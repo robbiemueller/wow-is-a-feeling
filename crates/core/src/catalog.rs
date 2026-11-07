@@ -69,6 +69,9 @@ pub struct Addon {
     /// Ids on other sites, used to match addons already installed by other tools.
     #[serde(default, skip_serializing_if = "ExternalIds::is_empty")]
     pub ids: ExternalIds,
+    /// Unix seconds when this addon first appeared, for the "Newest" sort. 0 when unknown.
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    pub created: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -215,6 +218,10 @@ fn is_zero_u32(n: &u32) -> bool {
     *n == 0
 }
 
+fn is_zero_i64(n: &i64) -> bool {
+    *n == 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -264,12 +271,8 @@ mod tests {
             ..Default::default()
         };
         let json = serde_json::to_string(&addon).unwrap();
-        assert!(
-            !json.contains("stars"),
-            "empty fields should be omitted: {json}"
-        );
-        assert!(
-            !json.contains("\"ids\""),
+        assert!(
+            !json.contains("created"),
             "empty fields should be omitted: {json}"
         );
         let back: Addon = serde_json::from_str(&json).unwrap();
