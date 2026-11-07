@@ -658,6 +658,12 @@ pub fn addon_page_url(addon: &Addon) -> Option<String> {
     if let Some(url) = addon.website.as_deref().and_then(safe_url) {
         return Some(url.to_owned());
     }
+    source_url(addon)
+}
+
+/// Where the Source line goes: the very thing it names. An addon's `website` is whatever its
+/// author wrote, so it can't stand in for the repo.
+pub fn source_url(addon: &Addon) -> Option<String> {
     match &addon.source {
         Source::Github { repo } => {
             let plain = repo
@@ -670,14 +676,19 @@ pub fn addon_page_url(addon: &Addon) -> Option<String> {
     }
 }
 
-/// The source's name, for the Details table.
-pub fn source_label(addon: &Addon) -> &'static str {
-    match addon.source {
-        Source::Github { .. } => "GitHub",
-        Source::Wowi { .. } => "WoWInterface",
-        Source::Direct { .. } => "Direct link",
+/// Who an addon really comes from, for the Details table. Display names aren't unique, so
+/// the repo is the only real signal.
+pub fn source_text(addon: &Addon) -> String {
+    match &addon.source {
+        Source::Github { repo } => format!("GitHub: {}", clean_line(repo, 100)),
+        Source::Wowi { .. } => "WoWInterface".to_owned(),
+        Source::Direct { .. } => "Direct link".to_owned(),
     }
 }
+
+/// What the page says about an entry the catalog doesn't vouch for.
+pub const UNTRUSTED_NOTE: &str =
+    "New in the catalog. Nobody has reviewed it, so check who made it before you install.";
 
 /// Where the game is, as far as anyone knows.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -1165,6 +1176,28 @@ mod tests {
         assert_eq!(addon_page_url(&a).unwrap(), "https://home.test");
         a.website = Some("file:///etc/passwd".to_owned());
         assert!(addon_page_url(&a).unwrap().ends_with("info12"));
+    }
+
+    #[test]
+    fn the_source_line_names_the_real_owner_and_goes_there() {
+        let mut a = addon("gh:a/b", "A", "misc", 0);
+        a.website = Some("https://looks-official.test".to_owned());
+        a.source = Source::Github {
+            repo: "stranger/details".to_owned(),
+        };
+        assert_eq!(source_text(&a), "GitHub: stranger/details");
+        assert_eq!(
+            source_url(&a).unwrap(),
+            "https://github.com/stranger/details",
+            "what its author wrote as a website doesn't change where it comes from"
+        );
+        a.source = Source::Wowi { id: 12 };
+        assert_eq!(source_text(&a), "WoWInterface");
+        assert!(source_url(&a).unwrap().ends_with("info12"));
+        a.source = Source::Direct {
+            url: "https://a.test/x.zip".to_owned(),
+        };
+        assert_eq!(source_text(&a), "Direct link");
     }
 
     #[test]
