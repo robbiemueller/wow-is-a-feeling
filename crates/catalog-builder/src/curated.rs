@@ -1728,10 +1728,15 @@ mod tests {
             }
         }
 
-        // The data pack that had taken the addon's place.
-        let pin = curated.pin_of("gh:jhunthrop/foreversixty").unwrap();
-        assert_eq!(pin.main.as_deref(), Some("ForeverSixty"));
-        assert!(pin.was.is_empty());
+        // The data packs that had taken their addon's place.
+        for (id, main) in [
+            ("gh:jhunthrop/foreversixty", "ForeverSixty"),
+            ("gh:LoyalFTW/Midnight-Routine", "MidnightRoutine"),
+        ] {
+            let pin = curated.pin_of(id).unwrap();
+            assert_eq!(pin.main.as_deref(), Some(main), "{id}");
+            assert!(pin.was.is_empty(), "{id}");
+        }
         for id in curated.pins.keys() {
             assert!(!picks.contains(id), "{id}: a pin picks nothing");
         }

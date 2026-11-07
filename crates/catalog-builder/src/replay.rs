@@ -400,8 +400,8 @@ fn replay_real_data_with_nobody_attacking() {
     assert!(wrong_tiers < 10, "tiers moved: {wrong_tiers}");
 }
 
-/// A release line, or an id `[[packs]]` names, whose download is over 100 MB. These go out
-/// unreviewed, so apps up to 0.1.2 never install one by itself.
+/// A release line, or an id `[[packs]]` names, whose download is over 100 MB or of unknown size.
+/// These go out unreviewed, so apps up to 0.1.2 never install one by itself.
 fn is_big_pack(addon: &Addon, curated: &Curated) -> bool {
     let pack = curated::is_line_id(&addon.id)
         || curated
@@ -409,14 +409,16 @@ fn is_big_pack(addon: &Addon, curated: &Curated) -> bool {
             .iter()
             .flat_map(|group| group.ids.iter())
             .any(|id| id.eq_ignore_ascii_case(&addon.id));
-    let size = addon
+    let sizes: Vec<u64> = addon
         .stable
         .iter()
         .chain(addon.beta.iter())
         .map(|release| release.size)
-        .max()
-        .unwrap_or(0);
-    pack && size > feeling_core::deps::BIGGEST_UNASKED_DOWNLOAD
+        .collect();
+    let big = sizes
+        .iter()
+        .any(|size| *size > feeling_core::deps::BIGGEST_UNASKED_DOWNLOAD);
+    pack && (big || sizes.contains(&0))
 }
 
 /// One attack: what goes in, and what must be true of what comes out.

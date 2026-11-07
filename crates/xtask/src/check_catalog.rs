@@ -130,7 +130,8 @@ fn static_problems(catalog: &Catalog) -> Vec<String> {
 }
 
 /// Apps up to 0.1.2 install any reviewed entry another addon requires by themselves, whatever
-/// its size, so a pack over 100 MB, any id some entry's pack groups name, is never reviewed.
+/// its size, so a pack over 100 MB, any id some entry's pack groups name, is never reviewed, and
+/// neither is one with a build whose size isn't known, which could be any size.
 fn big_packs_reviewed(catalog: &Catalog) -> Vec<String> {
     let packs: BTreeSet<String> = catalog
         .addons
@@ -144,17 +145,24 @@ fn big_packs_reviewed(catalog: &Catalog) -> Vec<String> {
         .iter()
         .filter(|addon| addon.reviewed && packs.contains(&addon.id.to_ascii_lowercase()))
         .filter_map(|addon| {
-            let size = [&addon.stable, &addon.beta]
+            let sizes: Vec<u64> = [&addon.stable, &addon.beta]
                 .into_iter()
                 .flatten()
                 .map(|release| release.size)
-                .max()?;
-            (size > BIGGEST_UNASKED_DOWNLOAD).then(|| {
-                format!(
-                    "{} is a pack of {size} bytes and reviewed, so apps up to 0.1.2 would install it by themselves",
-                    addon.id
-                )
-            })
+                .collect();
+            let size = sizes.iter().copied().max()?;
+            let id = &addon.id;
+            if size > BIGGEST_UNASKED_DOWNLOAD {
+                Some(format!(
+                    "{id} is a pack of {size} bytes and reviewed, so apps up to 0.1.2 would install it by themselves"
+                ))
+            } else if sizes.contains(&0) {
+                Some(format!(
+                    "{id} is a pack of unknown size and reviewed, so apps up to 0.1.2 would install it by themselves"
+                ))
+            } else {
+                None
+            }
         })
         .collect()
 }
@@ -674,6 +682,41 @@ mod tests {
         beta.beta = beta.stable.clone();
         beta.beta.as_mut().unwrap().size = 157_070_901;
         assert_eq!(check(beta).len(), 1, "a big beta counts too");
+    }
+
+    #[test]
+    fn a_pack_whose_size_isnt_known_is_never_reviewed_either() {
+        let pack_of = |stable: u64, beta: Option<u64>, reviewed: bool| {
+            let mut quests = entry("gh:rusty-key/spoken-wow/quests-audio", SPOKEN);
+            quests.folders = vec!["SpokenQuestsAudioAlliance".into()];
+            quests.stable.as_mut().unwrap().size = stable;
+            quests.beta = beta.map(|size| Release {
+                size,
+                ..quests.stable.clone().unwrap()
+            });
+            quests.trusted = true;
+            quests.reviewed = reviewed;
+            quests
+        };
+        let mut spoken = entry("gh:rusty-key/spoken-wow", SPOKEN);
+        spoken.reviewed = true;
+        spoken.packs = vec![PackGroup {
+            name: "Quest voices".into(),
+            needed: true,
+            ids: vec!["gh:rusty-key/spoken-wow/quests-audio".into()],
+            met_by: vec!["SpokenQuestsAudio".into()],
+        }];
+        let check = |pack: Addon| static_problems(&catalog(vec![spoken.clone(), pack]));
+        let unknown = [
+            "gh:rusty-key/spoken-wow/quests-audio is a pack of unknown size and reviewed, so apps up to 0.1.2 would install it by themselves",
+        ];
+        assert_eq!(check(pack_of(0, None, true)), unknown);
+        assert_eq!(check(pack_of(10, Some(0), true)), unknown, "its beta's");
+        assert!(check(pack_of(0, None, false)).is_empty());
+        assert!(
+            check(pack_of(10, None, true)).is_empty(),
+            "no beta at all isn't an unknown size"
+        );
     }
 
     #[test]

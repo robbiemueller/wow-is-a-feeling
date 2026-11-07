@@ -38,6 +38,8 @@ pub const MAX_DEPS: usize = 64;
 /// Former main folders an entry keeps in `formerly`, the most recent. An addon renames its
 /// main folder once or twice in its life, and every player's catalog carries the list.
 pub const MAX_FORMERLY: usize = 8;
+/// Old ids kept for a repository GitHub renamed, the most recent. Real ones are renamed once.
+pub const MAX_RENAMES: usize = 4;
 /// Real ids are 8 bytes or fewer, so nothing longer is one.
 const MAX_ID_BYTES: usize = 32;
 
@@ -118,9 +120,19 @@ pub struct Candidate {
     /// A newer release of the addon exists and doesn't target Forever any more.
     #[serde(default)]
     pub no_longer_forever: bool,
+    /// The ids this repository had before GitHub renamed it, the most recent first. The scan
+    /// cache keeps them on its last result, so every later build still knows the entry is the
+    /// one the last catalog and the scan cache's memory have under an old id.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub renamed_from: Vec<String>,
 }
 
 impl Candidate {
+    /// Every id the entry goes by: its own, then the ones it had before GitHub renamed it.
+    pub fn known_as(&self) -> impl Iterator<Item = &str> {
+        std::iter::once(self.addon.id.as_str()).chain(self.renamed_from.iter().map(String::as_str))
+    }
+
     /// Lowercased folder names, for comparing what two addons would install.
     pub fn folder_set(&self) -> BTreeSet<String> {
         self.addon

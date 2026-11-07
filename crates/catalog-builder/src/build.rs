@@ -18,7 +18,7 @@ use crate::gate::{GateContext, run_gate};
 use crate::github::{self, BatchResult, PrefixReleases, RepoInfo};
 use crate::http::{Channel, Http, unix_now};
 use crate::merge::{self, Pin, Pins};
-use crate::model::{Candidate, Held, ZipScan};
+use crate::model::{Candidate, Held, MAX_RENAMES, ZipScan};
 use crate::rangezip::{HttpRange, RangeReader};
 use crate::state::{Remembered, RepoState, State, write_atomic};
 use crate::text::{
@@ -327,8 +327,13 @@ struct Tally {
     unvouched: Vec<String>,
     /// GitHub main folders that moved with nothing vouching for the old one.
     moved: Vec<String>,
-    /// Packs too big for old apps to install by themselves, published unreviewed.
-    unreviewed: Vec<String>,
+    /// Folders `[pins]` says an entry was that don't fit in its `formerly`.
+    cut: Vec<String>,
+    /// Packs too big for old apps to install by themselves, or of unknown size, published
+    /// unreviewed.
+    unreviewed: merge::Unreviewed,
+    /// Hand-picked repositories GitHub knows by another name now.
+    renamed: Vec<String>,
 }
 
 fn repo_id(name: &str) -> String {
@@ -415,10 +420,20 @@ impl Product<'_> {
 
 /// The summary line for an entry that passed over `newer` as another addon's, saying what it
 /// lists instead, and how to tell the builder when `newer` is really this addon. `left_out`: it
-/// lists nothing, and stays that way while the pin stands.
-fn passed_over(id: &str, instead: &str, newer: &str, pin: &Pin, left_out: bool) -> String {
+/// lists nothing, and stays that way while the pin stands. `unread`: some of `newer`'s zips
+/// weren't read, so only the ones read are known not to ship the pinned folder.
+fn passed_over(
+    id: &str,
+    instead: &str,
+    newer: &str,
+    pin: &Pin,
+    left_out: bool,
+    unread: bool,
+) -> String {
     let main = &pin.main;
-    let line = format!("{id} {instead}, passed over newer {newer}, which doesn't ship {main}");
+    let read = if unread { " in the zips read" } else { "" };
+    let line =
+        format!("{id} {instead}, passed over newer {newer}, which doesn't ship {main}{read}");
     if pin.written {
         format!("{line}, the main folder [pins] in curated.toml gives it")
     } else if left_out {
@@ -432,11 +447,30 @@ fn passed_over(id: &str, instead: &str, newer: &str, pin: &Pin, left_out: bool) 
     }
 }
 
-/// The summary line for a release taken for another addon's with zips nobody read.
-fn left_unread(id: &str, tag: &str, unread: u32) -> String {
+/// The summary line for a release taken for another addon's with zips nobody read: a zip read in
+/// it was another addon's, and none was a Forever build of the pinned addon, `main`.
+fn left_unread(id: &str, tag: &str, unread: u32, main: &str) -> String {
     format!(
-        "{id} passed over {tag} with {unread} of its zips unread, after every one read was another addon's. It isn't read again until its files or this entry's main folder change"
+        "{id} passed over {tag} with {unread} of its zips unread and no Forever build of {main} among the ones read. It isn't read again until its files or this entry's main folder change"
     )
+}
+
+/// After GitHub renames a repository, its entry is still the one the last catalog listed under
+/// the id its last result has. The ids it had stay on every later result, so later builds know
+/// them too.
+fn carry_old_ids(entry: &mut Candidate, last: Option<&Candidate>) {
+    let Some(last) = last else {
+        return;
+    };
+    let id = entry.addon.id.clone();
+    let mut seen = HashSet::new();
+    entry.renamed_from = std::iter::once(&last.addon.id)
+        .chain(&last.renamed_from)
+        .filter(|old| !old.eq_ignore_ascii_case(&id))
+        .filter(|old| seen.insert(old.to_ascii_lowercase()))
+        .take(MAX_RENAMES)
+        .cloned()
+        .collect();
 }
 
 /// Reads one addon's releases into its entry: its newest build that's still the same addon,
@@ -467,12 +501,20 @@ fn read_product(
     }
     for (tag, unread) in &chosen.left_unread {
         let tag = product.full_tag(tag);
-        tally
-            .left_unread
-            .push(left_unread(&product.id, &tag, *unread));
+        tally.left_unread.push(left_unread(
+            &product.id,
+            &tag,
+            *unread,
+            main.unwrap_or_default(),
+        ));
     }
     let incomplete = !chosen.errors.is_empty();
     let skipped = chosen.skipped.as_deref().map(|tag| product.full_tag(tag));
+    let skipped_unread = chosen
+        .left_unread
+        .iter()
+        .any(|(tag, _)| chosen.skipped.as_ref() == Some(tag));
+    let last_result = last;
     // A last result that's another addon is no use for keeping this one listed, and one that is
     // keeps the pinned folder first, as every build of it does now.
     let last = last
@@ -495,9 +537,8 @@ fn read_product(
             let listed = chosen.stable.as_ref().or(chosen.beta.as_ref());
             if let (Some(pin), Some(newer), Some(listed)) = (pin, &skipped, listed) {
                 let instead = format!("lists {}", product.full_tag(&listed.tag));
-                tally
-                    .passed_over
-                    .push(passed_over(&product.id, &instead, newer, pin, false));
+                let line = passed_over(&product.id, &instead, newer, pin, false, skipped_unread);
+                tally.passed_over.push(line);
             }
             Some(product.own(entry, &chosen))
         }
@@ -517,7 +558,9 @@ fn read_product(
                     (None, true) => "is left out, as its last build's file is gone".to_string(),
                     (None, false) => "is left out, with no build of its own to keep".to_string(),
                 };
-                let line = passed_over(&product.id, &instead, &newer, pin, kept.is_none());
+                let left_out = kept.is_none();
+                let line =
+                    passed_over(&product.id, &instead, &newer, pin, left_out, skipped_unread);
                 tally.passed_over.push(line);
                 kept
             }
@@ -528,6 +571,10 @@ fn read_product(
             }
         },
     };
+    let mut entry = entry;
+    if let Some(entry) = &mut entry {
+        carry_old_ids(entry, last_result);
+    }
     (entry, incomplete)
 }
 
@@ -560,11 +607,11 @@ fn process_repo(
     let id = format!("gh:{}", info.name);
     let asked = format!("gh:{}", look.asked);
     // After GitHub renames a repository, its last result still has the id the last catalog
-    // and `curated.toml` use for it.
-    let last_id = record.entry.as_ref().map(|entry| entry.addon.id.as_str());
-    let ids: Vec<&str> = [Some(id.as_str()), Some(asked.as_str()), last_id]
+    // and `curated.toml` use for it, and every later result keeps the ids it had.
+    let last_ids = record.entry.iter().flat_map(Candidate::known_as);
+    let ids: Vec<&str> = [id.as_str(), asked.as_str()]
         .into_iter()
-        .flatten()
+        .chain(last_ids)
         .collect();
     let product = Product {
         pin: look.pins.get(&ids, record.entry.as_ref()),
@@ -812,8 +859,14 @@ fn triage_heads(
             continue;
         }
         let split = split_of(curated, asked, &head.name);
-        if !seen.insert(head.name.to_ascii_lowercase()) || curated.excludes_repo(&head.name) {
-            state.repos.remove(asked);
+        let excluded = curated.excludes_repo(&head.name);
+        if excluded || !seen.insert(head.name.to_ascii_lowercase()) {
+            // A second name for a repository already looked at this run goes, such as a seed
+            // still naming it as it was before GitHub renamed it. The record under GitHub's own
+            // name is the one the first look used, so it stays.
+            if excluded || !asked.eq_ignore_ascii_case(&head.name) {
+                state.repos.remove(asked);
+            }
             answer(tally, asked, split);
             continue;
         }
@@ -873,7 +926,8 @@ fn still_passed_over(record: &RepoState, id: &str, curated: &Curated) -> Option<
         written: curated.main_pin_of(id).is_some(),
     };
     let instead = format!("lists {}", listed_version(entry));
-    Some(passed_over(id, &instead, newest, &pin, false))
+    let unread = record.releases.get(newest).is_some_and(|v| v.unread > 0);
+    Some(passed_over(id, &instead, newest, &pin, false, unread))
 }
 
 /// Each split repository's releases, prefix by prefix, keyed by the name it was asked for in
@@ -1203,8 +1257,12 @@ pub struct Settled {
     pub unvouched: Vec<String>,
     /// GitHub main folders that moved with nothing vouching for the old one.
     pub moved: Vec<String>,
-    /// Packs published unreviewed because they're over 100 MB.
-    pub unreviewed: Vec<String>,
+    /// Folders `[pins]` says an entry was that don't fit in its `formerly`.
+    pub cut: Vec<String>,
+    /// Packs published unreviewed because they're over 100 MB, or their size isn't known.
+    pub unreviewed: merge::Unreviewed,
+    /// Hand-picked repositories GitHub knows by another name now.
+    pub renamed: Vec<String>,
 }
 
 /// Everything between the scans and the gate: who merges with whom, who owns which name
@@ -1237,8 +1295,10 @@ pub fn settle(
             candidate.addon.name.clone_from(name);
         }
     }
-    merge::stamp_ages(&mut candidates, previous, picks, now);
+    let renamed = merge::renamed_picks(&candidates, picks);
+    merge::stamp_ages(&mut candidates, previous, remembered, picks, now);
     let reserved = merge::Reserved::new(curated);
+    let left_out: HashSet<String> = forks.iter().map(|id| id.to_ascii_lowercase()).collect();
     let rules = merge::ClaimRules {
         picks,
         reserved: &reserved,
@@ -1246,6 +1306,7 @@ pub fn settle(
         remembered,
         curated,
         now,
+        left_out: &left_out,
     };
     let (mut candidates, held) = merge::hold_collisions(candidates, &rules);
     merge::settle_trust(&mut candidates, picks, &curated.merges, now);
@@ -1260,7 +1321,9 @@ pub fn settle(
         vouched: stamped.vouched,
         unvouched: stamped.unvouched,
         moved: stamped.moved,
+        cut: stamped.cut,
         unreviewed,
+        renamed,
     }
 }
 
@@ -1458,6 +1521,10 @@ fn print_summary(
         &tally.renamed_splits,
     );
     print_list(
+        "hand-picked repositories GitHub knows by another name now",
+        &tally.renamed,
+    );
+    print_list(
         "passed over newer releases that are another addon's",
         &tally.passed_over,
     );
@@ -1474,9 +1541,14 @@ fn print_summary(
         "main folders that moved, the old one not vouched for",
         &tally.moved,
     );
+    print_list("former main folders in [pins] that don't fit", &tally.cut);
     print_list(
         "packs published unreviewed, as they're over 100 MB",
-        &tally.unreviewed,
+        &tally.unreviewed.big,
+    );
+    print_list(
+        "packs published unreviewed, as their size isn't known",
+        &tally.unreviewed.unknown_size,
     );
     println!("requests:");
     for (channel, count) in http.counts() {
@@ -1600,7 +1672,9 @@ pub fn run(options: &Options) -> Result<(), String> {
     tally.vouched = settled.vouched;
     tally.unvouched = settled.unvouched;
     tally.moved = settled.moved;
+    tally.cut = settled.cut;
     tally.unreviewed = settled.unreviewed;
+    tally.renamed = settled.renamed;
     let published = publish(
         settled.candidates,
         settled.held,
@@ -4285,7 +4359,7 @@ mod tests {
             assert_eq!(
                 tally.left_unread,
                 [
-                    "gh:a/Addon passed over voices-v2 with 6 of its zips unread, after every one read was another addon's. It isn't read again until its files or this entry's main folder change"
+                    "gh:a/Addon passed over voices-v2 with 6 of its zips unread and no Forever build of Addon among the ones read. It isn't read again until its files or this entry's main folder change"
                 ],
                 "run {run}"
             );
@@ -5631,6 +5705,8 @@ mod tests {
             c.addon.source = Source::Github {
                 repo: SPOKEN.into(),
             };
+            // Small, and known to be.
+            c.addon.stable.as_mut().unwrap().size = 40_000_000;
             c
         };
         let quests = line(
@@ -6001,7 +6077,9 @@ mod tests {
             200_000_000,
         ));
         let extra = vec![spoken, sized(quests, 1_479_966_451), bosses];
-        let mut named = w.settle(extra.clone()).unreviewed;
+        let unreviewed = w.settle(extra.clone()).unreviewed;
+        assert!(unreviewed.unknown_size.is_empty(), "every size is known");
+        let mut named = unreviewed.big;
         named.sort();
         assert_eq!(
             named,
@@ -6164,5 +6242,814 @@ mod tests {
                 quests.met_by
             );
         }
+    }
+
+    // A repository GitHub renames, a held or missing entry's claims, and what the summary says.
+
+    /// Helpers moved its main folder to HelpersForever, and a person wrote the old one down. One
+    /// build later GitHub renames the repository, so from then on every build reads it as
+    /// gh:zebra/HelpersForever, with the old id kept on the scan cache's last result. `seeded`:
+    /// seeds.toml names it under its old name. `move_pin`: a person moves [pins] to the new name.
+    /// `still_ships_helpers`: it still ships Helpers beside its main folder. A stranger's copy
+    /// named Helpers, more popular than it, waits from the rename on. Returns its age before the
+    /// rename, and the 31 daily builds after it.
+    fn after_github_renamed_helpers(
+        seeded: bool,
+        move_pin: bool,
+        still_ships_helpers: bool,
+    ) -> (i64, Vec<Published>, Vec<Settled>) {
+        let mut w = world();
+        if seeded {
+            w.seeds.repos.push("zebra/Helpers".into());
+        }
+        w.curated.pins = pinned_by_hand("gh:zebra/Helpers", "HelpersForever", &["Helpers"]).pins;
+        let at = w
+            .repos
+            .iter()
+            .position(|c| c.addon.id == "gh:zebra/Helpers")
+            .unwrap();
+        w.repos[at].addon.folders = vec!["HelpersForever".into(), "Helpers".into()];
+        let (first, _d0) = w.build(vec![]);
+        assert_eq!(addon_of(&first, "gh:zebra/Helpers").formerly, ["Helpers"]);
+        let age = addon_of(&first, "gh:zebra/Helpers").created;
+        w.after(&first);
+
+        let mut renamed = w.repos.remove(at);
+        renamed.addon.id = "gh:zebra/HelpersForever".into();
+        renamed.addon.source = Source::Github {
+            repo: "zebra/HelpersForever".into(),
+        };
+        renamed.renamed_from = vec!["gh:zebra/Helpers".into()];
+        if !still_ships_helpers {
+            renamed.addon.folders = vec!["HelpersForever".into()];
+        }
+        w.repos.push(renamed);
+        if move_pin {
+            w.curated.pins =
+                pinned_by_hand("gh:zebra/HelpersForever", "HelpersForever", &["Helpers"]).pins;
+        }
+        let copy = || claim_of("nobody/Helpers", "Helpers", &["HelpersCopy"], 9_000_000);
+        let mut builds = Vec::new();
+        let mut settled = Vec::new();
+        for _ in 1..=31 {
+            w.now += DAY_SECS;
+            settled.push(w.settle(vec![copy()]));
+            let (built, _d) = w.build(vec![copy()]);
+            w.after(&built);
+            builds.push(built);
+        }
+        (age, builds, settled)
+    }
+
+    #[test]
+    fn a_repository_github_renamed_is_listed_under_its_new_name_with_the_folder_it_vouched_for() {
+        for (seeded, move_pin, ships) in [
+            (false, true, true),
+            (false, false, true),
+            (true, true, true),
+            (false, true, false),
+        ] {
+            let case = format!("seeded {seeded}, pin moved {move_pin}, ships Helpers {ships}");
+            let (age, builds, settled) = after_github_renamed_helpers(seeded, move_pin, ships);
+            let held: Vec<String> = builds
+                .iter()
+                .filter_map(|b| b.held.iter().find(|h| h.id == "gh:zebra/HelpersForever"))
+                .map(|h| h.reason.clone())
+                .collect();
+            assert!(held.is_empty(), "{case}: held {held:?}");
+            for (day, built) in builds.iter().enumerate() {
+                let renamed = addon_of(built, "gh:zebra/HelpersForever");
+                assert_eq!(renamed.formerly, ["Helpers"], "{case}, day {}", day + 1);
+                // Its age goes with it, so the more popular copy never gets ahead of it.
+                assert_eq!(renamed.created, age, "{case}");
+                assert!(is_held(built, "gh:nobody/Helpers"), "{case}");
+            }
+            for settled in &settled {
+                assert!(settled.vouched.is_empty(), "{case}: {:?}", settled.vouched);
+                let lines = &settled.renamed;
+                if seeded {
+                    assert_eq!(
+                        lines,
+                        &[
+                            "gh:zebra/Helpers is gh:zebra/HelpersForever on GitHub now. It isn't hand-picked under that name until seeds.toml or curated.toml uses it"
+                        ]
+                    );
+                } else {
+                    assert!(lines.is_empty(), "{case}: {lines:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_repository_github_renamed_keeps_the_id_it_had_on_every_later_result() {
+        // The last run read a/Addon when its own v1 was its only release, and a person wrote its
+        // pin down under that name.
+        let (mut probe, info) = module_then_addon();
+        let curated = pinned_by_hand("gh:a/Addon", "Addon", &[]);
+        let last = listed(&[("gh:a/Addon", &["Addon"])]);
+        let pins = Pins::new(Some(&last), &curated);
+        let mut state = State::empty();
+        let record = state.note_repo("a/Addon", "seed");
+        let v1_only = repo_with_releases(&[("v1", "Addon-1.zip")]);
+        process_pinned(&mut probe, &v1_only, record, &pins, &mut Tally::default()).unwrap();
+        assert!(
+            state.repos["a/Addon"]
+                .entry
+                .as_ref()
+                .unwrap()
+                .renamed_from
+                .is_empty()
+        );
+
+        // GitHub answers for it as a/Renamed, and its module is the newest release.
+        let to_read = renamed_on_github(&mut state, &curated, "module-v2");
+        let renamed = RepoInfo {
+            name: "a/Renamed".into(),
+            ..info
+        };
+        let entries = full_look(
+            &to_read,
+            &renamed,
+            &mut state,
+            &curated,
+            &pins,
+            &mut probe,
+            &mut Tally::default(),
+        );
+        assert_eq!(entries[0].addon.id, "gh:a/Renamed");
+        assert_eq!(entries[0].renamed_from, ["gh:a/Addon"]);
+
+        // Later runs read it under its new name, and the catalog of the run between them left it
+        // out. The old id is still on the result, so the pin written under it still holds.
+        let unlisted = listed(&[]);
+        let pins = Pins::new(Some(&unlisted), &curated);
+        for run in 0..2 {
+            let record = state.repos.get_mut("a/Renamed").unwrap();
+            let mut tally = Tally::default();
+            let entry = process_pinned(&mut probe, &renamed, record, &pins, &mut tally).unwrap();
+            assert_eq!(entry.addon.folders, ["Addon"], "run {run}: not its module");
+            assert_eq!(entry.renamed_from, ["gh:a/Addon"], "run {run}");
+            assert_eq!(record.entry.as_ref(), Some(&entry));
+        }
+    }
+
+    #[test]
+    fn a_seed_still_naming_a_renamed_repository_leaves_its_record_alone() {
+        // seeds.toml still says a/Addon, so every run notes that name again beside the record
+        // under GitHub's new name, and GitHub answers for both as a/Renamed.
+        let mut state = State::empty();
+        let record = state.note_repo("a/Renamed", "strongbox");
+        let mut entry = real_entry("a/Renamed", "Good Thing", &["Addon"], 1);
+        entry.renamed_from = vec!["gh:a/Addon".into()];
+        record.entry = Some(entry.clone());
+        record.newest_tag = Some("v1".into());
+        record.looked_at = unix_now();
+        for run in 0..2 {
+            state.note_repo("a/Addon", "seed");
+            let mut heads = heads_of(&["a/Addon", "a/Renamed"]);
+            heads.found.get_mut("a/Addon").unwrap().name = "a/Renamed".into();
+            let (entries, to_read) = triage_heads(
+                &heads,
+                &mut state,
+                &Curated::default(),
+                &HandPicked::default(),
+                unix_now(),
+                &mut Tally::default(),
+            );
+            assert!(to_read.is_empty(), "run {run}: nothing new");
+            assert_eq!(entries, [entry.clone()], "run {run}");
+            assert!(!state.repos.contains_key("a/Addon"), "run {run}");
+            let kept = &state.repos["a/Renamed"];
+            assert_eq!(kept.entry.as_ref(), Some(&entry), "run {run}");
+            assert!(kept.found_by.contains("seed"), "run {run}");
+        }
+    }
+
+    #[test]
+    fn a_library_github_renamed_still_provides_what_listed_addons_require() {
+        let mut w = world();
+        let lib = real_entry("zebra/LibFoo", "LibFoo", &["LibFoo"], 10);
+        let mut needs = real_entry("someone/NeedsLib", "Needs Lib", &["NeedsLib"], 10);
+        needs.addon.deps = vec!["LibFoo".into()];
+        w.previous.addons.push(lib.addon.clone());
+        w.previous.addons.push(needs.addon.clone());
+        w.repos.push(needs);
+        let mut renamed = lib;
+        renamed.addon.id = "gh:zebra/LibFooForever".into();
+        renamed.addon.source = Source::Github {
+            repo: "zebra/LibFooForever".into(),
+        };
+        renamed.renamed_from = vec!["gh:zebra/LibFoo".into()];
+        let (published, _d) = w.build(vec![renamed]);
+        assert!(
+            !is_held(&published, "gh:zebra/LibFooForever"),
+            "{:?}",
+            published.held
+        );
+        assert_eq!(
+            addon_of(&published, "gh:zebra/LibFooForever").created,
+            merge::BASELINE_CREATED
+        );
+    }
+
+    /// A listing nobody picked, published once with FooBar as its main folder, which then moves
+    /// its main folder to one an older entry has, so it's held from then on and no catalog lists
+    /// it again. Each of the 45 daily builds after that also has `shipper`, or PeaversCommons
+    /// with FooBar added when `shipper` is `None`. Returns the days `id` was held, and the last
+    /// reason.
+    fn held_beside_a_listing_held_for_good(
+        shipper: Option<Candidate>,
+        id: &str,
+    ) -> (Vec<u32>, String) {
+        let mut w = world();
+        w.wowi.push(listing_entry(500, "Foo Bar", &["FooBar"], 10));
+        let (first, _d0) = w.build(vec![]);
+        assert!(!is_held(&first, "wowi:500"));
+        w.after(&first);
+        let at = w
+            .wowi
+            .iter()
+            .position(|c| c.addon.id == "wowi:500")
+            .unwrap();
+        w.wowi[at].addon.folders = vec!["Helpers".into()];
+        if shipper.is_none() {
+            let peavers = w
+                .repos
+                .iter()
+                .position(|c| c.addon.id == "gh:Peavers/PeaversCommons")
+                .unwrap();
+            w.repos[peavers].addon.folders = vec!["PeaversCommons".into(), "FooBar".into()];
+        }
+        let mut held = Vec::new();
+        let mut reason = String::new();
+        for day in 1..=45 {
+            w.now += DAY_SECS;
+            let (built, _d) = w.build(shipper.iter().cloned().collect());
+            assert!(is_held(&built, "wowi:500"), "day {day}");
+            if is_held(&built, id) {
+                held.push(day);
+                reason = held_reason(&built, id).to_string();
+            }
+            w.after(&built);
+        }
+        (held, reason)
+    }
+
+    #[test]
+    fn a_held_entrys_vouched_folder_stops_holding_others_a_month_after_it_was_last_published() {
+        let newcomer = claim_of("someone/FooBar", "Foo Bar Reborn", &["FooBar"], 1);
+        let (held, reason) =
+            held_beside_a_listing_held_for_good(Some(newcomer), "gh:someone/FooBar");
+        let (peavers, peavers_reason) =
+            held_beside_a_listing_held_for_good(None, "gh:Peavers/PeaversCommons");
+        // Held while the listing still has the folder as a claim, and not a day after.
+        let month: Vec<u32> = (1..=29).collect();
+        assert_eq!(held, month, "{reason}");
+        assert_eq!(reason, "its folder FooBar was wowi:500's main folder");
+        assert_eq!(peavers, month, "{peavers_reason}");
+        assert_eq!(
+            peavers_reason,
+            "its folder FooBar was wowi:500's main folder"
+        );
+    }
+
+    #[test]
+    fn a_release_with_a_zip_for_another_flavor_isnt_said_to_be_all_another_addons() {
+        let mut probe = ScriptedProbe::default();
+        probe
+            .zips
+            .insert("Addon-1.zip".into(), Ok(forever_scan("Good Thing")));
+        let mut info = repo_with_releases(&[("voices-v2", "unused.zip"), ("v1", "Addon-1.zip")]);
+        let mut voices = other_addons_release(&mut probe, "voices-v2", 23);
+        // The biggest zip, read first, is the addon's own build for another flavor.
+        probe
+            .zips
+            .insert(voices.assets[0].name.clone(), Ok(retail_scan()));
+        info.releases[0].assets = std::mem::take(&mut voices.assets);
+        let last = listed(&[("gh:a/Addon", &["Addon"])]);
+        let pins = Pins::new(Some(&last), &Curated::default());
+        let mut state = State::empty();
+        let record = state.note_repo("a/Addon", "seed");
+        let mut tally = Tally::default();
+        let entry = process_pinned(&mut probe, &info, record, &pins, &mut tally).unwrap();
+        assert_eq!(version_of(&entry), "v1");
+        assert_eq!(
+            tally.left_unread,
+            [
+                "gh:a/Addon passed over voices-v2 with 3 of its zips unread and no Forever build of Addon among the ones read. It isn't read again until its files or this entry's main folder change"
+            ]
+        );
+        let passed_over = "gh:a/Addon lists v1, passed over newer voices-v2, which doesn't ship Addon in the zips read. If voices-v2 holds the addon this entry should list, set [pins.\"gh:a/Addon\"] in curated.toml";
+        assert_eq!(tally.passed_over, [passed_over]);
+
+        // A quick look that finds nothing new says the same.
+        let mut heads = heads_of(&["a/Addon"]);
+        heads.found.get_mut("a/Addon").unwrap().releases[0].tag = "voices-v2".into();
+        let mut tally = Tally::default();
+        let (entries, to_read) = triage_heads(
+            &heads,
+            &mut state,
+            &Curated::default(),
+            &HandPicked::default(),
+            unix_now(),
+            &mut tally,
+        );
+        assert!(to_read.is_empty());
+        assert_eq!(entries.len(), 1);
+        assert_eq!(tally.passed_over, [passed_over]);
+    }
+
+    #[test]
+    fn a_claim_the_scan_cache_remembers_names_the_entry_as_the_catalog_spells_it() {
+        // Helpers moved its main folder, and a person wrote the old one down.
+        let mut w = world();
+        w.curated.pins = pinned_by_hand("gh:zebra/Helpers", "HelpersForever", &["Helpers"]).pins;
+        let at = w
+            .repos
+            .iter()
+            .position(|c| c.addon.id == "gh:zebra/Helpers")
+            .unwrap();
+        w.repos[at].addon.folders = vec!["HelpersForever".into()];
+        let (first, _d0) = w.build(vec![]);
+        assert_eq!(addon_of(&first, "gh:zebra/Helpers").formerly, ["Helpers"]);
+        w.after(&first);
+
+        // It's missing from the next two builds, and a stranger's repository ships Helpers. The
+        // claim comes from the last catalog, then from the scan cache.
+        w.repos.remove(at);
+        let stranger = || claim_of("nobody/helpers-old", "Old Helpers", &["Helpers"], 1);
+        for _ in 0..2 {
+            w.now += DAY_SECS;
+            let (built, _d) = w.build(vec![stranger()]);
+            assert_eq!(
+                held_reason(&built, "gh:nobody/helpers-old"),
+                "its folder Helpers was gh:zebra/Helpers's main folder"
+            );
+            w.after(&built);
+        }
+    }
+
+    #[test]
+    fn the_scan_cache_remembers_the_same_through_builds_with_nothing_new() {
+        let mut w = world();
+        w.wowi[0].addon.folders = vec!["TomTomForever".into()];
+        let mut saved = Vec::new();
+        for _ in 0..3 {
+            // Every three hours, as the workflow runs.
+            w.now += 3 * 60 * 60;
+            let (built, _d) = w.build(vec![]);
+            w.after(&built);
+            saved.push(serde_json::to_string(&w.remembered).unwrap());
+        }
+        assert_eq!(saved[0], saved[1]);
+        assert_eq!(saved[1], saved[2]);
+        let tomtom = w.remembered.get("wowi:7032").unwrap();
+        assert_eq!(tomtom.at, BUILT_AT.div_euclid(DAY_SECS) * DAY_SECS);
+    }
+
+    #[test]
+    fn a_build_from_the_last_builds_output_with_nothing_new_is_the_same() {
+        // A renamed listing, a written was, a pin that lets a rename through, and a stranger
+        // held for a vouched folder, read the same way build after build.
+        let mut w = tomtom_renamed();
+        w.curated.pins = pinned_by_hand("gh:zebra/Helpers", "HelpersForever", &["Helpers"]).pins;
+        let at = w
+            .repos
+            .iter()
+            .position(|c| c.addon.id == "gh:zebra/Helpers")
+            .unwrap();
+        w.repos[at].addon.folders = vec!["HelpersForever".into(), "Helpers".into()];
+        let stranger = || claim_of("zebra/Waypoints", "Zebra Waypoints", &["TomTom"], 1);
+        let mut outputs = Vec::new();
+        for _ in 0..4 {
+            w.now += DAY_SECS;
+            let (built, _d) = w.build(vec![stranger()]);
+            let addons = serde_json::to_value(&built.catalog.addons).unwrap();
+            let held: Vec<(String, String)> = built
+                .held
+                .iter()
+                .map(|h| (h.id.clone(), h.reason.clone()))
+                .collect();
+            outputs.push((addons, held));
+            w.after(&built);
+        }
+        assert_eq!(outputs[1], outputs[2]);
+        assert_eq!(outputs[2], outputs[3]);
+    }
+
+    #[test]
+    fn formerly_settles_after_a_rename_even_with_eight_folders_written_in_was() {
+        // TomTom's listing renames its folder, and a person wrote eight older names in was, the
+        // most [pins] takes.
+        let mut w = tomtom_renamed();
+        let was: Vec<String> = (1..=8).map(|n| format!("TomTomOld{n}")).collect();
+        w.curated.pins.insert(
+            "wowi:7032".into(),
+            crate::curated::PinSpec {
+                main: None,
+                was: was.clone(),
+            },
+        );
+        let mut lists = Vec::new();
+        for build in 0..10 {
+            w.now += DAY_SECS;
+            let settled = w.settle(vec![]);
+            if build == 0 {
+                assert_eq!(settled.vouched.len(), 8, "{:?}", settled.vouched);
+            } else {
+                assert!(settled.vouched.is_empty(), "{:?}", settled.vouched);
+            }
+            assert_eq!(
+                settled.cut,
+                [
+                    "wowi:7032 was TomTomOld8, as [pins] says, but it isn't vouched for: formerly keeps the 8 most recent"
+                ]
+            );
+            let (built, _d) = w.build(vec![]);
+            lists.push(addon_of(&built, "wowi:7032").formerly.clone());
+            w.after(&built);
+        }
+        let mut wanted = vec!["TomTom".to_string()];
+        wanted.extend(was.iter().take(7).cloned());
+        for (build, list) in lists.iter().enumerate() {
+            assert_eq!(list, &wanted, "build {build}");
+        }
+    }
+
+    #[test]
+    fn a_listing_held_for_one_build_keeps_its_name_and_main_folder_from_a_newcomer() {
+        // A listing nobody seeded, and a stranger who has listed a folder named like the one
+        // the listing will add next, as many addons add a <Name>_Options folder.
+        let mut w = world();
+        let wayfarer = listing_entry(5555, "Wayfarer", &["Wayfarer"], 1_000);
+        let bait = claim_of("zebra/Options", "Zebra Options", &["Wayfarer_Options"], 1);
+        w.previous.addons.push(wayfarer.addon.clone());
+        w.previous.addons.push(bait.addon.clone());
+        w.repos.push(bait);
+        w.wowi.push(wayfarer);
+
+        // The stranger's copy, with the listing's name and main folder, waits: held, build
+        // after build, and costing nothing.
+        let squatter = || claim_of("zebra/Wayfinder", "Wayfarer", &["Wayfarer"], 1);
+        let (waiting, _dw) = w.build(vec![squatter()]);
+        assert_eq!(
+            held_reason(&waiting, "gh:zebra/Wayfinder"),
+            "its name is already taken by wowi:5555"
+        );
+        w.after(&waiting);
+
+        // The listing adds that folder, so this build holds it, and the copy still waits.
+        w.wowi.last_mut().unwrap().addon.folders =
+            vec!["Wayfarer".into(), "Wayfarer_Options".into()];
+        w.now += DAY_SECS;
+        let (held_once, _d0) = w.build(vec![squatter()]);
+        assert_eq!(
+            held_reason(&held_once, "wowi:5555"),
+            "it just added the folder Wayfarer_Options, which gh:zebra/Options already lists"
+        );
+        assert_eq!(
+            held_reason(&held_once, "gh:zebra/Wayfinder"),
+            "its name is wowi:5555's, which isn't listed in this build"
+        );
+        w.after(&held_once);
+
+        // The listing drops the folder again, as it was before, and comes back as it was.
+        w.wowi.last_mut().unwrap().addon.folders = vec!["Wayfarer".into()];
+        w.now += DAY_SECS;
+        let (back, _d1) = w.build(vec![squatter()]);
+        assert!(!is_held(&back, "wowi:5555"), "{:?}", back.held);
+        let listing = addon_of(&back, "wowi:5555");
+        assert_eq!(listing.created, merge::BASELINE_CREATED);
+        assert!(listing.trusted);
+        assert_eq!(
+            held_reason(&back, "gh:zebra/Wayfinder"),
+            "its name is already taken by wowi:5555"
+        );
+    }
+
+    #[test]
+    fn a_listing_held_for_adding_a_taken_folder_stays_held_while_it_ships_it() {
+        let mut w = world();
+        let wayfarer = listing_entry(5555, "Wayfarer", &["Wayfarer"], 1_000);
+        let bait = claim_of("zebra/Options", "Zebra Options", &["Wayfarer_Options"], 1);
+        w.previous.addons.push(wayfarer.addon.clone());
+        w.previous.addons.push(bait.addon.clone());
+        w.repos.push(bait);
+        w.wowi.push(wayfarer);
+        let (first, _d) = w.build(vec![]);
+        w.after(&first);
+        // It keeps the folder it added, and keeps its age while it's held, so it's judged by the
+        // folders it was last published with.
+        w.wowi.last_mut().unwrap().addon.folders =
+            vec!["Wayfarer".into(), "Wayfarer_Options".into()];
+        for day in 1..=3 {
+            w.now += DAY_SECS;
+            let (built, _d) = w.build(vec![]);
+            assert_eq!(
+                held_reason(&built, "wowi:5555"),
+                "it just added the folder Wayfarer_Options, which gh:zebra/Options already lists",
+                "day {day}"
+            );
+            w.after(&built);
+        }
+    }
+
+    /// A target listed before ages were kept and a copy with its name and main folder held behind
+    /// it, then one build the target is missing from, then the target back. Returns each build.
+    fn a_copy_waiting_on(target: Candidate, is_listing: bool, copy: Candidate) -> Vec<Published> {
+        let mut w = world();
+        let id = target.addon.id.clone();
+        w.previous.addons.push(target.addon.clone());
+        let add = |w: &mut World| {
+            if is_listing {
+                w.wowi.push(target.clone());
+            } else {
+                w.repos.push(target.clone());
+            }
+        };
+        add(&mut w);
+        let mut builds = Vec::new();
+        let (waiting, _d) = w.build(vec![copy.clone()]);
+        w.after(&waiting);
+        builds.push(waiting);
+        // The gap: for a listing, an upload with no Forever build. For a repository, left out.
+        w.wowi.retain(|c| c.addon.id != id);
+        w.repos.retain(|c| c.addon.id != id);
+        w.now += DAY_SECS;
+        let (gap, _d) = w.build(vec![copy.clone()]);
+        w.after(&gap);
+        builds.push(gap);
+        add(&mut w);
+        for day in [1, 2, 15, 45] {
+            w.now = BUILT_AT + (day + 1) * DAY_SECS;
+            let (back, _d) = w.build(vec![copy.clone()]);
+            w.after(&back);
+            builds.push(back);
+        }
+        builds
+    }
+
+    #[test]
+    fn a_listing_or_repository_missing_for_one_build_keeps_its_name_and_main_folder_from_a_copy() {
+        let copy = claim_of("zebra/Wayfinder", "Wayfarer", &["Wayfarer"], 9_000_000);
+        for (target, is_listing) in [
+            (listing_entry(5555, "Wayfarer", &["Wayfarer"], 1_000), true),
+            (
+                real_entry("alice/Wayfarer", "Wayfarer", &["Wayfarer"], 1_000),
+                false,
+            ),
+        ] {
+            let id = target.addon.id.clone();
+            let builds = a_copy_waiting_on(target, is_listing, copy.clone());
+            assert_eq!(
+                held_reason(&builds[1], "gh:zebra/Wayfinder"),
+                format!("its name is {id}'s, which isn't listed in this build"),
+                "the gap build"
+            );
+            for (at, built) in builds.iter().enumerate() {
+                assert!(is_held(built, "gh:zebra/Wayfinder"), "{id}, build {at}");
+                if at != 1 {
+                    let target = addon_of(built, &id);
+                    assert_eq!(target.created, merge::BASELINE_CREATED, "{id}, build {at}");
+                    assert!(target.trusted, "{id}, build {at}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_hand_picked_listing_missing_for_one_build_keeps_its_name_from_a_copy() {
+        // TomTom's listing is seeded, and a copy waits behind it.
+        let copy = claim_of("zebra/TomTom", "TomTom", &["TomTom"], 9_000_000);
+        let tomtom = listing_entry(7032, "TomTom", &["TomTom"], 3_550_000);
+        let mut w = world();
+        let (waiting, _d) = w.build(vec![copy.clone()]);
+        assert!(is_held(&waiting, "gh:zebra/TomTom"));
+        w.after(&waiting);
+        w.wowi.retain(|c| c.addon.id != "wowi:7032");
+        w.now += DAY_SECS;
+        let (gap, _d) = w.build(vec![copy.clone()]);
+        assert_eq!(
+            held_reason(&gap, "gh:zebra/TomTom"),
+            "its name is wowi:7032's, which isn't listed in this build"
+        );
+        w.after(&gap);
+        w.wowi.insert(0, tomtom);
+        w.now += DAY_SECS;
+        let (back, _d) = w.build(vec![copy]);
+        assert!(!is_held(&back, "wowi:7032"));
+        assert_eq!(
+            held_reason(&back, "gh:zebra/TomTom"),
+            "its name is already taken by wowi:7032"
+        );
+    }
+
+    #[test]
+    fn a_new_repository_from_the_same_owner_can_take_the_place_of_one_that_left() {
+        // The real move from gh:MaddisonM79/ryna-wow_forever to gh:MaddisonM79/ryna_agent, from
+        // one live catalog to the next.
+        let mut w = world();
+        let old = real_entry("MaddisonM79/ryna-wow_forever", "Ryna", &["Ryna"], 100);
+        w.previous.addons.push(old.addon.clone());
+        w.repos.push(old);
+        let (first, _d) = w.build(vec![]);
+        w.after(&first);
+        w.repos
+            .retain(|c| c.addon.id != "gh:MaddisonM79/ryna-wow_forever");
+        w.now += DAY_SECS;
+        let moved = real_entry(
+            "maddisonm79/ryna_agent",
+            "Ryna",
+            &["Ryna", "Ryna_Chronicle"],
+            1,
+        );
+        let (published, _d) = w.build(vec![moved]);
+        assert!(
+            !is_held(&published, "gh:maddisonm79/ryna_agent"),
+            "{:?}",
+            published.held
+        );
+
+        // Another owner's copy is held.
+        let copy = real_entry("zebra/ryna", "Ryna", &["Ryna"], 9_000_000);
+        let (published, _d) = w.build(vec![copy]);
+        assert_eq!(
+            held_reason(&published, "gh:zebra/ryna"),
+            "its name is gh:MaddisonM79/ryna-wow_forever's, which isn't listed in this build"
+        );
+        let copy = real_entry("zebra/other", "Something Else", &["Ryna"], 9_000_000);
+        let (published, _d) = w.build(vec![copy]);
+        assert_eq!(
+            held_reason(&published, "gh:zebra/other"),
+            "its main folder Ryna is gh:MaddisonM79/ryna-wow_forever's, which isn't listed in this build"
+        );
+    }
+
+    #[test]
+    fn a_fork_dropped_beside_its_parent_doesnt_hold_the_parent() {
+        // A fork was listed while its parent had no Forever build. Now the parent has one, so the
+        // fork goes, with the same folders as the parent, and the parent takes its place.
+        let mut w = world();
+        let mut fork = real_entry("fork/Stream", "Stream", &["Stream"], 100);
+        fork.fork_of = Some("up/Stream".into());
+        w.previous.addons.push(fork.addon.clone());
+        w.repos.push(fork);
+        let (first, _d) = w.build(vec![]);
+        w.after(&first);
+        w.now += DAY_SECS;
+        let parent = real_entry("up/Stream", "Stream", &["Stream"], 1);
+        let settled = w.settle(vec![parent.clone()]);
+        assert_eq!(settled.forks, ["gh:fork/Stream"]);
+        let (published, _d) = w.build(vec![parent]);
+        assert!(!is_held(&published, "gh:up/Stream"), "{:?}", published.held);
+    }
+
+    /// The world with a WoWInterface listing nobody seeded, listed from before ages were kept,
+    /// that renames its folder from Wayfarer to WayfarerForever in the first build.
+    fn wayfarer_renamed() -> (World, Candidate) {
+        let mut w = world();
+        let wayfarer = listing_entry(5555, "Wayfarer", &["Wayfarer"], 1_000);
+        w.previous.addons.push(wayfarer.addon.clone());
+        let mut renamed = wayfarer;
+        renamed.addon.folders = vec!["WayfarerForever".into()];
+        w.wowi.push(renamed.clone());
+        (w, renamed)
+    }
+
+    #[test]
+    fn a_stranger_cant_take_a_renamed_listings_old_folder_by_case_look_alikes_or_a_gap() {
+        let (mut w, renamed) = wayfarer_renamed();
+        let (first, _d0) = w.build(vec![]);
+        assert_eq!(addon_of(&first, "wowi:5555").formerly, ["Wayfarer"]);
+        w.after(&first);
+
+        // The listing is no hand-picked one, and its rename made it new, so these strangers are
+        // all older than it or as new, and none of them was listed with the folder.
+        let strangers = || {
+            vec![
+                claim_of("zebra/Caps", "Zebra Caps", &["ZebraCaps", "WAYFARER"], 1),
+                // A Cyrillic a.
+                claim_of(
+                    "zebra/Alike",
+                    "Zebra Alike",
+                    &["ZebraAlike", "W\u{0430}yfarer"],
+                    1,
+                ),
+                claim_of("zebra/Plain", "Zebra Plain", &["wayfarer"], 1),
+            ]
+        };
+        let (next, _d1) = w.build(strangers());
+        for id in ["gh:zebra/Caps", "gh:zebra/Alike", "gh:zebra/Plain"] {
+            assert!(is_held(&next, id), "{id}");
+        }
+        assert_eq!(addon_of(&next, "wowi:5555").formerly, ["Wayfarer"]);
+        w.after(&next);
+
+        // A build without the listing, and the same strangers try again.
+        w.wowi.retain(|c| c.addon.id != "wowi:5555");
+        w.now += DAY_SECS;
+        let (gap, _d2) = w.build(strangers());
+        for id in ["gh:zebra/Caps", "gh:zebra/Alike", "gh:zebra/Plain"] {
+            assert!(is_held(&gap, id), "{id} during the gap");
+        }
+        w.after(&gap);
+
+        // Back, the vouch is still there and the strangers are still held.
+        w.wowi.push(renamed);
+        w.now += DAY_SECS;
+        let (back, _d3) = w.build(strangers());
+        for id in ["gh:zebra/Caps", "gh:zebra/Alike", "gh:zebra/Plain"] {
+            assert!(is_held(&back, id), "{id} after the gap");
+        }
+        assert_eq!(addon_of(&back, "wowi:5555").formerly, ["Wayfarer"]);
+    }
+
+    #[test]
+    fn an_excluded_listing_cant_hold_anything_with_the_folders_it_was_vouched_for() {
+        // The listing renamed itself away from Wayfarer, and a maintainer then excludes it. The
+        // real Wayfarer, a repository nobody seeded, ships Wayfarer, and another goes by the
+        // listing's name.
+        let (mut w, _renamed) = wayfarer_renamed();
+        let (first, _d0) = w.build(vec![]);
+        assert_eq!(addon_of(&first, "wowi:5555").formerly, ["Wayfarer"]);
+        w.after(&first);
+        w.curated.exclude.ids.push("wowi:5555".into());
+        let others = || {
+            vec![
+                claim_of("wayfarer/Wayfarer", "Wayfarer Maps", &["Wayfarer"], 1),
+                claim_of("wayfarer/Classic", "Wayfarer", &["WayfarerClassic"], 1),
+            ]
+        };
+        for days in [1, 20] {
+            w.now += days * DAY_SECS;
+            let (built, _d) = w.build(others());
+            assert!(built.held.is_empty(), "{days} days on: {:?}", built.held);
+            w.after(&built);
+        }
+    }
+
+    #[test]
+    fn every_catalog_the_gate_lets_out_meets_the_catalog_checks_former_folder_rule() {
+        // Whatever reaches the gate with a vouch for a folder another entry ships, in any case or
+        // look-alike spelling, the catalog goes out without it.
+        let release = |name: &str| Release {
+            version: "1.0".into(),
+            url: format!("https://github.com/zebra/{name}/releases/download/v1/{name}.zip"),
+            size: 10,
+            ..Release::default()
+        };
+        let entry = |repo: &str, folders: &[&str], formerly: &[&str]| {
+            let mut c = real_entry(repo, repo.split('/').nth(1).unwrap(), folders, 1);
+            c.addon.formerly = formerly.iter().map(|f| f.to_string()).collect();
+            c.addon.stable = Some(release(repo.split('/').nth(1).unwrap()));
+            c.addon.category = "misc".into();
+            c
+        };
+        let candidates = vec![
+            entry(
+                "zebra/Renamed",
+                &["RenamedNow"],
+                &["QUESTIE", "W\u{0430}yfarer", "\u{0397}ogHeals", "Older"],
+            ),
+            entry("zebra/Questie", &["Questie"], &[]),
+            entry("zebra/Wayfarer", &["Wayfarer"], &[]),
+            entry("zebra/Hogs", &["\u{03B7}ogHeals"], &[]),
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let published = publish(
+            candidates,
+            vec![],
+            &GateContext {
+                curated: &Curated::default(),
+                picks: &HandPicked::default(),
+                previous: None,
+                answered: &BTreeSet::new(),
+                accept_smaller: false,
+            },
+            dir.path(),
+        )
+        .unwrap();
+        assert_eq!(published.catalog.addons.len(), 4, "nothing held for it");
+        assert_eq!(addon_of(&published, "gh:zebra/Renamed").formerly, ["Older"]);
+        assert!(crate::gate::formerly_shipped_elsewhere(&published.catalog.addons).is_empty());
+    }
+
+    #[test]
+    fn a_pack_whose_size_isnt_known_goes_out_unreviewed_and_is_named_for_it() {
+        let mut w = world();
+        w.seeds.repos.push(SPOKEN.into());
+        w.curated.split = vec![spoken_split()];
+        let mut quests = real_entry(SPOKEN, "Spoken Audio: Quests", &QUEST_FOLDERS, 1394);
+        quests.addon.id = SplitSpec::line_id(SPOKEN, "quests-audio");
+        let settled = w.settle(vec![quests.clone()]);
+        assert_eq!(
+            settled.unreviewed.unknown_size,
+            ["gh:rusty-key/spoken-wow/quests-audio, whose stable download's size isn't known"]
+        );
+        assert!(settled.unreviewed.big.is_empty());
+        let (published, _dir) = w.build(vec![quests]);
+        let pack = addon_of(&published, "gh:rusty-key/spoken-wow/quests-audio");
+        assert!(pack.trusted && !pack.reviewed);
     }
 }

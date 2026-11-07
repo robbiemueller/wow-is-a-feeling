@@ -252,6 +252,11 @@ changes_often = true
 [pins."gh:jhunthrop/foreversixty"]
 main = "ForeverSixty"
 
+# Midnight-Routine releases its data module, RoutineData, as a separate dv* line, and the
+# catalog flipped between the two depending on which released last.
+[pins."gh:LoyalFTW/Midnight-Routine"]
+main = "MidnightRoutine"
+
 # Repositories that publish several addons, each under its own tag prefix, as tags like
 # <prefix>/v1.2.3. The repository's own entry, gh:owner/repo, reads only main's tags. Each
 # line is an entry of its own, gh:owner/repo/<line> in lower case, and reads only its tags.
@@ -272,8 +277,9 @@ lines = ["quests-audio", "places-audio", "readables-audio", "bosses-audio"]
 # name prefixes that meet it too, for packs the catalog doesn't list, such as other
 # languages or ones another tool installed, so nobody is told their own voices are missing.
 # The app shows them on the addon's page and asks before installing any. Naming an id here
-# hand-picks it. A pack over 100 MB, as each of Spoken's is, goes out trusted but not
-# reviewed, so an older app never installs one by itself as another addon's dependency.
+# hand-picks it. A pack over 100 MB, as each of Spoken's is, or one whose size isn't known,
+# goes out trusted but not reviewed, so an older app never installs one by itself as another
+# addon's dependency.
 #
 # Spoken's packs, from what Spoken itself loads. SpokenQuestsAudio starts every official
 # quest pack: each language's, CurseForge's Alliance, Horde, Shared and Gossip splits, and

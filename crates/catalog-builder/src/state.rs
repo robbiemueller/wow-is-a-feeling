@@ -17,6 +17,7 @@ use crate::wowi::WowiState;
 /// Bump when old state can't be understood any more. It's only a cache, so the
 /// price is one slow run.
 const STATE_SCHEMA: u32 = 1;
+const DAY_SECS: i64 = 24 * 60 * 60;
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct State {
@@ -42,19 +43,38 @@ pub struct State {
 }
 
 /// The main folder an entry was last published with, the former ones the catalog vouched for
-/// then, when that was, and how old the entry was.
+/// then, when that was, how old the entry was, and its id, name and folders as that catalog had
+/// them. Each of the later fields is empty or 0 for an entry noted before it was kept.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LastPublished {
     pub main: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub formerly: Vec<String>,
-    /// Unix seconds when the catalog it was last published in was made. 0 for an entry noted
-    /// before this was kept, which counts as recent.
+    /// Unix seconds when the catalog it was last published in was made, rounded down to the day,
+    /// so a build with nothing new leaves the scan cache as it was. 0 for an entry noted before
+    /// this was kept, which counts as recent.
     #[serde(default, skip_serializing_if = "is_zero_i64")]
     pub at: i64,
-    /// Its `created` in that catalog. 0 for an entry noted before this was kept.
+    /// Its `created` in that catalog.
     #[serde(default, skip_serializing_if = "is_zero_i64")]
     pub created: i64,
+    /// Its id as that catalog spells it. The memory is keyed by the id in lower case.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub id: String,
+    /// Its name in that catalog.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+    /// Its folders in that catalog, the main one first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub folders: Vec<String>,
+}
+
+impl LastPublished {
+    /// Its id as the catalog spelled it, or `key`, the lower case one, for an entry noted before
+    /// the spelling was kept.
+    pub fn id_or<'a>(&'a self, key: &'a str) -> &'a str {
+        if self.id.is_empty() { key } else { &self.id }
+    }
 }
 
 /// What each entry was last published as, by lowercased id. Nothing is ever taken out: it's a
@@ -64,8 +84,8 @@ pub struct LastPublished {
 pub struct Remembered(BTreeMap<String, LastPublished>);
 
 impl Remembered {
-    /// Notes what each entry of a catalog that went out was published as, and when. Entries it
-    /// left out keep what was noted before.
+    /// Notes what each entry of a catalog that went out was published as, and on which day.
+    /// Entries it left out keep what was noted before.
     pub fn note(&mut self, catalog: &Catalog) {
         for addon in &catalog.addons {
             let Some(main) = addon.folders.first() else {
@@ -76,8 +96,11 @@ impl Remembered {
                 LastPublished {
                     main: main.clone(),
                     formerly: addon.formerly.clone(),
-                    at: catalog.generated,
+                    at: catalog.generated.div_euclid(DAY_SECS) * DAY_SECS,
                     created: addon.created,
+                    id: addon.id.clone(),
+                    name: addon.name.clone(),
+                    folders: addon.folders.clone(),
                 },
             );
         }
@@ -341,6 +364,7 @@ mod tests {
                 .iter()
                 .map(|(id, folders, formerly)| feeling_core::catalog::Addon {
                     id: (*id).to_string(),
+                    name: "Listed".into(),
                     folders: folders.iter().map(|f| f.to_string()).collect(),
                     formerly: formerly.iter().map(|f| f.to_string()).collect(),
                     created: 1_790_000_000,
@@ -369,14 +393,24 @@ mod tests {
         assert_eq!(tomtom.formerly, ["TomTom"]);
         assert_eq!(
             (tomtom.at, tomtom.created),
-            (1_800_000_000, 1_790_000_000),
-            "when it was last published, and how old it was then"
+            (1_799_971_200, 1_790_000_000),
+            "the day it was last published, and how old it was then"
         );
+        assert_eq!(
+            (tomtom.id.as_str(), tomtom.name.as_str()),
+            ("wowi:7032", "Listed")
+        );
+        assert_eq!(tomtom.folders, ["TomTomForever"]);
         let addon = state.remembered.get("gh:A/Addon").unwrap();
         assert_eq!(
             (addon.main.as_str(), addon.at),
-            ("AddonCore", 1_800_086_400)
+            ("AddonCore", 1_800_057_600)
         );
+        assert_eq!(
+            addon.id, "gh:a/addon",
+            "as the catalog it was last in spells it"
+        );
+        assert_eq!(addon.folders, ["AddonCore", "Addon"]);
         assert_eq!(state.remembered.get("gh:a/other"), None);
         assert_eq!(state.remembered.entries().count(), 2);
 
@@ -385,16 +419,21 @@ mod tests {
         state.save(&path).unwrap();
         assert_eq!(State::load(&path).remembered, state.remembered);
 
-        // Memory noted before when and how old were kept still loads, with both 0.
+        // Memory noted before when and how old were kept still loads, with both 0, and so does
+        // memory from before its id, name and folders were kept.
         fs::write(
             &path,
-            br#"{"schema":1,"remembered":{"wowi:7032":{"main":"TomTomForever","formerly":["TomTom"]}}}"#,
+            br#"{"schema":1,"remembered":{"wowi:7032":{"main":"TomTomForever","formerly":["TomTom"]},"gh:a/addon":{"main":"Addon","at":1800000000,"created":1790000000}}}"#,
         )
         .unwrap();
         let noted = State::load(&path);
         let tomtom = noted.remembered.get("wowi:7032").unwrap();
         assert_eq!((tomtom.at, tomtom.created), (0, 0));
         assert_eq!(tomtom.formerly, ["TomTom"]);
+        let addon = noted.remembered.get("gh:a/addon").unwrap();
+        assert_eq!((addon.at, addon.created), (1_800_000_000, 1_790_000_000));
+        assert!(addon.id.is_empty() && addon.name.is_empty() && addon.folders.is_empty());
+        assert_eq!(addon.id_or("gh:a/addon"), "gh:a/addon");
 
         // A scan cache from before this was kept still loads, with nothing remembered.
         fs::write(&path, br#"{"schema":1,"repos":{"A/a":{}}}"#).unwrap();
