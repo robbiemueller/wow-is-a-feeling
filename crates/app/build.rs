@@ -6,7 +6,10 @@ fn main() {
         res.set_icon("../../assets/icon/icon.ico");
         res.set("ProductName", "WoW is a Feeling");
         res.set("FileDescription", "WoW is a Feeling");
-        res.set("LegalCopyright", "GPL-3.0-or-later. Not affiliated with Blizzard Entertainment.");
+        res.set(
+            "LegalCopyright",
+            "GPL-3.0-or-later. Not affiliated with Blizzard Entertainment.",
+        );
         if let Err(e) = res.compile() {
             println!("cargo:warning=could not embed the Windows icon: {e}");
         }

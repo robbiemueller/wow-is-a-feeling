@@ -1,0 +1,82 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-22.04]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libgl1-mesa-dev libwayland-dev xvfb libgl1-mesa-dri
+      - name: Check formatting
+        if: runner.os == 'Linux'
+        run: cargo fmt --all --check
+      - name: Lint
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --workspace
+
+  smoke:
+    name: Screenshot on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-22.04]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libgl1-mesa-dev libwayland-dev xvfb libgl1-mesa-dri
+      - name: Build
+        run: cargo build --release -p wow-is-a-feeling
+      - name: Run and screenshot (Linux)
+        if: runner.os == 'Linux'
+        env:
+          LIBGL_ALWAYS_SOFTWARE: "1"
+        run: xvfb-run -a -s "-screen 0 1280x800x24" timeout 60 ./target/release/wow-is-a-feeling --demo --screenshot screenshot-linux.png
+      - name: Run and screenshot (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          ./target/release/wow-is-a-feeling --demo --screenshot screenshot-macos.png &
+          app=$!
+          for _ in $(seq 1 60); do
+            if [ -f screenshot-macos.png ]; then break; fi
+            sleep 1
+          done
+          kill "$app" 2>/dev/null || true
+          test -f screenshot-macos.png
+      - uses: actions/upload-artifact@v5
+        with:
+          name: screenshot-${{ runner.os }}
+          path: screenshot-*.png
+          if-no-files-found: error
+      - name: Report binary size
+        shell: bash
+        run: ls -l target/release/wow-is-a-feeling

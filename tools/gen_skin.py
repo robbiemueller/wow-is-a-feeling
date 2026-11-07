@@ -190,9 +190,9 @@ def portrait_ring(size: int = 128) -> None:
     outer, inner = size / 2 - 1, size / 2 - 13
     mask = np.clip(outer - r + 0.5, 0, 1) * np.clip(r - inner + 0.5, 0, 1)
     height = np.sin(np.clip((r - inner) / (outer - inner), 0, 1) * np.pi) ** 0.7
-    shade = bevel_shade(height, 3.2)
+    shade = bevel_shade(height, 2.0)
     wear = (periodic_noise(size, 0.9) - 0.5) * 0.10
-    t = np.clip(0.48 + (shade - 0.5) * 1.15 + wear, 0, 1)
+    t = np.clip(0.40 + (shade - 0.5) * 0.95 + wear, 0, 1)
     rgb = gold_ramp(t)
     # Rivets at the four diagonals.
     for ang in (45, 135, 225, 315):

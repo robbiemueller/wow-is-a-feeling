@@ -14,7 +14,13 @@ pub const FOREVER_INTERFACE_MAX: u32 = 19999;
 /// The suffixes the Forever client looks for, in the order it tries them.
 /// An empty string means the plain `Folder.toc`.
 pub const TOC_SUFFIXES: [&str; 7] = [
-    "_Forever", "-Forever", "_Camelot", "-Camelot", "_Mainline", "-Mainline", "",
+    "_Forever",
+    "-Forever",
+    "_Camelot",
+    "-Camelot",
+    "_Mainline",
+    "-Mainline",
+    "",
 ];
 
 /// Game types that may load on Forever when a TOC restricts itself.
@@ -186,9 +192,14 @@ pub fn strip_ui_escapes(input: &str) -> String {
             }
             Some(open @ ('T' | 't' | 'A' | 'a')) => {
                 chars.next();
-                let close = if open.eq_ignore_ascii_case(&'T') { 't' } else { 'a' };
+                let close = if open.eq_ignore_ascii_case(&'T') {
+                    't'
+                } else {
+                    'a'
+                };
                 while let Some(inner) = chars.next() {
-                    if inner == '|' && chars.peek().is_some_and(|n| n.eq_ignore_ascii_case(&close)) {
+                    if inner == '|' && chars.peek().is_some_and(|n| n.eq_ignore_ascii_case(&close))
+                    {
                         chars.next();
                         break;
                     }
@@ -303,8 +314,14 @@ mod tests {
 
     #[test]
     fn game_type_restriction_can_exclude_forever() {
-        assert!(!parse("## Interface: 120105, 16001\n## AllowLoadGameType: standard\n").targets_forever());
-        assert!(parse("## Interface: 16001\n## AllowLoadGameType: standard, camelot\n").targets_forever());
+        assert!(
+            !parse("## Interface: 120105, 16001\n## AllowLoadGameType: standard\n")
+                .targets_forever()
+        );
+        assert!(
+            parse("## Interface: 16001\n## AllowLoadGameType: standard, camelot\n")
+                .targets_forever()
+        );
         assert!(parse("## Interface: 16001\n## AllowLoadGameType: mainline\n").targets_forever());
     }
 
@@ -327,16 +344,27 @@ mod tests {
 
     #[test]
     fn picks_toc_in_client_order() {
-        let files: Vec<String> = ["Foo.toc", "Foo_Mainline.toc", "Foo_Camelot.toc", "Foo_Vanilla.toc"]
+        let files: Vec<String> = [
+            "Foo.toc",
+            "Foo_Mainline.toc",
+            "Foo_Camelot.toc",
+            "Foo_Vanilla.toc",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(pick_toc("Foo", &files), Some("Foo_Camelot.toc"));
+
+        let files: Vec<String> = ["Foo.toc", "Foo_Mainline.toc"]
             .iter()
             .map(|s| s.to_string())
             .collect();
-        assert_eq!(pick_toc("Foo", &files), Some("Foo_Camelot.toc"));
-
-        let files: Vec<String> = ["Foo.toc", "Foo_Mainline.toc"].iter().map(|s| s.to_string()).collect();
         assert_eq!(pick_toc("Foo", &files), Some("Foo_Mainline.toc"));
 
-        let files: Vec<String> = ["Foo.toc", "Foo_Vanilla.toc"].iter().map(|s| s.to_string()).collect();
+        let files: Vec<String> = ["Foo.toc", "Foo_Vanilla.toc"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         assert_eq!(pick_toc("Foo", &files), Some("Foo.toc"));
 
         let files: Vec<String> = ["Foo_Vanilla.toc"].iter().map(|s| s.to_string()).collect();
@@ -346,7 +374,10 @@ mod tests {
     #[test]
     fn toc_picking_ignores_case_and_keeps_leading_bang() {
         let files: Vec<String> = ["!bugGRABBER_forever.TOC".to_string()].to_vec();
-        assert_eq!(pick_toc("!BugGrabber", &files), Some("!bugGRABBER_forever.TOC"));
+        assert_eq!(
+            pick_toc("!BugGrabber", &files),
+            Some("!bugGRABBER_forever.TOC")
+        );
     }
 
     #[test]

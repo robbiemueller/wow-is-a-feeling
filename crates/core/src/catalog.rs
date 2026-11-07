@@ -255,15 +255,23 @@ mod tests {
             id: "gh:Questie/Questie".into(),
             name: "Questie".into(),
             category: "quests".into(),
-            source: Source::Github { repo: "Questie/Questie".into() },
+            source: Source::Github {
+                repo: "Questie/Questie".into(),
+            },
             stable: Some(release("v12.6.2", 1)),
             folders: vec!["Questie".into()],
             tier: 5,
             ..Default::default()
         };
         let json = serde_json::to_string(&addon).unwrap();
-        assert!(!json.contains("stars"), "empty fields should be omitted: {json}");
-        assert!(!json.contains("\"ids\""), "empty fields should be omitted: {json}");
+        assert!(
+            !json.contains("stars"),
+            "empty fields should be omitted: {json}"
+        );
+        assert!(
+            !json.contains("\"ids\""),
+            "empty fields should be omitted: {json}"
+        );
         let back: Addon = serde_json::from_str(&json).unwrap();
         assert_eq!(back, addon);
     }
@@ -275,6 +283,9 @@ mod tests {
         ]}"#;
         let catalog: Catalog = serde_json::from_str(json).unwrap();
         assert_eq!(catalog.addons.len(), 1);
-        assert_eq!(category_name(&catalog.addons[0].category), "Everything Else");
+        assert_eq!(
+            category_name(&catalog.addons[0].category),
+            "Everything Else"
+        );
     }
 }
