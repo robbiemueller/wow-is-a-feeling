@@ -1075,13 +1075,20 @@ fn a_swapped_tool_or_signature_is_caught_before_it_counts() {
             "{swapped}"
         );
         assert!(!ran.exists(), "{swapped}");
-        let failure = rig.run_job("publish", &[]).unwrap_err();
-        assert_eq!(
-            failure.step, "Check these are exactly the files the manifest job made",
-            "{swapped}"
-        );
-        assert!(!rig.log().contains("gh release create"), "{swapped}");
+        // Publish waits for verify, so a swapped tool already stops the release there. Publish
+        // doesn't use the tool, but it does check the signature itself before uploading it.
+        if swapped == "signature" {
+            let failure = rig.run_job("publish", &[]).unwrap_err();
+            assert_eq!(
+                failure.step,
+                "Check these are exactly the files the manifest job made"
+            );
+            assert!(!rig.log().contains("gh release create"));
+        }
     }
+    let text = workflow("release.yml");
+    let jobs = jobs(&text);
+    assert!(find_job(&jobs, "publish").needs().contains(&"verify"));
 }
 
 #[test]
