@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use feeling_core::selfupdate::{self, UPDATE_PUBLIC_KEY};
 use minisign::{KeyPair, SecretKeyBox};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -26,6 +27,8 @@ Release chores for WoW is a Feeling.
       Write <file>.minisig, using the key file's contents from MINISIGN_SECRET_KEY.
   make-latest --version <v> --notes-file <file> --assets-dir <dir> --base-url <url>
       Write <dir>/latest.json with the sha256 and size of each known asset found.
+  verify-latest <latest.json>
+      Check <latest.json>.minisig against the public key built into the app.
 ";
 
 const SECRET_KEY_VAR: &str = "MINISIGN_SECRET_KEY";
@@ -64,6 +67,9 @@ fn main() -> ExitCode {
         ["make-latest", options @ ..] => parse_make_latest(options)
             .and_then(|options| make_latest(&options))
             .map(|latest| println!("Wrote {}", latest.display())),
+        ["verify-latest", file] => {
+            verify_latest(Path::new(file), UPDATE_PUBLIC_KEY).map(|summary| println!("{summary}"))
+        }
         _ => Err(USAGE.to_string()),
     };
     match result {
@@ -124,6 +130,28 @@ fn sign_file(file: &Path, secret_key: &str) -> Result<PathBuf, String> {
     fs::write(&path, signature.into_string())
         .map_err(|e| format!("Couldn't write {}: {e}", path.display()))?;
     Ok(path)
+}
+
+/// Check a signed `latest.json` the way the app will, so a release signed with the wrong
+/// key fails here rather than on every player's machine.
+fn verify_latest(file: &Path, public_key: &str) -> Result<String, String> {
+    let json = fs::read(file).map_err(|e| format!("Couldn't read {}: {e}", file.display()))?;
+    let mut signature_path = file.as_os_str().to_os_string();
+    signature_path.push(".minisig");
+    let signature_path = PathBuf::from(signature_path);
+    let signature = fs::read(&signature_path)
+        .map_err(|e| format!("Couldn't read {}: {e}", signature_path.display()))?;
+    let manifest = selfupdate::verified_manifest(&json, &signature, public_key)
+        .map_err(|e| format!("{} failed verification: {e}", file.display()))?;
+    if manifest.assets.is_empty() {
+        return Err(format!("{} lists no downloads.", file.display()));
+    }
+    Ok(format!(
+        "{} verifies: version {}, {} downloads",
+        file.display(),
+        manifest.version,
+        manifest.assets.len()
+    ))
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -317,6 +345,68 @@ mod tests {
         assert!(parse_make_latest(&args[..6]).is_err());
         assert!(parse_make_latest(&["--version"]).is_err());
         assert!(parse_make_latest(&["--what", "x"]).is_err());
+    }
+
+    fn signed_manifest(dir: &Path) -> (PathBuf, String) {
+        let key_path = dir.join("k.minisign.key");
+        let public_key = keygen(&key_path).unwrap();
+        let secret_key = fs::read_to_string(&key_path).unwrap();
+        let file = dir.join("latest.json");
+        let manifest = json!({
+            "version": "1.2.3",
+            "notes": "",
+            "date": 1,
+            "assets": {
+                "windows-x64": {
+                    "url": "https://example.com/a.exe",
+                    "sha256": "00",
+                    "size": 1,
+                    "kind": "exe"
+                }
+            }
+        });
+        fs::write(&file, manifest.to_string()).unwrap();
+        sign_file(&file, &secret_key).unwrap();
+        (file, public_key)
+    }
+
+    #[test]
+    fn a_manifest_signed_with_the_matching_key_verifies() {
+        let dir = tempfile::tempdir().unwrap();
+        let (file, public_key) = signed_manifest(dir.path());
+        let summary = verify_latest(&file, &public_key).unwrap();
+        assert!(summary.contains("version 1.2.3"), "{summary}");
+    }
+
+    #[test]
+    fn a_secret_key_with_windows_line_endings_still_signs() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = dir.path().join("k.minisign.key");
+        let public_key = keygen(&key_path).unwrap();
+        let secret_key = fs::read_to_string(&key_path).unwrap().replace('\n', "\r\n");
+        let file = dir.path().join("latest.json");
+        let manifest = json!({"version": "1.2.3", "notes": "", "date": 1, "assets": {
+            "windows-x64": {"url": "https://example.com/a.exe", "sha256": "00", "size": 1, "kind": "exe"}
+        }});
+        fs::write(&file, manifest.to_string()).unwrap();
+        sign_file(&file, &secret_key).unwrap();
+        verify_latest(&file, &public_key).unwrap();
+    }
+
+    #[test]
+    fn a_manifest_signed_with_another_key_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (file, _) = signed_manifest(dir.path());
+        assert!(verify_latest(&file, UPDATE_PUBLIC_KEY).is_err());
+    }
+
+    #[test]
+    fn a_changed_manifest_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (file, public_key) = signed_manifest(dir.path());
+        let changed = fs::read_to_string(&file).unwrap().replace("1.2.3", "9.9.9");
+        fs::write(&file, changed).unwrap();
+        assert!(verify_latest(&file, &public_key).is_err());
     }
 
     #[test]

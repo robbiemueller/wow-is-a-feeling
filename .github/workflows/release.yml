@@ -146,6 +146,8 @@ jobs:
           cargo run --quiet -p xtask -- make-latest --version "$version" --notes-file notes.md --assets-dir release --base-url "$base"
           cargo run --quiet -p xtask -- sign release/latest.json
           test -f release/latest.json.minisig
+      - name: Check the signature with the key built into the app
+        run: cargo run --quiet -p xtask -- verify-latest release/latest.json
       - name: Checksums
         run: |
           cd release

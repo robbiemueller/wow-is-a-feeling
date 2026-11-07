@@ -9,10 +9,10 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+feeling-core.workspace = true
 minisign = "0.10"
 serde_json.workspace = true
 sha2.workspace = true
 
 [dev-dependencies]
-feeling-core.workspace = true
 tempfile = "3"
