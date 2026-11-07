@@ -142,6 +142,8 @@ pub struct LocalZipFacts {
 pub struct OpFailure {
     pub cancelled: bool,
     pub text: String,
+    /// The folders an install stopped short of replacing, when that's why it failed.
+    pub would_replace: Vec<String>,
 }
 
 impl From<Error> for OpFailure {
@@ -149,6 +151,10 @@ impl From<Error> for OpFailure {
         OpFailure {
             cancelled: matches!(error, Error::Cancelled),
             text: error.to_string(),
+            would_replace: match &error {
+                Error::WouldReplace { folders } => folders.clone(),
+                _ => Vec::new(),
+            },
         }
     }
 }
@@ -844,6 +850,7 @@ fn game_layout(env: &OpEnv) -> Result<(Install, Layout), OpFailure> {
     let install = env.install.clone().ok_or_else(|| OpFailure {
         cancelled: false,
         text: "Choose your game folder first.".to_owned(),
+        would_replace: Vec::new(),
     })?;
     let layout = Layout::from_addons_dir(&install.addons_dir)?;
     Ok((install, layout))

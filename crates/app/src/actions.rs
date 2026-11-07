@@ -318,7 +318,8 @@ impl App {
             {
                 let conflicts = self.folder_conflicts(addon);
                 if !conflicts.is_empty() {
-                    let line = sitting_out_line(name, self.managed(id).is_some(), &conflicts);
+                    let folders: Vec<&str> = conflicts.iter().map(|c| c.folder.as_str()).collect();
+                    let line = ops::sitting_out_line(name, self.managed(id).is_some(), &folders);
                     self.yellow(line);
                     continue;
                 }
@@ -583,6 +584,7 @@ impl App {
             origin: Origin::Adopted,
             previous_zip: None,
             previous_version: None,
+            not_in_zip: Vec::new(),
         };
         if let Some(install) = self.state.current_mut() {
             install.managed.insert(id.to_owned(), record);
@@ -755,19 +757,6 @@ fn unreviewed_line(bundle: &CatalogBundle, left: &Unreviewed) -> String {
 fn conflict_names(conflicts: &[FolderConflict]) -> String {
     let folders: Vec<&str> = conflicts.iter().map(|c| c.folder.as_str()).collect();
     ops::short_list(&folders)
-}
-
-/// Why an addon stayed out of a batch, and where the player gets to decide.
-fn sitting_out_line(name: &str, updating: bool, conflicts: &[FolderConflict]) -> String {
-    let (done, verb) = if updating {
-        ("updated", "Update")
-    } else {
-        ("installed", "Install")
-    };
-    format!(
-        "{name} wasn't {done} because it would replace {}. {verb} it from its own page to choose.",
-        conflict_names(conflicts)
-    )
 }
 
 fn backup_draft() -> Draft {

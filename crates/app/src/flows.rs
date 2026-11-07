@@ -1431,13 +1431,9 @@ fn a_folder_the_zip_did_not_bring_stays_the_players_own() {
     let rig = Rig::new();
     rig.plant("Extra", "mine");
     let listed = ["Foo", "Extra"];
-    rig.site.publish(&catalog_of(vec![publish_bundle(
-        &rig.site,
-        FOO,
-        &listed,
-        &["Foo"],
-        "1.0",
-    )]));
+    // The catalog's list comes from one build, and the zips served leave Extra out.
+    let without = |version: &str| publish_bundle(&rig.site, FOO, &listed, &["Foo"], version);
+    rig.site.publish(&catalog_of(vec![without("1.0")]));
     let mut h = rig.launch_settled();
     click(&mut h, "Browse");
     click(&mut h, "Foo Addon, 1.0");
@@ -1448,13 +1444,89 @@ fn a_folder_the_zip_did_not_bring_stays_the_players_own() {
     assert_eq!(rig.version_on_disk("Extra").as_deref(), Some("mine"));
 
     // If it had gone in the record, this next install, whose zip doesn't have it either,
-    // would delete a folder that was never replaced. So the question comes back instead.
+    // would delete a folder that was never replaced. It stays out, and the player already
+    // said yes, so nothing asks again.
     click(&mut h, "Reinstall");
-    assert!(matches!(app(&h).popup, Some(Popup::Replace(_))));
-    click(&mut h, "Replace them");
+    assert!(app(&h).popup.is_none(), "it asked again");
     finish_ops(&mut h);
     assert_eq!(rig.version_on_disk("Extra").as_deref(), Some("mine"));
     assert_eq!(rig.version_on_disk("Foo").as_deref(), Some("1.0"));
+    close(h);
+
+    // Nor does Update all leave it out, after a restart either.
+    rig.site.publish(&catalog_of(vec![without("2.0")]));
+    let mut h = rig.launch_settled();
+    click(&mut h, "Update all (1)");
+    assert!(
+        !said(&h, "wasn't updated"),
+        "{:?}",
+        app(&h).messages.texts()
+    );
+    finish_ops(&mut h);
+    assert_eq!(rig.version_on_disk("Foo").as_deref(), Some("2.0"));
+    assert_eq!(rig.version_on_disk("Extra").as_deref(), Some("mine"));
+    assert!(app(&h).messages.errors().is_empty());
+    close(h);
+
+    // A zip that really brings it is refused, because the yes was for one that didn't, and
+    // from then on it asks.
+    rig.site.publish(&catalog_of(vec![publish_bundle(
+        &rig.site, FOO, &listed, &listed, "3.0",
+    )]));
+    let mut h = rig.launch_settled();
+    click(&mut h, "Update all (1)");
+    finish_ops(&mut h);
+    assert_eq!(rig.version_on_disk("Extra").as_deref(), Some("mine"));
+    assert_eq!(rig.version_on_disk("Foo").as_deref(), Some("2.0"));
+    assert!(
+        app(&h).messages.errors().contains(
+            &"Foo Addon wasn't updated because it would replace Extra. Update it from its own \
+              page to choose."
+        ),
+        "{:?}",
+        app(&h).messages.texts()
+    );
+    click(&mut h, "Foo Addon, update");
+    click(&mut h, "Update");
+    assert!(matches!(app(&h).popup, Some(Popup::Replace(_))));
+    click(&mut h, "Replace them");
+    finish_ops(&mut h);
+    assert_eq!(rig.version_on_disk("Extra").as_deref(), Some("3.0"));
+    assert_eq!(managed(&h, FOO).unwrap().folders, ["Foo", "Extra"]);
+}
+
+#[test]
+fn a_folder_that_turned_up_since_the_last_look_is_asked_about_next_time() {
+    let rig = Rig::new();
+    let listed = ["Foo", "Extra"];
+    rig.site.publish(&catalog_of(vec![publish_bundle(
+        &rig.site, FOO, &listed, &listed, "1.0",
+    )]));
+    let mut h = rig.launch_settled();
+    // Copied in by hand after the app looked, so it can't know to ask.
+    rig.plant("Extra", "mine");
+    click(&mut h, "Foo Addon, 1.0");
+    click(&mut h, "Install");
+    assert!(app(&h).popup.is_none());
+    finish_ops(&mut h);
+    assert_eq!(rig.version_on_disk("Extra").as_deref(), Some("mine"));
+    assert!(managed(&h, FOO).is_none());
+    assert!(
+        app(&h).messages.errors().contains(
+            &"Foo Addon wasn't installed because it would replace Extra. Install it from its own \
+              page to choose."
+        ),
+        "the catalog does list it: {:?}",
+        app(&h).messages.texts()
+    );
+
+    // It looked again, so the next press asks instead of being refused all over again.
+    click(&mut h, "Install");
+    assert!(matches!(app(&h).popup, Some(Popup::Replace(_))));
+    assert!(has_label(
+        &h,
+        "Extra: Extra from elsewhere, not installed by this app"
+    ));
 }
 
 #[test]

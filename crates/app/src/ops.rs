@@ -438,7 +438,9 @@ impl FolderConflict {
 /// What installing this addon would take from something else: its folders that are on disk
 /// and aren't in its own record. A catalog entry's list is only a claim, so who a folder
 /// belongs to goes by the records and the last scan. A folder new to the disk costs nobody
-/// anything, so it doesn't count, unless another op is about to put it there.
+/// anything, so it doesn't count, unless another op is about to put it there. Nor does one
+/// of the player's own that they already let this addon replace and its zip didn't bring:
+/// if a zip ever does, the install is refused, and the next one asks.
 pub fn folder_conflicts(
     addon: &Addon,
     managed: &BTreeMap<String, ManagedAddon>,
@@ -446,9 +448,12 @@ pub fn folder_conflicts(
     disk_lookup: &HashMap<String, usize>,
     queue: &Queue,
 ) -> Vec<FolderConflict> {
-    let own = managed
-        .get(&addon.id)
+    let record = managed.get(&addon.id);
+    let own = record
         .map(|record| folder_set(&record.folders))
+        .unwrap_or_default();
+    let said_yes = record
+        .map(|record| folder_set(&record.not_in_zip))
         .unwrap_or_default();
     let mut others: HashMap<String, Vec<String>> = HashMap::new();
     for (id, record) in managed {
@@ -471,7 +476,9 @@ pub fn folder_conflicts(
             FolderOwner::Addons(names)
         } else if let Some(op) = queue.incoming(&lower, &addon.id) {
             FolderOwner::Addons(vec![op.name.clone()])
-        } else if let Some(found) = found {
+        } else if let Some(found) = found
+            && !said_yes.contains(&lower)
+        {
             FolderOwner::Unmanaged(found.toc.title.clone())
         } else {
             continue;
@@ -568,10 +575,55 @@ pub struct Installed<'a> {
     pub channel: Channel,
     pub origin: Origin,
     pub folders: Vec<String>,
+    /// From [`not_in_zip`].
+    pub not_in_zip: Vec<String>,
     /// From `install::kept_zips`: the version just installed, then the one before it.
     pub kept: &'a [PathBuf],
     pub keep_previous: bool,
     pub now: i64,
+}
+
+/// The listed folders a finished install leaves with the player even though they said it
+/// could replace them, because its zip didn't bring them. `asked` is what it was allowed to
+/// replace, and `kept` the folders its record claims now. Remembered so the next update
+/// doesn't ask about the same folder again, and forgotten once the catalog stops listing it.
+pub fn not_in_zip(
+    prev: Option<&ManagedAddon>,
+    listed: &[String],
+    asked: &[String],
+    kept: &[String],
+) -> Vec<String> {
+    let listed = folder_set(listed);
+    let kept = folder_set(kept);
+    // The record's own folders it already had are this addon's, not the player's.
+    let own_before = prev.map(|p| folder_set(&p.folders)).unwrap_or_default();
+    let said_before = prev.map_or(&[][..], |p| p.not_in_zip.as_slice());
+    let said_now = asked
+        .iter()
+        .filter(|folder| !own_before.contains(&folder.to_lowercase()));
+    let mut seen = HashSet::new();
+    said_before
+        .iter()
+        .chain(said_now)
+        .filter(|folder| {
+            let lower = folder.to_lowercase();
+            listed.contains(&lower) && !kept.contains(&lower) && seen.insert(lower)
+        })
+        .cloned()
+        .collect()
+}
+
+/// Why an addon wasn't installed or updated, and where the player gets to decide.
+pub fn sitting_out_line<S: AsRef<str>>(name: &str, updating: bool, folders: &[S]) -> String {
+    let (done, verb) = if updating {
+        ("updated", "Update")
+    } else {
+        ("installed", "Install")
+    };
+    format!(
+        "{name} wasn't {done} because it would replace {}. {verb} it from its own page to choose.",
+        short_list(folders)
+    )
 }
 
 /// The record to store after an install, carrying over what should survive it.
@@ -600,6 +652,7 @@ pub fn record_after_install(prev: Option<&ManagedAddon>, facts: Installed<'_>) -
         origin: facts.origin,
         previous_zip,
         previous_version,
+        not_in_zip: facts.not_in_zip,
     }
 }
 
@@ -907,10 +960,78 @@ mod tests {
             channel: Channel::Stable,
             origin: Origin::Catalog,
             folders: vec!["A".to_owned()],
+            not_in_zip: Vec::new(),
             kept,
             keep_previous,
             now: 500,
         }
+    }
+
+    #[test]
+    fn a_yes_the_zip_did_not_need_is_remembered_until_the_catalog_drops_the_folder() {
+        let strings =
+            |names: &[&str]| -> Vec<String> { names.iter().map(|n| (*n).to_owned()).collect() };
+        let listed = strings(&["Foo", "Extra", "Shared"]);
+        // A first install the player let replace Extra and Shared, whose zip brought neither.
+        // Shared stayed in the record because another addon claims it.
+        let first = not_in_zip(
+            None,
+            &listed,
+            &strings(&["Extra", "Shared"]),
+            &strings(&["Foo", "Shared"]),
+        );
+        assert_eq!(first, ["Extra"]);
+
+        let mut prev = record("a", "1", &["Foo", "Shared"]);
+        prev.not_in_zip = first;
+        // The next update only asks to replace what's its own, and the yes carries over.
+        let again = not_in_zip(
+            Some(&prev),
+            &listed,
+            &strings(&["Foo", "Shared"]),
+            &strings(&["Foo", "Shared"]),
+        );
+        assert_eq!(again, ["Extra"]);
+        // A zip that brings it makes it the addon's own.
+        let brought = not_in_zip(Some(&prev), &listed, &[], &strings(&["Foo", "extra"]));
+        assert!(brought.is_empty());
+        // And once the catalog stops listing it, there's nothing to remember.
+        let gone = not_in_zip(Some(&prev), &strings(&["Foo"]), &[], &strings(&["Foo"]));
+        assert!(gone.is_empty());
+    }
+
+    #[test]
+    fn a_folder_the_player_already_let_this_replace_is_not_asked_about_again() {
+        let mut foo = record("foo", "1", &["Foo"]);
+        foo.not_in_zip = vec!["Extra".to_owned()];
+        let managed: BTreeMap<String, ManagedAddon> = [
+            ("foo".to_owned(), foo),
+            ("lib".to_owned(), record("lib", "1", &["Lib"])),
+        ]
+        .into();
+        let disk = [
+            on_disk("Foo", None),
+            on_disk("extra", Some("Extra from elsewhere")),
+            on_disk("Lib", None),
+        ];
+        let entry = entry("foo", &["Foo", "Extra", "Lib"]);
+        let found = conflicts_of(&entry, &managed, &disk);
+        assert_eq!(
+            found,
+            vec![FolderConflict {
+                folder: "Lib".to_owned(),
+                owner: FolderOwner::Addons(vec!["lib".to_owned()]),
+            }],
+            "only what isn't the player's own copy any more"
+        );
+        // Another addon's record claiming it later is a new question.
+        let mut managed = managed;
+        managed
+            .get_mut("lib")
+            .unwrap()
+            .folders
+            .push("Extra".to_owned());
+        assert_eq!(conflicts_of(&entry, &managed, &disk).len(), 2);
     }
 
     #[test]

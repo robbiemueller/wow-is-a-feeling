@@ -80,6 +80,11 @@ pub struct ManagedAddon {
     /// The zip of the version this one replaced, for rolling back.
     pub previous_zip: Option<PathBuf>,
     pub previous_version: Option<String>,
+    /// Folders the catalog lists for this addon that the player let it replace, but that its
+    /// zip didn't bring. They're still the player's, so they aren't in `folders`, and updates
+    /// don't ask about them again unless a zip brings one.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub not_in_zip: Vec<String>,
 }
 
 /// How an addon came to be managed.
