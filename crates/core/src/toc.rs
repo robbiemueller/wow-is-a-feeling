@@ -36,8 +36,6 @@ pub struct Toc {
     pub version: Option<String>,
     /// Every number from `## Interface:` plus the Forever-specific overrides.
     pub interfaces: Vec<u32>,
-    /// True when `## Interface-Forever:` or `## Interface-Camelot:` was present.
-    pub has_forever_override: bool,
     /// Required addons (`Dependencies`, `RequiredDeps`, or any key starting with `Dep`).
     pub deps: Vec<String>,
     /// Load-order hints only. Never auto-installed.
@@ -55,8 +53,7 @@ pub struct Toc {
 impl Toc {
     /// Does this TOC declare that it runs on Forever?
     pub fn targets_forever(&self) -> bool {
-        let interface_ok =
-            self.has_forever_override || self.interfaces.iter().copied().any(is_forever_interface);
+        let interface_ok = self.interfaces.iter().copied().any(is_forever_interface);
         let game_type_ok = self.allow_game_types.is_empty()
             || self
                 .allow_game_types
@@ -107,7 +104,6 @@ pub fn parse(text: &str) -> Toc {
             "interface" => base_interfaces = parse_numbers(value),
             "interface-forever" | "interface-camelot" => {
                 forever_interfaces.extend(parse_numbers(value));
-                toc.has_forever_override = true;
             }
             "optionaldeps" | "optionaldependencies" => {
                 toc.optional_deps.extend(parse_name_list(value));
@@ -323,6 +319,21 @@ mod tests {
         let toc = parse("## Interface: 120105\n## Interface-Camelot: 16001\n");
         assert!(toc.targets_forever());
         assert_eq!(toc.interfaces[0], 16001);
+    }
+
+    #[test]
+    fn an_override_line_without_a_forever_number_does_not_count() {
+        for line in [
+            "## Interface-Camelot: 0",
+            "## Interface-Forever: none",
+            "## Interface-Camelot: 120105",
+            "## Interface-Forever: 20000",
+            "## Interface-Forever: 99999999999999999999",
+        ] {
+            let toc = parse(&format!("## Interface: 120105\n{line}\n"));
+            assert!(!toc.targets_forever(), "{line}");
+            assert_eq!(toc.forever_interface(), None, "{line}");
+        }
     }
 
     #[test]
