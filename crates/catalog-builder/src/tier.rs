@@ -23,6 +23,9 @@ pub fn assign_tiers(candidates: &mut [Candidate], boosts: &BTreeMap<String, f64>
     for (at, candidate) in candidates.iter_mut().enumerate() {
         if candidate.no_longer_forever {
             candidate.addon.tier = 0;
+        } else if !candidate.addon.trusted {
+            // Its counts are claims until it's established, so they earn no color.
+            candidate.addon.tier = 1;
         } else {
             let boost = boosts.get(&candidate.addon.id).copied().unwrap_or(0.0);
             ranked.push((at, popularity(candidate, boost)));
@@ -63,9 +66,20 @@ mod tests {
                 let mut c = Candidate::default();
                 c.addon.id = format!("gh:a/{i:04}");
                 c.addon.downloads = (count - i) as u64 * 100;
+                c.addon.trusted = true;
                 c
             })
             .collect()
+    }
+
+    #[test]
+    fn an_untrusted_entry_earns_no_color_however_popular() {
+        let mut list = candidates(100);
+        list[0].addon.trusted = false;
+        list[0].addon.downloads = u64::MAX / 2;
+        assign_tiers(&mut list, &BTreeMap::new());
+        assert_eq!(list[0].addon.tier, 1);
+        assert_eq!(list[1].addon.tier, 5);
     }
 
     #[test]

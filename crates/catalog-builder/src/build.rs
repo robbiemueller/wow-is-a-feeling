@@ -1568,6 +1568,9 @@ mod tests {
             addon_candidate("gh:a/x", "x thing", 5),
             addon_candidate("gh:a/y", "Questie", 500),
         ];
+        for candidate in &mut list {
+            candidate.addon.trusted = true;
+        }
         let curated = Curated {
             overrides: BTreeMap::from([(
                 "gh:a/x".to_string(),

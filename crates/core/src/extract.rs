@@ -193,7 +193,7 @@ pub fn planned_folders(names: &[(String, bool)]) -> Result<Vec<String>> {
             });
         }
     }
-    Ok(plan_addons(&entries, &[])?.folders)
+    Ok(plan_addons(&entries, &[], &Limits::default())?.folders)
 }
 
 /// How [`extract_tree`] treats what it finds.

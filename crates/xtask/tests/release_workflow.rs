@@ -321,7 +321,7 @@ impl Rig {
         let turn = one_at_a_time();
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().to_path_buf();
-        for folder in ["bin", "store", "work"] {
+        for folder in ["bin", "store", "work", "outputs"] {
             fs::create_dir(root.join(folder)).unwrap();
         }
         fs::write(root.join("log"), "").unwrap();
@@ -367,6 +367,17 @@ impl Rig {
 
     fn log(&self) -> String {
         fs::read_to_string(self.root.join("log")).unwrap()
+    }
+
+    /// What a job wrote to `$GITHUB_OUTPUT`. Each job output here is named after the step
+    /// output it passes on, which `job_outputs_pass_step_outputs_on_unchanged` holds to.
+    fn job_output(&self, job: &str, key: &str) -> String {
+        let written = fs::read_to_string(self.root.join("outputs").join(job)).unwrap_or_default();
+        written
+            .lines()
+            .find_map(|line| line.strip_prefix(key)?.strip_prefix('='))
+            .unwrap_or_default()
+            .to_string()
     }
 
     fn fake_builds(&self) {
@@ -485,6 +496,8 @@ impl Rig {
             .env("GITHUB_REPOSITORY", REPOSITORY)
             .env("REAL_XTASK", env!("CARGO_BIN_EXE_xtask"))
             .env("REAL_XTASK_SIGN", env!("CARGO_BIN_EXE_xtask-sign"));
+        let job = work.file_name().unwrap().to_string_lossy().into_owned();
+        command.env("GITHUB_OUTPUT", self.root.join("outputs").join(&job));
         if !extra_env.iter().any(|(key, _)| *key == "GITHUB_REF_NAME") {
             command.env("GITHUB_REF_NAME", release_tag());
         }
@@ -496,7 +509,14 @@ impl Rig {
                 "${{ secrets.MINISIGN_SECRET_KEY }}" => self.secret_key.clone(),
                 "${{ github.token }}" => "fake-token".to_string(),
                 "${{ github.repository }}" => REPOSITORY.to_string(),
-                other => panic!("{key} is set to {other}, which this test doesn't know"),
+                other => match other
+                    .strip_prefix("${{ needs.")
+                    .and_then(|rest| rest.strip_suffix(" }}"))
+                    .and_then(|rest| rest.split_once(".outputs."))
+                {
+                    Some((job, output)) => self.job_output(job, output),
+                    None => panic!("{key} is set to {other}, which this test doesn't know"),
+                },
             };
             command.env(key, value);
         }
@@ -710,11 +730,113 @@ fn the_key_is_in_one_step_of_one_small_job() {
                     || uses.starts_with("actions/upload-artifact@"),
                 "{uses}"
             );
+        } else if step.label() == "Check the signing tool and manifest are the ones their jobs made"
+        {
+            assert_eq!(keyed_steps, 0, "the check has to come before the key");
+            assert!(
+                step.script()
+                    .unwrap()
+                    .contains("sha256sum --check --strict")
+            );
         } else {
             assert_eq!(step.script().unwrap(), "chmod +x signer/xtask-sign\n");
         }
     }
     assert_eq!(keyed_steps, 1);
+}
+
+#[test]
+fn job_outputs_pass_step_outputs_on_unchanged() {
+    let text = workflow("release.yml");
+    for job in jobs(&text) {
+        let Some(at) = job.lines.iter().position(|line| *line == "    outputs:") else {
+            continue;
+        };
+        for line in job.lines[at + 1..]
+            .iter()
+            .take_while(|line| line.starts_with("      "))
+        {
+            let (name, value) = line.trim().split_once(": ").unwrap();
+            assert_eq!(
+                value,
+                format!("${{{{ steps.hash.outputs.{name} }}}}"),
+                "{}",
+                job.name
+            );
+        }
+    }
+}
+
+#[test]
+fn a_swapped_signing_tool_is_refused_before_the_key_is_used() {
+    let Some(rig) = Rig::new() else { return };
+    rig.fake_builds();
+    for job in ["signer", "manifest"] {
+        rig.run_job(job, &[]).unwrap();
+    }
+    let leak = rig.root.join("leaked-key");
+    let tool = rig.store("signer").join("xtask-sign");
+    fs::write(
+        &tool,
+        format!(
+            "#!/bin/sh\nprintf '%s' \"$MINISIGN_SECRET_KEY\" > '{}'\n",
+            leak.display()
+        ),
+    )
+    .unwrap();
+    let failure = rig.run_job("sign", &[]).unwrap_err();
+    assert_eq!(
+        failure.step,
+        "Check the signing tool and manifest are the ones their jobs made"
+    );
+    assert!(!leak.exists());
+    assert!(!rig.store("signature").exists());
+}
+
+#[test]
+fn a_swapped_manifest_is_refused_before_signing() {
+    let Some(rig) = Rig::new() else { return };
+    rig.fake_builds();
+    for job in ["signer", "manifest"] {
+        rig.run_job(job, &[]).unwrap();
+    }
+    let manifest = rig.store("manifest").join("latest.json");
+    let changed = fs::read_to_string(&manifest).unwrap().replace(
+        "wow-is-a-feeling-windows-x64.exe",
+        "wow-is-a-feeling-windows-x64.exe?x",
+    );
+    fs::write(&manifest, changed).unwrap();
+    let failure = rig.run_job("sign", &[]).unwrap_err();
+    assert_eq!(
+        failure.step,
+        "Check the signing tool and manifest are the ones their jobs made"
+    );
+    assert!(!rig.store("signature").exists());
+}
+
+#[test]
+fn a_release_file_changed_or_added_after_hashing_is_refused() {
+    for change in ["changed", "added"] {
+        let Some(rig) = Rig::new() else { return };
+        rig.signed_release();
+        let _ = rig.run_job("verify", &[]);
+        let assets = rig.store("assets");
+        if change == "changed" {
+            fs::write(
+                assets.join("wow-is-a-feeling-linux-x64.tar.gz"),
+                "something else",
+            )
+            .unwrap();
+        } else {
+            fs::write(assets.join("extra.exe"), "something else").unwrap();
+        }
+        let failure = rig.run_job("publish", &[]).unwrap_err();
+        assert_eq!(
+            failure.step, "Check these are exactly the files the manifest job made",
+            "{change}"
+        );
+        assert!(!rig.log().contains("gh release create"), "{change}");
+    }
 }
 
 #[test]

@@ -325,6 +325,8 @@ struct Ledger {
     names: HashMap<String, Vec<usize>>,
     folders: HashMap<String, Vec<usize>>,
     per_owner: HashMap<String, usize>,
+    /// Folders that entries kept so far require, folded.
+    required: HashSet<String>,
 }
 
 impl Ledger {
@@ -340,6 +342,8 @@ impl Ledger {
                 .or_default()
                 .push(at);
         }
+        self.required
+            .extend(candidate.addon.deps.iter().map(|dep| fold_folder(dep)));
         if let Some(owner) = owner_of(&candidate)
             && !picks.contains(&candidate.addon.id)
         {
@@ -406,6 +410,25 @@ impl Ledger {
         None
     }
 
+    /// A folder that listed addons require and nothing provides yet is the easiest one to
+    /// squat: once a newcomer was trusted, the app would install it as a dependency. So only
+    /// something already listed with that folder, a listing or a hand-picked repo may fill it.
+    fn squats_a_dependency(&self, candidate: &Candidate, last: &LastCatalog) -> Option<String> {
+        if is_baseline(candidate) || is_listing(candidate) {
+            return None;
+        }
+        candidate.addon.folders.iter().find_map(|folder| {
+            let folded = fold_folder(folder);
+            let fills_a_gap =
+                self.required.contains(&folded) && !self.folders.contains_key(&folded);
+            (fills_a_gap && !last.had_folder(&candidate.addon.id, &folded)).then(|| {
+                format!(
+                    "it would be the first to provide {folder}, which addons already listed require"
+                )
+            })
+        })
+    }
+
     fn at(&self, places: Option<&Vec<usize>>) -> Vec<&Candidate> {
         places
             .into_iter()
@@ -437,6 +460,13 @@ impl<'a> LastCatalog<'a> {
                 .insert(addon.id.to_ascii_lowercase(), folders);
         }
         last
+    }
+
+    /// Whether the last catalog listed this entry with this folder.
+    fn had_folder(&self, id: &str, folded: &str) -> bool {
+        self.folders_of
+            .get(&id.to_ascii_lowercase())
+            .is_some_and(|folders| folders.contains(folded))
     }
 
     /// For an entry that was already listed: a folder it has only now added, which another
@@ -510,7 +540,12 @@ pub fn hold_collisions(
                 reserved.or_else(|| last.added_a_taken_folder(&candidate, &present))
             })
             .flatten()
-            .or_else(|| ledger.conflict(&candidate, picks));
+            .or_else(|| ledger.conflict(&candidate, picks))
+            .or_else(|| {
+                (!picks.contains(&candidate.addon.id))
+                    .then(|| ledger.squats_a_dependency(&candidate, &last))
+                    .flatten()
+            });
         match problem {
             Some(reason) => held.push(Held::new(&candidate.addon, reason)),
             None => ledger.keep(candidate, picks),
@@ -677,6 +712,37 @@ mod tests {
             previous,
         };
         hold_collisions(std::mem::take(list), &rules)
+    }
+
+    #[test]
+    fn a_newcomer_cannot_be_the_first_to_fill_a_dependency() {
+        let mut needs = gh("someone/NeedsLib", &["NeedsLib"]);
+        needs.addon.deps = vec!["LibMissing".into()];
+        let before = published(&[(&needs, 0)]);
+        let squatter = gh("stranger/LibMissing", &["LibMissing"]);
+        let (kept, held) = pass(vec![needs.clone(), squatter], &picks(&[]), Some(&before));
+        assert_eq!(held_ids(&held), ["gh:stranger/LibMissing"]);
+        assert_eq!(ids(&kept), ["gh:someone/NeedsLib"]);
+
+        // A listing or a hand-picked repo still can, and so can anything once a provider exists.
+        let listing = wowi(42, "LibMissing", &["LibMissing"]);
+        let (kept, held) = pass(vec![needs.clone(), listing], &picks(&[]), Some(&before));
+        assert!(held.is_empty(), "{:?}", held_ids(&held));
+        assert_eq!(kept.len(), 2);
+        let chosen = gh("trusted/LibMissing", &["LibMissing"]);
+        let (_, held) = pass(
+            vec![needs.clone(), chosen],
+            &picks(&["trusted/LibMissing"]),
+            Some(&before),
+        );
+        assert!(held.is_empty(), "{:?}", held_ids(&held));
+
+        // Something already listed with that folder keeps it, however young.
+        let young = gh("someone/LibMissing", &["LibMissing"]);
+        let before = published(&[(&needs, 0), (&young, NOW - 3 * DAY)]);
+        let (kept, held) = pass(vec![needs, young], &picks(&[]), Some(&before));
+        assert!(held.is_empty(), "{:?}", held_ids(&held));
+        assert_eq!(kept.len(), 2);
     }
 
     #[test]

@@ -97,12 +97,19 @@ impl SearchIndex {
         let mut by_name: Vec<u32> = (0..addons.len() as u32).collect();
         by_name.sort_by(|&a, &b| lower_names[a as usize].cmp(&lower_names[b as usize]));
 
+        // An untrusted entry's counts are only claims, so it doesn't climb Most popular on them.
+        // A catalog built before the flag existed ranks as it always did.
+        let counted = {
+            let any_trusted = addons.iter().any(|a| a.trusted);
+            move |addon: &Addon| !any_trusted || addon.trusted
+        };
         let mut by_popularity = by_name.clone();
         by_popularity.sort_by_key(|&i| {
             let i = i as usize;
+            let counts = counted(&addons[i]);
             (
-                std::cmp::Reverse(popularity[i]),
-                std::cmp::Reverse(addons[i].downloads),
+                std::cmp::Reverse(if counts { popularity[i] } else { 0 }),
+                std::cmp::Reverse(if counts { addons[i].downloads } else { 0 }),
             )
         });
 
@@ -117,7 +124,9 @@ impl SearchIndex {
             } else {
                 release_date(addon)
             };
-            std::cmp::Reverse(first_seen)
+            // Everything listed before ages were kept shares one date, so the latest release
+            // breaks that tie.
+            std::cmp::Reverse((first_seen, release_date(addon)))
         });
 
         // Among equal matches, trusted entries come first. A catalog built before the flag

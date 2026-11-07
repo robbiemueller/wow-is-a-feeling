@@ -179,6 +179,10 @@ jobs:
   signer:
     needs: check-tag
     runs-on: ubuntu-22.04
+    # Job outputs can't be changed by any other job, unlike artifacts, so the sign job checks
+    # the tool against this before the key is anywhere near it.
+    outputs:
+      digest: ${{ steps.hash.outputs.digest }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -188,6 +192,9 @@ jobs:
           rustup toolchain install stable --profile minimal --no-self-update
           rustup default stable
       - run: cargo build --locked -p xtask --no-default-features --bin xtask-sign
+      - name: Hash the signing tool
+        id: hash
+        run: echo "digest=$(sha256sum target/debug/xtask-sign | cut -c1-64)" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: signer
@@ -197,6 +204,11 @@ jobs:
   manifest:
     needs: [windows, linux, macos]
     runs-on: ubuntu-22.04
+    # What sign and publish check their downloads against: the release files as a set, and
+    # latest.json, which only covers the four files the app updates from.
+    outputs:
+      assets: ${{ steps.hash.outputs.assets }}
+      manifest: ${{ steps.hash.outputs.manifest }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -256,6 +268,13 @@ jobs:
           target/debug/xtask make-latest --version "$version" --notes-file notes.md --assets-dir release --base-url "$base"
           mkdir manifest
           mv release/latest.json manifest/
+      - name: Hash what goes on
+        id: hash
+        run: |
+          assets=$(cd release && sha256sum -- * | LC_ALL=C sort -k2 | sha256sum | cut -c1-64)
+          manifest=$(sha256sum manifest/latest.json | cut -c1-64)
+          echo "assets=$assets" >> "$GITHUB_OUTPUT"
+          echo "manifest=$manifest" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: assets
@@ -288,6 +307,14 @@ jobs:
         with:
           name: manifest
           path: manifest
+      - name: Check the signing tool and manifest are the ones their jobs made
+        env:
+          SIGNER: ${{ needs.signer.outputs.digest }}
+          MANIFEST: ${{ needs.manifest.outputs.manifest }}
+        run: |
+          test -n "$SIGNER" && test -n "$MANIFEST"
+          echo "$SIGNER  signer/xtask-sign" | sha256sum --check --strict
+          echo "$MANIFEST  manifest/latest.json" | sha256sum --check --strict
       - run: chmod +x signer/xtask-sign
       - name: Sign latest.json
         env:
@@ -324,7 +351,7 @@ jobs:
           tool/xtask verify-latest release/latest.json
 
   publish:
-    needs: verify
+    needs: [verify, manifest]
     runs-on: ubuntu-22.04
     permissions:
       contents: write
@@ -343,6 +370,28 @@ jobs:
         with:
           name: signature
           path: release
+      - name: Check these are exactly the files the manifest job made
+        env:
+          ASSETS: ${{ needs.manifest.outputs.assets }}
+          MANIFEST: ${{ needs.manifest.outputs.manifest }}
+        run: |
+          test -n "$ASSETS" && test -n "$MANIFEST"
+          expected=$(printf '%s\n' latest.json latest.json.minisig \
+            wow-is-a-feeling-linux-x64.AppImage wow-is-a-feeling-linux-x64.gz \
+            wow-is-a-feeling-linux-x64.tar.gz wow-is-a-feeling-macos-universal.dmg \
+            wow-is-a-feeling-macos-universal.zip wow-is-a-feeling-windows-x64.exe | LC_ALL=C sort)
+          found=$(cd release && ls -1A | LC_ALL=C sort)
+          if [ "$found" != "$expected" ]; then
+            echo "::error::The release files aren't the expected set, so nothing was published:"
+            echo "$found"
+            exit 1
+          fi
+          echo "$MANIFEST  release/latest.json" | sha256sum --check --strict
+          assets=$(cd release && sha256sum -- wow-is-a-feeling-* | LC_ALL=C sort -k2 | sha256sum | cut -c1-64)
+          if [ "$assets" != "$ASSETS" ]; then
+            echo "::error::The release files changed after the manifest job hashed them, so nothing was published."
+            exit 1
+          fi
       - name: Check each asset against the signed hashes
         run: |
           jq -r '.assets[] | "\(.sha256)  \(.url | split("/") | last)"' release/latest.json > signed-hashes
