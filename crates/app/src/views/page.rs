@@ -18,6 +18,9 @@ const BUTTON_HEIGHT: f32 = 26.0;
 const ROW_GAP: f32 = 6.0;
 const CHECK_HEIGHT: f32 = 20.0;
 
+/// Beside a required addon that an install leaves out, because nobody has reviewed it.
+pub const INSTALL_IT_YOURSELF: &str = "(install it yourself)";
+
 pub fn show(app: &mut App, ui: &mut Ui, rect: Rect) {
     paper(app, ui, rect);
     match app.page_kind() {
@@ -401,6 +404,16 @@ fn requires(app: &mut App, ui: &mut Ui, addon: &Addon) {
         return;
     }
     let bundle = app.bundle.clone();
+    // What an install would leave for the player to add, decided the same way it decides.
+    let yourself: Vec<String> = bundle.as_deref().map_or_else(Vec::new, |b| {
+        let installed = app.installed_folders();
+        deps::resolve(&addon.id, &b.catalog, &b.folders, installed.iter())
+            .unreviewed
+            .into_iter()
+            .filter(|left| left.needed_by == addon.id && app.managed(&left.provider).is_none())
+            .map(|left| left.folder.to_lowercase())
+            .collect()
+    });
     widgets::fact_with(ui, "Requires:", |ui| {
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
@@ -417,6 +430,14 @@ fn requires(app: &mut App, ui: &mut Ui, addon: &Addon) {
                         if link.clicked() {
                             app.actions
                                 .push(Action::Select(Selection::Addon(provider.id.clone())));
+                        }
+                        if yourself.contains(&dep.to_lowercase()) {
+                            widgets::ink(
+                                ui,
+                                INSTALL_IT_YOURSELF,
+                                theme::body(14.0),
+                                theme::INK_SOFT,
+                            );
                         }
                     }
                     None => {

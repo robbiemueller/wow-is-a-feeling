@@ -175,6 +175,7 @@ fn publish_bundle(
         tier: 3,
         downloads: 100,
         trusted: true,
+        reviewed: true,
         ..Default::default()
     }
 }
@@ -963,6 +964,88 @@ fn a_required_addon_from_a_stranger_stays_out_and_the_player_is_told() {
 }
 
 #[test]
+fn a_dropped_zips_folder_that_a_catalog_addon_lists_but_does_not_bring_stays_shared() {
+    let rig = Rig::new();
+    // The catalog's list comes from one build, and this build of Foo leaves Side out.
+    let foo = |version: &str| publish_bundle(&rig.site, FOO, &["Foo", "Side"], &["Foo"], version);
+    rig.site.publish(&catalog_of(vec![foo("1.0")]));
+    let mut h = rig.launch_settled();
+    let zip = rig.home.path().join("Side.zip");
+    fs::write(&zip, addon_zip("Side", "mine")).unwrap();
+    drop_file(&mut h, zip);
+    finish_ops(&mut h);
+    assert!(managed(&h, "local:Side").is_some());
+
+    click(&mut h, "Browse");
+    click(&mut h, "Foo Addon, 1.0");
+    click(&mut h, "Install");
+    assert!(has_label(&h, "Side: part of Side"));
+    click(&mut h, "Replace them");
+    finish_ops(&mut h);
+    assert_eq!(rig.version_on_disk("Side").as_deref(), Some("mine"));
+    assert!(
+        managed(&h, "local:Side").is_some(),
+        "the zip didn't bring Side, so the dropped one still has it"
+    );
+    close(h);
+
+    // So Foo doesn't own it alone, and its next version, without it too, leaves it there.
+    rig.site.publish(&catalog_of(vec![foo("2.0")]));
+    let mut h = rig.launch_settled();
+    click(&mut h, "Update all (1)");
+    finish_ops(&mut h);
+    assert_eq!(rig.version_on_disk("Foo").as_deref(), Some("2.0"));
+    assert_eq!(rig.version_on_disk("Side").as_deref(), Some("mine"));
+}
+
+#[test]
+fn a_required_addon_nobody_reviewed_is_left_for_the_player_to_install() {
+    let rig = Rig::new();
+    // Old enough to trust, but no person picked it, and it could be anyone's Foo.
+    let mut foo = publish_addon(&rig.site, FOO, "Foo", "1.0");
+    foo.reviewed = false;
+    let mut bar = publish_addon(&rig.site, BAR, "Bar", "1.0");
+    bar.deps = vec!["Foo".to_owned()];
+    let mut catalog = catalog_of(vec![foo, bar]);
+    catalog.featured = vec![BAR.to_owned()];
+    rig.site.publish(&catalog);
+
+    let mut h = rig.launch_settled();
+    click(&mut h, "Bar Addon, 1.0");
+    assert!(has_label(&h, "Foo Addon"), "Requires still names the pick");
+    assert!(
+        has_label(&h, crate::views::page::INSTALL_IT_YOURSELF),
+        "and says an install won't add it"
+    );
+    click(&mut h, "Install");
+    assert!(app(&h).popup.is_none());
+    assert!(said(
+        &h,
+        "Bar Addon requires Foo Addon, which wasn't added because nobody has reviewed it. \
+         Click it under Requires on the Bar Addon page to see who made it, and install it \
+         yourself."
+    ));
+    finish_ops(&mut h);
+    assert_eq!(rig.version_on_disk("Bar").as_deref(), Some("1.0"));
+    assert!(!rig.addons().join("Foo").exists());
+    assert!(managed(&h, FOO).is_none());
+
+    // The link still goes to it, so the player can see who made it and add it from there.
+    click(&mut h, "My Addons");
+    click(&mut h, "Bar Addon, 1.0");
+    click(&mut h, "Foo Addon");
+    assert_eq!(app(&h).page_kind(), PageKind::Addon(FOO.to_owned()));
+    click(&mut h, "Install");
+    finish_ops(&mut h);
+    assert_eq!(rig.version_on_disk("Foo").as_deref(), Some("1.0"));
+    click(&mut h, "Bar Addon, 1.0");
+    assert!(
+        !has_label(&h, crate::views::page::INSTALL_IT_YOURSELF),
+        "nothing left to do"
+    );
+}
+
+#[test]
 fn a_required_addon_that_would_replace_something_is_left_out() {
     let rig = Rig::new();
     rig.plant("Questie", "mine");
@@ -1272,6 +1355,40 @@ fn dominos_shares_a_folder_and_only_asks_about_it_once() {
 }
 
 #[test]
+fn a_removal_waiting_behind_a_sharing_install_leaves_the_shared_folder() {
+    let rig = Rig::new();
+    let masque = publish_addon(&rig.site, MASQUE, "Masque_Dominos", "1.0");
+    rig.site
+        .publish(&catalog_of(vec![masque, dominos(&rig.site, "1.0")]));
+    let mut h = rig.launch_settled();
+    click(&mut h, "Masque_Dominos Addon, 1.0");
+    click(&mut h, "Install");
+    finish_ops(&mut h);
+
+    // "Dominos includes it, so drop the separate one", asked while Dominos is on its way. The
+    // removal was planned when nobody else claimed the folder. Both go in before another
+    // frame, so the removal waits behind the install however quick that is.
+    app_mut(&mut h).ask_remove(&Selection::Addon(MASQUE.to_owned()));
+    let Some(Popup::Remove(plan)) = app_mut(&mut h).popup.take() else {
+        panic!("Remove asks first");
+    };
+    assert_eq!(plan.folders, ["Masque_Dominos"]);
+    let agreed = vec!["Masque_Dominos".to_owned()];
+    app_mut(&mut h).apply(Action::ReplaceAndInstall(DOMINOS.to_owned(), agreed));
+    app_mut(&mut h).apply(Action::ConfirmRemove(plan));
+    finish_ops(&mut h);
+    assert!(managed(&h, MASQUE).is_none());
+    assert_eq!(
+        managed(&h, DOMINOS).unwrap().folders,
+        ["Dominos", "Masque_Dominos"]
+    );
+    assert!(
+        rig.addons().join("Masque_Dominos").exists(),
+        "Dominos still claims it"
+    );
+}
+
+#[test]
 fn a_shared_folder_the_zip_did_not_bring_is_only_asked_about_once() {
     // The catalog keeps one list of folders per addon, so a build can have fewer than it says.
     let rig = Rig::new();
@@ -1314,13 +1431,9 @@ fn a_folder_the_zip_did_not_bring_stays_the_players_own() {
     let rig = Rig::new();
     rig.plant("Extra", "mine");
     let listed = ["Foo", "Extra"];
-    rig.site.publish(&catalog_of(vec![publish_bundle(
-        &rig.site,
-        FOO,
-        &listed,
-        &["Foo"],
-        "1.0",
-    )]));
+    // The catalog's list comes from one build, and the zips served leave Extra out.
+    let without = |version: &str| publish_bundle(&rig.site, FOO, &listed, &["Foo"], version);
+    rig.site.publish(&catalog_of(vec![without("1.0")]));
     let mut h = rig.launch_settled();
     click(&mut h, "Browse");
     click(&mut h, "Foo Addon, 1.0");
@@ -1331,13 +1444,89 @@ fn a_folder_the_zip_did_not_bring_stays_the_players_own() {
     assert_eq!(rig.version_on_disk("Extra").as_deref(), Some("mine"));
 
     // If it had gone in the record, this next install, whose zip doesn't have it either,
-    // would delete a folder that was never replaced. So the question comes back instead.
+    // would delete a folder that was never replaced. It stays out, and the player already
+    // said yes, so nothing asks again.
     click(&mut h, "Reinstall");
-    assert!(matches!(app(&h).popup, Some(Popup::Replace(_))));
-    click(&mut h, "Replace them");
+    assert!(app(&h).popup.is_none(), "it asked again");
     finish_ops(&mut h);
     assert_eq!(rig.version_on_disk("Extra").as_deref(), Some("mine"));
     assert_eq!(rig.version_on_disk("Foo").as_deref(), Some("1.0"));
+    close(h);
+
+    // Nor does Update all leave it out, after a restart either.
+    rig.site.publish(&catalog_of(vec![without("2.0")]));
+    let mut h = rig.launch_settled();
+    click(&mut h, "Update all (1)");
+    assert!(
+        !said(&h, "wasn't updated"),
+        "{:?}",
+        app(&h).messages.texts()
+    );
+    finish_ops(&mut h);
+    assert_eq!(rig.version_on_disk("Foo").as_deref(), Some("2.0"));
+    assert_eq!(rig.version_on_disk("Extra").as_deref(), Some("mine"));
+    assert!(app(&h).messages.errors().is_empty());
+    close(h);
+
+    // A zip that really brings it is refused, because the yes was for one that didn't, and
+    // from then on it asks.
+    rig.site.publish(&catalog_of(vec![publish_bundle(
+        &rig.site, FOO, &listed, &listed, "3.0",
+    )]));
+    let mut h = rig.launch_settled();
+    click(&mut h, "Update all (1)");
+    finish_ops(&mut h);
+    assert_eq!(rig.version_on_disk("Extra").as_deref(), Some("mine"));
+    assert_eq!(rig.version_on_disk("Foo").as_deref(), Some("2.0"));
+    assert!(
+        app(&h).messages.errors().contains(
+            &"Foo Addon wasn't updated because it would replace Extra. Update it from its own \
+              page to choose."
+        ),
+        "{:?}",
+        app(&h).messages.texts()
+    );
+    click(&mut h, "Foo Addon, update");
+    click(&mut h, "Update");
+    assert!(matches!(app(&h).popup, Some(Popup::Replace(_))));
+    click(&mut h, "Replace them");
+    finish_ops(&mut h);
+    assert_eq!(rig.version_on_disk("Extra").as_deref(), Some("3.0"));
+    assert_eq!(managed(&h, FOO).unwrap().folders, ["Foo", "Extra"]);
+}
+
+#[test]
+fn a_folder_that_turned_up_since_the_last_look_is_asked_about_next_time() {
+    let rig = Rig::new();
+    let listed = ["Foo", "Extra"];
+    rig.site.publish(&catalog_of(vec![publish_bundle(
+        &rig.site, FOO, &listed, &listed, "1.0",
+    )]));
+    let mut h = rig.launch_settled();
+    // Copied in by hand after the app looked, so it can't know to ask.
+    rig.plant("Extra", "mine");
+    click(&mut h, "Foo Addon, 1.0");
+    click(&mut h, "Install");
+    assert!(app(&h).popup.is_none());
+    finish_ops(&mut h);
+    assert_eq!(rig.version_on_disk("Extra").as_deref(), Some("mine"));
+    assert!(managed(&h, FOO).is_none());
+    assert!(
+        app(&h).messages.errors().contains(
+            &"Foo Addon wasn't installed because it would replace Extra. Install it from its own \
+              page to choose."
+        ),
+        "the catalog does list it: {:?}",
+        app(&h).messages.texts()
+    );
+
+    // It looked again, so the next press asks instead of being refused all over again.
+    click(&mut h, "Install");
+    assert!(matches!(app(&h).popup, Some(Popup::Replace(_))));
+    assert!(has_label(
+        &h,
+        "Extra: Extra from elsewhere, not installed by this app"
+    ));
 }
 
 #[test]
@@ -1696,8 +1885,9 @@ fn update_all_backs_up_settings_first_and_counts_on_the_bar() {
 
     let mut h = rig.launch_settled();
     let ids: Vec<String> = names.iter().map(|n| format!("direct:{n}")).collect();
-    app_mut(&mut h).actions.push(Action::Install(ids));
-    h.step();
+    // Applied here and looked at before another frame, so no worker can have answered yet,
+    // however fast the machine is. Answers only land when a frame reads them.
+    app_mut(&mut h).apply(Action::Install(ids.clone()));
     assert_eq!(app(&h).casting().unwrap().text, "Installing 1 of 4");
     finish_ops(&mut h);
     let backups = rig.dirs.backups();
@@ -1714,12 +1904,20 @@ fn update_all_backs_up_settings_first_and_counts_on_the_bar() {
     rig.site.publish(&catalog_of(v2));
     let mut h = rig.launch_settled();
     assert!(has_label(&h, "Update all (4)"));
-    click(&mut h, "Update all (4)");
-    let cast = app(&h).casting().unwrap();
+    // What the button does, checked the same way: the backup is the one running, alone, and
+    // all four updates wait behind it, which the queue holds to until the backup is done.
+    app_mut(&mut h).apply(Action::UpdateAll);
+    let queue = &app(&h).queue;
     assert_eq!(
-        cast.text, "Backing up your settings",
+        queue.casting().unwrap().text,
+        "Backing up your settings",
         "the bar shows the backup first"
     );
+    assert_eq!(queue.running_count(), 1, "nothing runs beside it");
+    assert!(queue.busy_exclusive());
+    for id in &ids {
+        assert!(queue.busy_with(id), "{id} waits its turn");
+    }
     finish_ops(&mut h);
     for name in names {
         assert_eq!(rig.version_on_disk(name).as_deref(), Some("2.0"));

@@ -4,14 +4,14 @@
 use crate::app::App;
 use crate::dialogs::{ListPreview, Popup, RemovePlan, ReplacePlan};
 use crate::easter;
-use crate::model::{self, HeaderId, Section, Selection, Tab};
+use crate::model::{self, CatalogBundle, HeaderId, Section, Selection, Tab};
 use crate::ops::{self, FolderConflict, Op, OpKind, Verb, folder_set};
 use crate::views::settings::VERSION;
 use crate::worker::FoundGame;
 use eframe::egui::OpenUrl;
 use feeling_core::backup::{self, BackupEntry};
 use feeling_core::catalog::{Addon, Channel, Release};
-use feeling_core::deps;
+use feeling_core::deps::{self, Unreviewed};
 use feeling_core::listfile;
 use feeling_core::search::SortBy;
 use feeling_core::selfupdate::UpdateInfo;
@@ -307,6 +307,7 @@ impl App {
         let installed = self.installed_folders();
         let mut plan: Vec<String> = Vec::new();
         let mut chained: HashSet<String> = HashSet::new();
+        let mut told: HashSet<String> = HashSet::new();
         for id in ids {
             if self.queue.busy_with(id) {
                 continue;
@@ -317,7 +318,8 @@ impl App {
             {
                 let conflicts = self.folder_conflicts(addon);
                 if !conflicts.is_empty() {
-                    let line = sitting_out_line(name, self.managed(id).is_some(), &conflicts);
+                    let folders: Vec<&str> = conflicts.iter().map(|c| c.folder.as_str()).collect();
+                    let line = ops::sitting_out_line(name, self.managed(id).is_some(), &folders);
                     self.yellow(line);
                     continue;
                 }
@@ -329,6 +331,15 @@ impl App {
                      in Browse or on the web. Installing {name} anyway.",
                     model::clean_line(missing, 60)
                 ));
+            }
+            for left in &resolved.unreviewed {
+                // Nothing to say about one that's on its way or already here.
+                let coming = ids.contains(&left.provider)
+                    || self.queue.busy_with(&left.provider)
+                    || self.managed(&left.provider).is_some();
+                if !coming && told.insert(left.provider.clone()) {
+                    self.yellow(unreviewed_line(&bundle, left));
+                }
             }
             for (position, step) in resolved.to_install.iter().enumerate() {
                 if plan.contains(step) || self.queue.busy_with(step) {
@@ -392,7 +403,8 @@ impl App {
         self.enqueue(drafts);
     }
 
-    fn installed_folders(&self) -> Vec<String> {
+    /// Everything that counts as already there for a dependency: on disk, or in a record.
+    pub fn installed_folders(&self) -> Vec<String> {
         let mut folders: Vec<String> = self.folders.iter().map(|f| f.name.clone()).collect();
         if let Some(managed) = self.managed_map() {
             folders.extend(managed.values().flat_map(|m| m.folders.iter().cloned()));
@@ -572,6 +584,7 @@ impl App {
             origin: Origin::Adopted,
             previous_zip: None,
             previous_version: None,
+            not_in_zip: Vec::new(),
         };
         if let Some(install) = self.state.current_mut() {
             install.managed.insert(id.to_owned(), record);
@@ -725,22 +738,25 @@ fn verb_for(record: Option<&ManagedAddon>, release: &Release) -> Verb {
     }
 }
 
+/// Why a required addon wasn't added, and where the player can read who made it.
+fn unreviewed_line(bundle: &CatalogBundle, left: &Unreviewed) -> String {
+    let named = |id: &str, fallback: &str| {
+        bundle
+            .addon(id)
+            .map_or_else(|| model::clean_line(fallback, 60), |a| a.name.clone())
+    };
+    let needed_by = named(&left.needed_by, &left.needed_by);
+    let provider = named(&left.provider, &left.folder);
+    format!(
+        "{needed_by} requires {provider}, which wasn't added because nobody has reviewed it. \
+         Click it under Requires on the {needed_by} page to see who made it, and install it \
+         yourself."
+    )
+}
+
 fn conflict_names(conflicts: &[FolderConflict]) -> String {
     let folders: Vec<&str> = conflicts.iter().map(|c| c.folder.as_str()).collect();
     ops::short_list(&folders)
-}
-
-/// Why an addon stayed out of a batch, and where the player gets to decide.
-fn sitting_out_line(name: &str, updating: bool, conflicts: &[FolderConflict]) -> String {
-    let (done, verb) = if updating {
-        ("updated", "Update")
-    } else {
-        ("installed", "Install")
-    };
-    format!(
-        "{name} wasn't {done} because it would replace {}. {verb} it from its own page to choose.",
-        conflict_names(conflicts)
-    )
 }
 
 fn backup_draft() -> Draft {

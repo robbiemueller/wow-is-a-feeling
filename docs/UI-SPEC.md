@@ -46,13 +46,13 @@ Keyboard: Up and Down move the selection and skip headers, Enter activates the m
 
 **Catalog addon:**
 - Name in the display face, "by author", the hand-drawn rule.
-- Description (summary), then Details: Version, Updated, Size, Source (who it really comes from, "GitHub: owner/repo" or "WoWInterface", linking there), Folders, Requires (required addons by name, the same pick an install would make; click to select). Display names aren't unique, so the repo is the only real signal.
+- Description (summary), then Details: Version, Updated, Size, Source (who it really comes from, "GitHub: owner/repo" or "WoWInterface", linking there), Folders, Requires (required addons by name, the same pick an install would make; click to select). One an install would leave out, because nobody has reviewed it, says "(install it yourself)". Display names aren't unique, so the repo is the only real signal.
 - An entry the catalog doesn't mark `trusted` adds one note under Details: "New in the catalog. Nobody has reviewed it, so check who made it before you install."
 - Then Screenshots (up to 3, decoded on a worker with a 5 MB and 4096 px limit, scaled to at most 640 px wide, textures freed when evicted), then About (README text, fetched on demand after a 300 ms pause on the selection, cached for the last 64 addons), then Changelog (collapsed). A README can run long, so the pictures come first.
 - Fetch failures just leave those sections out and say so in small text. The page must stay usable offline.
 - Buttons along the bottom, always visible: **Install** or **Update** or **Reinstall** (main), **Remove**, **Open page**, **Share**. **Roll back to x** appears when a previous version is kept. Two small checkboxes: "Use beta versions" and "Don't update this addon" (the pin).
 
-**Other folder:** title and notes from its TOC, its folders, whether it targets Forever, and "This addon wasn't installed by this app." When a catalog match exists, say which entry and its source, and offer **Manage with this app**. Only a trusted entry can match, and a match by TOC id also needs the entry to list the folder. Otherwise it just stays here. **Remove** always asks first.
+**Other folder:** title and notes from its TOC, its folders, whether it targets Forever, and "This addon wasn't installed by this app." When a catalog match exists, say which entry and its source, and offer **Manage with this app**. Only a trusted entry can match, and a match by TOC id also needs the entry to list the folder. Managing takes only folders the disk ties together: one group here, or TOCs carrying the same id. Another folder the entry lists stays the player's, and the first update asks about it. Otherwise it just stays here. **Remove** always asks first.
 
 **Kit:** its description, a list of its addons with their state, **Install all**.
 
@@ -65,7 +65,7 @@ Keyboard: Up and Down move the selection and skip headers, Enter activates the m
 ## Installing
 
 - Up to 3 operations run at once. Two operations whose folders overlap never run together.
-- Before an install: `deps::resolve`. Required addons install first and get a yellow message. Only a trusted entry is picked by itself, and downloads never rank a stranger over it. A required folder nothing trusted provides gets a yellow warning telling the player to look for it themselves, and the install goes ahead.
+- Before an install: `deps::resolve`. Required addons install first and get a yellow message. Only a trusted entry is picked, and downloads never rank a stranger over it. The pick installs by itself only when it's also reviewed (hand-picked), because any addon can ship a library's folder name long before anything needs it. A pick nobody reviewed stays out with a yellow line naming it and the page whose Requires line links to it, so the player can see who made it and install it themselves. A required folder nothing trusted provides gets a yellow warning telling the player to look for it themselves. Either way the install goes ahead.
 - Before queuing a catalog install or update: compare its folders with the disk. See Replacing folders.
 - Before an update batch: if `backup_wtf` is on and `should_backup` says so, back up WTF first. The casting bar shows it.
 - If the game is running: a yellow message, not a block: "WoW is running. Type /reload in game to load updates. New addons appear after restarting the game." WTF restore is blocked while it's running.
@@ -78,11 +78,11 @@ Keyboard: Up and Down move the selection and skip headers, Enter activates the m
 
 Who a folder belongs to goes by what's on disk and in the records, never by what a catalog entry claims. The last scan and the records are all it takes, so nothing here touches the disk from the UI thread. A request made before the first scan is back waits for it.
 
-- **A conflict** is a folder the entry lists that's on disk, or in another addon's record, or about to arrive with another queued op, and isn't in this addon's own record. A folder new to the disk needs no question.
+- **A conflict** is a folder the entry lists that's on disk, or in another addon's record, or about to arrive with another queued op, and isn't in this addon's own record. A folder new to the disk needs no question, and nor does a copy of the player's own they already let this addon replace when its zip didn't bring it.
 - **One Install, Update or Reinstall click** with conflicts opens a popup first: which folders, who they belong to if known, the addon's source, **Replace them** and **Cancel**.
 - **Update all, kits and pasted lists** never ask. An addon that would replace something stays out, with a yellow message saying to do it from its own page. The same goes for a required addon, and the addon that required it goes ahead.
-- **Every catalog install and update** may replace this addon's record folders, including ones it shares, plus what the player agreed to. Anything else its zip brings that's already on disk is refused with a red message and nothing changes, which catches a zip that doesn't match the catalog. Folders a whole batch brings new to the disk may be shared within it.
-- **After saying yes,** a folder the zip brought is in the addon's record like any other, so the next update doesn't ask. One the zip didn't bring stays in the record if another addon claims it too, and otherwise stays the player's, because a later version without it would delete a folder that was never replaced.
+- **Every catalog install and update** may replace this addon's record folders, including ones it shares, plus what the player agreed to. Anything else its zip brings that's already on disk is refused with a red message and nothing changes, which catches a zip that doesn't match the catalog. Folders a whole batch brings new to the disk may be shared within it. After a refusal the app reads AddOns again, so the next try asks instead of being refused the same way. A refused folder the catalog does list gets the words of a batch that left it out: it wasn't installed because it would replace that folder, so do it from its own page.
+- **After saying yes,** a folder the zip brought is in the addon's record like any other, so the next update doesn't ask. One the zip didn't bring stays in the record if another addon claims it too, and that addon keeps its own record, a dropped zip's included. Otherwise it stays the player's, because a later version without it would delete a folder that was never replaced. The record remembers the yes, so later updates, Update all included, don't ask about it again. If a later zip does bring it, that update is refused, and the next one asks.
 - **A dropped zip and a rollback** are the player's own choice, so they don't ask. A yellow message says which folders they replaced and how to get another addon's copy back.
 
 Dominos ships `Masque_Dominos`, which is another entry's main folder. Installing one over the other asks once. After that both records claim the folder, updates of either replace it without a word, and removing either leaves it for the other.
@@ -90,6 +90,8 @@ Dominos ships `Masque_Dominos`, which is another entry's main folder. Installing
 ## Removing
 
 A popup confirms: "Remove Questie? Its folders are deleted. Your saved settings in WTF stay." It lists dependents when other installed addons require it.
+
+Which folders a removal deletes, and which old folders an update or rollback drops, is worked out again when it starts, from the records then. One waiting behind an install that has come to share a folder leaves that folder to it.
 
 ## Popups
 

@@ -188,14 +188,24 @@ impl Queue {
         self.waiting.push_back(op);
     }
 
-    /// Every op that may start right now, each with the flag that cancels it.
+    #[cfg(test)]
     pub fn start_ready(&mut self) -> Vec<(Op, Arc<AtomicBool>)> {
+        self.start_ready_with(|_| {})
+    }
+
+    /// Every op that may start right now, each with the flag that cancels it. `settle` sees
+    /// each one first, so what it does can be decided at the last moment.
+    pub fn start_ready_with(
+        &mut self,
+        mut settle: impl FnMut(&mut Op),
+    ) -> Vec<(Op, Arc<AtomicBool>)> {
         let mut started = Vec::new();
         let mut index = 0;
         while index < self.waiting.len() {
             let op = &self.waiting[index];
             if self.can_start(index) {
-                let op = self.waiting.remove(index).expect("index was just checked");
+                let mut op = self.waiting.remove(index).expect("index was just checked");
+                settle(&mut op);
                 let cancel = Arc::new(AtomicBool::new(false));
                 started.push((op.clone(), cancel.clone()));
                 self.running.push(Running {
@@ -334,6 +344,22 @@ pub fn stage_fraction(stage: Stage, expected_size: u64) -> f32 {
     }
 }
 
+/// Is this the same folder? Names fold the way core's installer folds them, all of Unicode
+/// and not only ASCII, so every decision about who owns a folder agrees with what an install
+/// does on disk.
+pub fn same_folder(a: &str, b: &str) -> bool {
+    a.eq_ignore_ascii_case(b) || a.to_lowercase() == b.to_lowercase()
+}
+
+/// Where the catalog lists this folder, for putting a record's main folder first. Folders
+/// it doesn't list go last.
+pub fn listed_position(listed: &[String], folder: &str) -> usize {
+    listed
+        .iter()
+        .position(|known| same_folder(known, folder))
+        .unwrap_or(usize::MAX)
+}
+
 /// Folders this addon owns that no other managed addon claims. These are the ones an
 /// update may replace and a removal may delete.
 pub fn own_folders(id: &str, managed: &BTreeMap<String, ManagedAddon>) -> Vec<String> {
@@ -345,11 +371,34 @@ pub fn own_folders(id: &str, managed: &BTreeMap<String, ManagedAddon>) -> Vec<St
         .iter()
         .filter(|folder| {
             !managed.iter().any(|(other, addon)| {
-                other != id && addon.folders.iter().any(|f| f.eq_ignore_ascii_case(folder))
+                other != id && addon.folders.iter().any(|f| same_folder(f, folder))
             })
         })
         .cloned()
         .collect()
+}
+
+/// Decide what an op deletes now that it's starting, from the records as they are now. A
+/// removal or an update that waited behind an install could otherwise delete a folder that
+/// install has since come to share.
+pub fn settle_folders(op: &mut Op, managed: &BTreeMap<String, ManagedAddon>) {
+    match &mut op.kind {
+        OpKind::Download { old_folders, .. } | OpKind::Rollback { old_folders, .. } => {
+            *old_folders = own_folders(&op.addon_id, managed);
+        }
+        OpKind::Remove { folders } if managed.contains_key(&op.addon_id) => {
+            *folders = own_folders(&op.addon_id, managed);
+        }
+        // Folders nothing managed when the player asked, or an addon whose record has gone
+        // since: whatever a record claims by now isn't theirs to delete.
+        OpKind::Remove { folders } => {
+            folders.retain(|folder| {
+                let lower = folder.to_lowercase();
+                !managed.values().any(|record| claims(record, &lower))
+            });
+        }
+        _ => {}
+    }
 }
 
 /// A folder an install would replace that isn't this addon's.
@@ -375,7 +424,7 @@ impl FolderConflict {
         let folder = clean_line(&self.folder, 60);
         match &self.owner {
             FolderOwner::Addons(names) => format!("{folder}: part of {}", short_list(names)),
-            FolderOwner::Unmanaged(Some(title)) if !title.eq_ignore_ascii_case(&self.folder) => {
+            FolderOwner::Unmanaged(Some(title)) if !same_folder(title, &self.folder) => {
                 format!(
                     "{folder}: {}, not installed by this app",
                     clean_line(title, 60)
@@ -389,7 +438,9 @@ impl FolderConflict {
 /// What installing this addon would take from something else: its folders that are on disk
 /// and aren't in its own record. A catalog entry's list is only a claim, so who a folder
 /// belongs to goes by the records and the last scan. A folder new to the disk costs nobody
-/// anything, so it doesn't count, unless another op is about to put it there.
+/// anything, so it doesn't count, unless another op is about to put it there. Nor does one
+/// of the player's own that they already let this addon replace and its zip didn't bring:
+/// if a zip ever does, the install is refused, and the next one asks.
 pub fn folder_conflicts(
     addon: &Addon,
     managed: &BTreeMap<String, ManagedAddon>,
@@ -397,9 +448,12 @@ pub fn folder_conflicts(
     disk_lookup: &HashMap<String, usize>,
     queue: &Queue,
 ) -> Vec<FolderConflict> {
-    let own = managed
-        .get(&addon.id)
+    let record = managed.get(&addon.id);
+    let own = record
         .map(|record| folder_set(&record.folders))
+        .unwrap_or_default();
+    let said_yes = record
+        .map(|record| folder_set(&record.not_in_zip))
         .unwrap_or_default();
     let mut others: HashMap<String, Vec<String>> = HashMap::new();
     for (id, record) in managed {
@@ -422,7 +476,9 @@ pub fn folder_conflicts(
             FolderOwner::Addons(names)
         } else if let Some(op) = queue.incoming(&lower, &addon.id) {
             FolderOwner::Addons(vec![op.name.clone()])
-        } else if let Some(found) = found {
+        } else if let Some(found) = found
+            && !said_yes.contains(&lower)
+        {
             FolderOwner::Unmanaged(found.toc.title.clone())
         } else {
             continue;
@@ -519,10 +575,55 @@ pub struct Installed<'a> {
     pub channel: Channel,
     pub origin: Origin,
     pub folders: Vec<String>,
+    /// From [`not_in_zip`].
+    pub not_in_zip: Vec<String>,
     /// From `install::kept_zips`: the version just installed, then the one before it.
     pub kept: &'a [PathBuf],
     pub keep_previous: bool,
     pub now: i64,
+}
+
+/// The listed folders a finished install leaves with the player even though they said it
+/// could replace them, because its zip didn't bring them. `asked` is what it was allowed to
+/// replace, and `kept` the folders its record claims now. Remembered so the next update
+/// doesn't ask about the same folder again, and forgotten once the catalog stops listing it.
+pub fn not_in_zip(
+    prev: Option<&ManagedAddon>,
+    listed: &[String],
+    asked: &[String],
+    kept: &[String],
+) -> Vec<String> {
+    let listed = folder_set(listed);
+    let kept = folder_set(kept);
+    // The record's own folders it already had are this addon's, not the player's.
+    let own_before = prev.map(|p| folder_set(&p.folders)).unwrap_or_default();
+    let said_before = prev.map_or(&[][..], |p| p.not_in_zip.as_slice());
+    let said_now = asked
+        .iter()
+        .filter(|folder| !own_before.contains(&folder.to_lowercase()));
+    let mut seen = HashSet::new();
+    said_before
+        .iter()
+        .chain(said_now)
+        .filter(|folder| {
+            let lower = folder.to_lowercase();
+            listed.contains(&lower) && !kept.contains(&lower) && seen.insert(lower)
+        })
+        .cloned()
+        .collect()
+}
+
+/// Why an addon wasn't installed or updated, and where the player gets to decide.
+pub fn sitting_out_line<S: AsRef<str>>(name: &str, updating: bool, folders: &[S]) -> String {
+    let (done, verb) = if updating {
+        ("updated", "Update")
+    } else {
+        ("installed", "Install")
+    };
+    format!(
+        "{name} wasn't {done} because it would replace {}. {verb} it from its own page to choose.",
+        short_list(folders)
+    )
 }
 
 /// The record to store after an install, carrying over what should survive it.
@@ -551,6 +652,7 @@ pub fn record_after_install(prev: Option<&ManagedAddon>, facts: Installed<'_>) -
         origin: facts.origin,
         previous_zip,
         previous_version,
+        not_in_zip: facts.not_in_zip,
     }
 }
 
@@ -739,6 +841,25 @@ mod tests {
     }
 
     #[test]
+    fn a_backup_ahead_of_a_batch_shows_first_and_is_not_counted_in_it() {
+        let mut q = Queue::default();
+        let mut backup = op(&mut q, "backup", &[]);
+        backup.verb = Verb::Backup;
+        backup.exclusive = true;
+        let backup_id = backup.id;
+        q.push(backup);
+        for name in ["a", "b", "c", "d"] {
+            let o = op(&mut q, name, &[name]);
+            q.push(o);
+        }
+        assert_eq!(names(&q.start_ready()), vec!["backup"]);
+        assert_eq!(q.casting().unwrap().text, "Backing up your settings");
+        q.finish(backup_id);
+        assert_eq!(names(&q.start_ready()), vec!["a", "b", "c"]);
+        assert_eq!(q.casting().unwrap().text, "Updating 1 of 4");
+    }
+
+    #[test]
     fn the_bar_names_a_single_op_and_only_moves_forward() {
         let mut q = Queue::default();
         let o = op(&mut q, "Questie", &["Questie"]);
@@ -839,10 +960,78 @@ mod tests {
             channel: Channel::Stable,
             origin: Origin::Catalog,
             folders: vec!["A".to_owned()],
+            not_in_zip: Vec::new(),
             kept,
             keep_previous,
             now: 500,
         }
+    }
+
+    #[test]
+    fn a_yes_the_zip_did_not_need_is_remembered_until_the_catalog_drops_the_folder() {
+        let strings =
+            |names: &[&str]| -> Vec<String> { names.iter().map(|n| (*n).to_owned()).collect() };
+        let listed = strings(&["Foo", "Extra", "Shared"]);
+        // A first install the player let replace Extra and Shared, whose zip brought neither.
+        // Shared stayed in the record because another addon claims it.
+        let first = not_in_zip(
+            None,
+            &listed,
+            &strings(&["Extra", "Shared"]),
+            &strings(&["Foo", "Shared"]),
+        );
+        assert_eq!(first, ["Extra"]);
+
+        let mut prev = record("a", "1", &["Foo", "Shared"]);
+        prev.not_in_zip = first;
+        // The next update only asks to replace what's its own, and the yes carries over.
+        let again = not_in_zip(
+            Some(&prev),
+            &listed,
+            &strings(&["Foo", "Shared"]),
+            &strings(&["Foo", "Shared"]),
+        );
+        assert_eq!(again, ["Extra"]);
+        // A zip that brings it makes it the addon's own.
+        let brought = not_in_zip(Some(&prev), &listed, &[], &strings(&["Foo", "extra"]));
+        assert!(brought.is_empty());
+        // And once the catalog stops listing it, there's nothing to remember.
+        let gone = not_in_zip(Some(&prev), &strings(&["Foo"]), &[], &strings(&["Foo"]));
+        assert!(gone.is_empty());
+    }
+
+    #[test]
+    fn a_folder_the_player_already_let_this_replace_is_not_asked_about_again() {
+        let mut foo = record("foo", "1", &["Foo"]);
+        foo.not_in_zip = vec!["Extra".to_owned()];
+        let managed: BTreeMap<String, ManagedAddon> = [
+            ("foo".to_owned(), foo),
+            ("lib".to_owned(), record("lib", "1", &["Lib"])),
+        ]
+        .into();
+        let disk = [
+            on_disk("Foo", None),
+            on_disk("extra", Some("Extra from elsewhere")),
+            on_disk("Lib", None),
+        ];
+        let entry = entry("foo", &["Foo", "Extra", "Lib"]);
+        let found = conflicts_of(&entry, &managed, &disk);
+        assert_eq!(
+            found,
+            vec![FolderConflict {
+                folder: "Lib".to_owned(),
+                owner: FolderOwner::Addons(vec!["lib".to_owned()]),
+            }],
+            "only what isn't the player's own copy any more"
+        );
+        // Another addon's record claiming it later is a new question.
+        let mut managed = managed;
+        managed
+            .get_mut("lib")
+            .unwrap()
+            .folders
+            .push("Extra".to_owned());
+        assert_eq!(conflicts_of(&entry, &managed, &disk).len(), 2);
     }
 
     #[test]
@@ -925,6 +1114,99 @@ mod tests {
         .into();
         assert_eq!(own_folders("a", &managed), vec!["A".to_owned()]);
         assert!(own_folders("missing", &managed).is_empty());
+    }
+
+    #[test]
+    fn a_shared_folder_spelled_with_another_case_outside_ascii_is_still_shared() {
+        // The installer folds all of Unicode, so to the disk these are one folder.
+        let managed: BTreeMap<String, ManagedAddon> = [
+            ("a".to_owned(), record("a", "1", &["Aaa", "Ärger"])),
+            ("b".to_owned(), record("b", "1", &["Bbb", "ärger"])),
+        ]
+        .into();
+        assert_eq!(own_folders("b", &managed), vec!["Bbb".to_owned()]);
+        assert_eq!(own_folders("a", &managed), vec!["Aaa".to_owned()]);
+        assert!(same_folder("ÄRGER", "ärger") && !same_folder("Ärger", "Arger"));
+        let listed = ["Ärger".to_owned(), "Ärger_Lib".to_owned()];
+        assert_eq!(
+            listed_position(&listed, "ärger"),
+            0,
+            "the main folder sorts first"
+        );
+        assert_eq!(listed_position(&listed, "Other"), usize::MAX);
+    }
+
+    #[test]
+    fn what_an_op_deletes_is_settled_from_the_records_when_it_starts() {
+        // Dominos landed while these waited, and shares Masque_Dominos now.
+        let managed: BTreeMap<String, ManagedAddon> = [
+            (
+                "d".to_owned(),
+                record("d", "1", &["Dominos", "Masque_Dominos"]),
+            ),
+            (
+                "m".to_owned(),
+                record("m", "1", &["Masque_Dominos", "Masque_Extra"]),
+            ),
+        ]
+        .into();
+        let settled = |addon_id: &str, kind: OpKind| {
+            let mut op = Op {
+                id: 1,
+                verb: Verb::Remove,
+                kind,
+                addon_id: addon_id.to_owned(),
+                name: String::new(),
+                folders: HashSet::new(),
+                after: None,
+                exclusive: false,
+            };
+            settle_folders(&mut op, &managed);
+            op.kind
+        };
+        let both = || vec!["Masque_Dominos".to_owned(), "Masque_Extra".to_owned()];
+
+        let removal = settled("m", OpKind::Remove { folders: both() });
+        assert!(
+            matches!(&removal, OpKind::Remove { folders } if folders == &["Masque_Extra"]),
+            "planned before Dominos had a record: {removal:?}"
+        );
+        let update = settled(
+            "m",
+            OpKind::Download {
+                release: Release::default(),
+                channel: Channel::Stable,
+                origin: Origin::Catalog,
+                old_folders: both(),
+                may_replace: both(),
+            },
+        );
+        assert!(
+            matches!(&update, OpKind::Download { old_folders, may_replace, .. }
+                if old_folders == &["Masque_Extra"] && may_replace == &both()),
+            "a zip without it no longer deletes it, and may still replace it: {update:?}"
+        );
+        let rollback = settled(
+            "m",
+            OpKind::Rollback {
+                zip: PathBuf::from("zips/0.9.zip"),
+                version: "0.9".to_owned(),
+                channel: Channel::Stable,
+                origin: Origin::Catalog,
+                old_folders: both(),
+            },
+        );
+        assert!(
+            matches!(&rollback, OpKind::Rollback { old_folders, .. } if old_folders == &["Masque_Extra"]),
+            "{rollback:?}"
+        );
+        // Unmanaged folders: one a record has claimed since isn't the player's to delete now.
+        let loose = vec!["masque_dominos".to_owned(), "Loose".to_owned()];
+        let other = settled("other:Loose", OpKind::Remove { folders: loose });
+        assert!(
+            matches!(&other, OpKind::Remove { folders } if folders == &["Loose"]),
+            "{other:?}"
+        );
     }
 
     #[test]

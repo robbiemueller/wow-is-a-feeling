@@ -333,7 +333,7 @@ impl App {
             adoption
                 .folders
                 .iter()
-                .any(|f| group.folders.iter().any(|g| g.eq_ignore_ascii_case(f)))
+                .any(|f| group.folders.iter().any(|g| ops::same_folder(g, f)))
         })
     }
 
@@ -671,7 +671,16 @@ impl App {
     }
 
     pub fn pump_queue(&mut self) {
-        let started = self.queue.start_ready();
+        // What a removal or an update deletes goes by the records as they are when it starts,
+        // not when it was asked for: an install ahead of it may have come to share a folder.
+        let empty = BTreeMap::new();
+        let managed = self
+            .state
+            .current()
+            .map_or(&empty, |record| &record.managed);
+        let started = self
+            .queue
+            .start_ready_with(|op| ops::settle_folders(op, managed));
         if started.is_empty() {
             return;
         }
@@ -1178,7 +1187,7 @@ impl eframe::App for App {
 
 pub fn same_main(folder: &str, id: &str) -> bool {
     id.strip_prefix("local:")
-        .is_some_and(|main| main.eq_ignore_ascii_case(folder))
+        .is_some_and(|main| ops::same_folder(main, folder))
 }
 
 /// `kit:0`, `gap:0`, `other:Folder`, or an addon id.
@@ -1246,6 +1255,10 @@ mod tests {
     #[test]
     fn a_dropped_zips_main_folder_sorts_first() {
         assert!(same_main("Foo", "local:foo"));
+        assert!(
+            same_main("Ärger", "local:ärger"),
+            "folded like the installer"
+        );
         assert!(!same_main("Bar", "local:foo"));
         assert!(!same_main("Foo", "gh:a/foo"));
     }

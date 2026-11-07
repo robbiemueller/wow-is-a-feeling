@@ -10,6 +10,7 @@ use crate::views::settings::VERSION;
 use crate::worker::{CatalogSource, Event, LocalZipFacts, OpFailure, OpOutcome};
 use eframe::egui::{TextureOptions, ViewportCommand};
 use feeling_core::catalog::Channel;
+use feeling_core::error::Error;
 use feeling_core::install::InstallOutcome;
 use feeling_core::scan::LocalFolder;
 use feeling_core::state::Origin;
@@ -247,6 +248,7 @@ impl App {
                     .relaunch(*applied, self.state.clone(), self.lock.clone());
             }
             Err(failure) if failure.cancelled => self.cancelled_ops += 1,
+            Err(failure) if !failure.would_replace.is_empty() => self.refused(&op, failure),
             Err(failure) => self.red(failure.text),
         }
         if self.queue.is_idle() && self.cancelled_ops > 0 {
@@ -254,6 +256,47 @@ impl App {
             self.yellow("Cancelled.");
         }
         let _ = now;
+    }
+
+    /// An install stopped because its zip would replace folders it may not. Either something
+    /// put them there since the last look at the disk, or a zip brought a folder its earlier
+    /// ones didn't. Look again, so the next press asks, and say what to do. A folder the
+    /// catalog doesn't list means the zip isn't what the catalog says, and that's said too.
+    fn refused(&mut self, op: &Op, failure: OpFailure) {
+        let folders = failure.would_replace;
+        // The player's yes covered a zip without these. One that brings them asks again.
+        let mut forgot = false;
+        if let Some(record) = self
+            .state
+            .current_mut()
+            .and_then(|install| install.managed.get_mut(&op.addon_id))
+        {
+            let before = record.not_in_zip.len();
+            record
+                .not_in_zip
+                .retain(|kept| !folders.iter().any(|f| ops::same_folder(f, kept)));
+            forgot = record.not_in_zip.len() != before;
+        }
+        if forgot {
+            self.save_state();
+        }
+        self.rescan();
+        let listed = self
+            .bundle
+            .as_deref()
+            .and_then(|b| b.addon(&op.addon_id))
+            .map_or_else(Vec::new, |addon| addon.folders.clone());
+        let unlisted: Vec<String> = folders
+            .iter()
+            .filter(|f| !listed.iter().any(|known| ops::same_folder(known, f)))
+            .cloned()
+            .collect();
+        let text = if unlisted.is_empty() {
+            ops::sitting_out_line(&op.name, op.verb != Verb::Install, &folders)
+        } else {
+            Error::WouldReplace { folders: unlisted }.to_string()
+        };
+        self.red(text);
     }
 
     fn op_installed(
@@ -330,6 +373,15 @@ impl App {
         }
         let mut folders = outcome.folders.clone();
         folders.sort_by_key(|folder| !same_main(folder, &id));
+        let listed = self
+            .bundle
+            .as_deref()
+            .and_then(|b| b.addon(&id))
+            .map_or_else(Vec::new, |addon| addon.folders.clone());
+        let asked: &[String] = match &op.kind {
+            OpKind::Download { may_replace, .. } => may_replace,
+            _ => &[],
+        };
         if let Some(addon) = self.bundle.as_deref().and_then(|b| b.addon(&id)) {
             // A folder this addon shares stays claimed while the catalog lists it, even if this
             // zip didn't bring it, or the next update would ask about it all over again. One
@@ -351,14 +403,7 @@ impl App {
                 }
             }
             // Main folder first, the order the catalog lists them in.
-            let order = |folder: &String| {
-                addon
-                    .folders
-                    .iter()
-                    .position(|known| known.eq_ignore_ascii_case(folder))
-                    .unwrap_or(usize::MAX)
-            };
-            folders.sort_by_key(order);
+            folders.sort_by_key(|folder| ops::listed_position(&addon.folders, folder));
         }
         if self.demo {
             self.demo_add_folders(&folders, &name, &version);
@@ -375,6 +420,9 @@ impl App {
         } else {
             kept
         };
+        // What the player let this replace and the zip didn't bring stays theirs, and the
+        // next update doesn't ask about it all over again.
+        let not_in_zip = ops::not_in_zip(prev.as_ref(), &listed, asked, &folders);
         let new_record = ops::record_after_install(
             prev.as_ref(),
             ops::Installed {
@@ -384,12 +432,15 @@ impl App {
                 channel,
                 origin,
                 folders: folders.clone(),
+                not_in_zip,
                 kept,
                 keep_previous,
                 now,
             },
         );
-        for stale in ops::stale_records(&record.managed, &id, origin, &folders) {
+        // Only what the zip really brought replaced anything. A folder kept in the record
+        // because another addon claims it is still that addon's too.
+        for stale in ops::stale_records(&record.managed, &id, origin, &outcome.folders) {
             record.managed.remove(&stale);
         }
         record.managed.insert(id.clone(), new_record);
@@ -415,7 +466,7 @@ impl App {
     fn demo_add_folders(&mut self, folders: &[String], name: &str, version: &str) {
         for folder in folders {
             self.demo_disk
-                .retain(|f| !f.name.eq_ignore_ascii_case(folder));
+                .retain(|f| !ops::same_folder(&f.name, folder));
             let mut local = LocalFolder {
                 name: folder.clone(),
                 toc_file: Some(format!("{folder}.toc")),
@@ -432,7 +483,7 @@ impl App {
 
     fn op_removed(&mut self, op: &Op) {
         if let OpKind::Remove { folders } = &op.kind {
-            let gone = |f: &LocalFolder| folders.iter().any(|g| g.eq_ignore_ascii_case(&f.name));
+            let gone = |f: &LocalFolder| folders.iter().any(|g| ops::same_folder(g, &f.name));
             self.demo_disk.retain(|f| !gone(f));
             // Known already, so the rows don't flash an "other folder" until the rescan.
             self.folders.retain(|f| !gone(f));
