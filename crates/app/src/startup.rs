@@ -177,6 +177,9 @@ impl App {
                 self.ask_remove(&selection);
             }
             "folder" => self.open_folder_browser(),
+            "replace" => self
+                .actions
+                .push(Action::Install(vec![demo::UNTRUSTED_ID.to_owned()])),
             "list" => {
                 self.list_text = "# WoW is a Feeling addon list\ngh:Questie/Questie\n\
                                   gh:Nevcairiel/GatherMate2\ngh:tukui-org/ElvUI @beta\n\

@@ -2,11 +2,13 @@
 //! folder, and one casting bar that tells the truth about all of it. Pure, so it's tested
 //! without threads.
 
-use feeling_core::catalog::{Channel, Release};
+use crate::model::clean_line;
+use feeling_core::catalog::{Addon, Channel, Release};
 use feeling_core::install::Stage;
+use feeling_core::scan::LocalFolder;
 use feeling_core::selfupdate::UpdateInfo;
 use feeling_core::state::{ManagedAddon, Origin};
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -49,6 +51,10 @@ pub enum OpKind {
         channel: Channel,
         origin: Origin,
         old_folders: Vec<String>,
+        /// What this may replace besides `old_folders`: this addon's own folders, shared ones
+        /// included, and whatever the player agreed to. Anything else the zip brings that's
+        /// already on disk stops the install, so a surprise never costs anyone a folder.
+        may_replace: Vec<String>,
     },
     /// Swap in a zip we kept earlier.
     Rollback {
@@ -158,6 +164,17 @@ impl Queue {
     /// Is a restore or an app update on the go? Those lock everything else out.
     pub fn busy_exclusive(&self) -> bool {
         self.waiting.iter().any(|op| op.exclusive) || self.running.iter().any(|r| r.op.exclusive)
+    }
+
+    /// The op about to put this folder in place, other than this addon's own. It may not be
+    /// on disk yet, but it will be by the time anything queued now gets its turn.
+    fn incoming(&self, lower_folder: &str, addon_id: &str) -> Option<&Op> {
+        self.running
+            .iter()
+            .map(|run| &run.op)
+            .chain(&self.waiting)
+            .filter(|op| op.addon_id != addon_id && op.verb != Verb::Remove)
+            .find(|op| op.folders.contains(lower_folder))
     }
 
     pub fn push(&mut self, op: Op) {
@@ -333,6 +350,161 @@ pub fn own_folders(id: &str, managed: &BTreeMap<String, ManagedAddon>) -> Vec<St
         })
         .cloned()
         .collect()
+}
+
+/// A folder an install would replace that isn't this addon's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FolderConflict {
+    /// As the disk spells it, when it's been seen there.
+    pub folder: String,
+    pub owner: FolderOwner,
+}
+
+/// Who a folder belongs to now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FolderOwner {
+    /// Addons this app manages or is about to install, by name.
+    Addons(Vec<String>),
+    /// Nothing this app installed. The title in its TOC, if it has one.
+    Unmanaged(Option<String>),
+}
+
+impl FolderConflict {
+    /// A line for the popup. Folder names and TOC titles come from strangers.
+    pub fn describe(&self) -> String {
+        let folder = clean_line(&self.folder, 60);
+        match &self.owner {
+            FolderOwner::Addons(names) => format!("{folder}: part of {}", short_list(names)),
+            FolderOwner::Unmanaged(Some(title)) if !title.eq_ignore_ascii_case(&self.folder) => {
+                format!(
+                    "{folder}: {}, not installed by this app",
+                    clean_line(title, 60)
+                )
+            }
+            FolderOwner::Unmanaged(_) => format!("{folder}: not installed by this app"),
+        }
+    }
+}
+
+/// What installing this addon would take from something else: its folders that are on disk
+/// and aren't in its own record. A catalog entry's list is only a claim, so who a folder
+/// belongs to goes by the records and the last scan. A folder new to the disk costs nobody
+/// anything, so it doesn't count, unless another op is about to put it there.
+pub fn folder_conflicts(
+    addon: &Addon,
+    managed: &BTreeMap<String, ManagedAddon>,
+    disk: &[LocalFolder],
+    disk_lookup: &HashMap<String, usize>,
+    queue: &Queue,
+) -> Vec<FolderConflict> {
+    let own = managed
+        .get(&addon.id)
+        .map(|record| folder_set(&record.folders))
+        .unwrap_or_default();
+    let mut seen = HashSet::new();
+    let mut conflicts = Vec::new();
+    for listed in &addon.folders {
+        let lower = listed.to_lowercase();
+        if own.contains(&lower) || !seen.insert(lower.clone()) {
+            continue;
+        }
+        let found = disk_lookup.get(&lower).and_then(|&i| disk.get(i));
+        let mut owners: Vec<String> = managed
+            .iter()
+            .filter(|(id, m)| **id != addon.id && claims(m, &lower))
+            .map(|(_, m)| m.name.clone())
+            .collect();
+        if owners.is_empty()
+            && let Some(op) = queue.incoming(&lower, &addon.id)
+        {
+            owners.push(op.name.clone());
+        }
+        let owner = match found {
+            _ if !owners.is_empty() => FolderOwner::Addons(owners),
+            Some(found) => FolderOwner::Unmanaged(found.toc.title.clone()),
+            None => continue,
+        };
+        conflicts.push(FolderConflict {
+            folder: found.map_or_else(|| listed.clone(), |found| found.name.clone()),
+            owner,
+        });
+    }
+    conflicts
+}
+
+fn claims(record: &ManagedAddon, lower_folder: &str) -> bool {
+    record
+        .folders
+        .iter()
+        .any(|f| f.to_lowercase() == lower_folder)
+}
+
+/// Does a managed addon other than this one claim this folder?
+pub fn claimed_by_another(
+    managed: &BTreeMap<String, ManagedAddon>,
+    id: &str,
+    lower_folder: &str,
+) -> bool {
+    managed
+        .iter()
+        .any(|(other, record)| other != id && claims(record, lower_folder))
+}
+
+/// `A`, `A and B`, `A, B and C` or `A, B, C and 4 more`, for a line that has to stay short.
+pub fn short_list<S: AsRef<str>>(names: &[S]) -> String {
+    const SHOWN: usize = 3;
+    let shown: Vec<String> = names
+        .iter()
+        .take(SHOWN)
+        .map(|name| clean_line(name.as_ref(), 40))
+        .collect();
+    let rest = names.len().saturating_sub(SHOWN);
+    match shown.split_last() {
+        None => String::new(),
+        Some((only, [])) => only.clone(),
+        Some((last, others)) if rest == 0 => format!("{} and {last}", others.join(", ")),
+        Some(_) => format!("{} and {rest} more", shown.join(", ")),
+    }
+}
+
+/// What to say after a dropped zip or a rollback replaced folders. The player chose it, but
+/// should still hear what went and how to get it back. Replacing a folder only this addon
+/// ever had isn't news: that's its own older copy.
+pub fn replaced_line(
+    how: &str,
+    id: &str,
+    replaced: &[String],
+    managed: &BTreeMap<String, ManagedAddon>,
+) -> Option<String> {
+    let own = managed.get(id);
+    let went: Vec<&String> = replaced
+        .iter()
+        .filter(|folder| {
+            let lower = folder.to_lowercase();
+            claimed_by_another(managed, id, &lower)
+                || !own.is_some_and(|record| claims(record, &lower))
+        })
+        .collect();
+    if went.is_empty() {
+        return None;
+    }
+    let lower_went = folder_set(went.iter().copied());
+    let owners: Vec<&str> = managed
+        .iter()
+        .filter(|(other, record)| {
+            other.as_str() != id && lower_went.iter().any(|f| claims(record, f))
+        })
+        .map(|(_, record)| record.name.as_str())
+        .collect();
+    let folders = short_list(&went);
+    Some(match owners.as_slice() {
+        [] => format!("{how} replaced {folders}, and the old copy is gone."),
+        [owner] => format!("{how} replaced {folders}. Install {owner} again to get its own back."),
+        many => format!(
+            "{how} replaced {folders}. Install {} again to get their own back.",
+            short_list(many)
+        ),
+    })
 }
 
 /// The facts of a finished install.
@@ -784,6 +956,182 @@ mod tests {
         assert!(
             stale_records(&managed, "gh:x", Origin::Catalog, &["Lib".to_owned()]).is_empty(),
             "catalog addons may share folders"
+        );
+    }
+
+    fn on_disk(name: &str, title: Option<&str>) -> LocalFolder {
+        let mut folder = LocalFolder {
+            name: name.to_owned(),
+            ..LocalFolder::default()
+        };
+        folder.toc.title = title.map(str::to_owned);
+        folder
+    }
+
+    fn lookup(disk: &[LocalFolder]) -> HashMap<String, usize> {
+        disk.iter()
+            .enumerate()
+            .map(|(i, f)| (f.name.to_lowercase(), i))
+            .collect()
+    }
+
+    fn entry(id: &str, folders: &[&str]) -> Addon {
+        Addon {
+            id: id.to_owned(),
+            folders: folders.iter().map(|f| (*f).to_owned()).collect(),
+            ..Addon::default()
+        }
+    }
+
+    fn conflicts_of(
+        addon: &Addon,
+        managed: &BTreeMap<String, ManagedAddon>,
+        disk: &[LocalFolder],
+    ) -> Vec<FolderConflict> {
+        folder_conflicts(addon, managed, disk, &lookup(disk), &Queue::default())
+    }
+
+    #[test]
+    fn a_folder_on_disk_that_is_not_this_addons_is_a_conflict() {
+        let managed: BTreeMap<String, ManagedAddon> =
+            [("gh:q".to_owned(), record("gh:q", "1", &["Questie"]))].into();
+        let disk = [
+            on_disk("questie", Some("Questie")),
+            on_disk("ElvUI", Some("Elv's UI")),
+            on_disk("OpenMe", None),
+        ];
+        let addon = entry("gh:new", &["New", "QUESTIE", "ElvUI", "OpenMe", "elvui"]);
+        let found = conflicts_of(&addon, &managed, &disk);
+        assert_eq!(
+            found,
+            vec![
+                FolderConflict {
+                    folder: "questie".to_owned(),
+                    owner: FolderOwner::Addons(vec!["gh:q".to_owned()]),
+                },
+                FolderConflict {
+                    folder: "ElvUI".to_owned(),
+                    owner: FolderOwner::Unmanaged(Some("Elv's UI".to_owned())),
+                },
+                FolderConflict {
+                    folder: "OpenMe".to_owned(),
+                    owner: FolderOwner::Unmanaged(None),
+                },
+            ],
+            "new folders don't count, nor does the same folder twice"
+        );
+        assert_eq!(found[0].describe(), "questie: part of gh:q");
+        assert_eq!(
+            found[1].describe(),
+            "ElvUI: Elv's UI, not installed by this app"
+        );
+        assert_eq!(found[2].describe(), "OpenMe: not installed by this app");
+    }
+
+    #[test]
+    fn a_folder_in_this_addons_own_record_is_never_a_conflict_even_when_shared() {
+        let managed: BTreeMap<String, ManagedAddon> = [
+            (
+                "d".to_owned(),
+                record("d", "1", &["Dominos", "Masque_Dominos"]),
+            ),
+            ("m".to_owned(), record("m", "1", &["Masque_Dominos"])),
+        ]
+        .into();
+        let disk = [on_disk("Dominos", None), on_disk("Masque_Dominos", None)];
+        let dominos = entry("d", &["Dominos", "Masque_Dominos"]);
+        assert_eq!(conflicts_of(&dominos, &managed, &disk), vec![]);
+        // The folder has another owner, but this addon's record says it shares it, so an
+        // update can't be stopped by what the other addon claims.
+        assert_eq!(
+            conflicts_of(&entry("m", &["Masque_Dominos"]), &managed, &disk),
+            vec![]
+        );
+    }
+
+    #[test]
+    fn a_record_claiming_a_folder_counts_even_before_the_next_scan_sees_it() {
+        let managed: BTreeMap<String, ManagedAddon> =
+            [("a".to_owned(), record("a", "1", &["Lib"]))].into();
+        let found = conflicts_of(&entry("b", &["Lib"]), &managed, &[]);
+        assert_eq!(found[0].owner, FolderOwner::Addons(vec!["a".to_owned()]));
+    }
+
+    #[test]
+    fn a_folder_another_op_is_about_to_bring_counts_as_taken() {
+        let mut q = Queue::default();
+        let lib = op(&mut q, "Lib Bringer", &["Lib"]);
+        q.push(lib);
+        let addon = entry("other", &["lib"]);
+        let found = folder_conflicts(&addon, &BTreeMap::new(), &[], &HashMap::new(), &q);
+        assert_eq!(
+            found[0].owner,
+            FolderOwner::Addons(vec!["Lib Bringer".to_owned()])
+        );
+        // Its own op doesn't count, and a folder on its way out doesn't either.
+        let own = entry("Lib Bringer", &["Lib"]);
+        assert_eq!(
+            folder_conflicts(&own, &BTreeMap::new(), &[], &HashMap::new(), &q),
+            vec![]
+        );
+        let mut q = Queue::default();
+        let mut gone = op(&mut q, "Going", &["Lib"]);
+        gone.verb = Verb::Remove;
+        q.push(gone);
+        assert_eq!(
+            folder_conflicts(&addon, &BTreeMap::new(), &[], &HashMap::new(), &q),
+            vec![]
+        );
+    }
+
+    #[test]
+    fn lists_stay_short() {
+        let list = |names: &[&str]| short_list(names);
+        assert_eq!(list(&[]), "");
+        assert_eq!(list(&["A"]), "A");
+        assert_eq!(list(&["A", "B"]), "A and B");
+        assert_eq!(list(&["A", "B", "C"]), "A, B and C");
+        assert_eq!(list(&["A", "B", "C", "D", "E"]), "A, B, C and 2 more");
+        assert_eq!(
+            list(&["line\nbreak"]),
+            "line break",
+            "these are strangers' words"
+        );
+    }
+
+    #[test]
+    fn what_got_replaced_is_said_and_how_to_get_it_back() {
+        let managed: BTreeMap<String, ManagedAddon> = [
+            (
+                "local:Foo".to_owned(),
+                record("local:Foo", "1", &["Foo", "Shared"]),
+            ),
+            ("a".to_owned(), record("a", "1", &["Questie", "Shared"])),
+            ("b".to_owned(), record("b", "1", &["Bags"])),
+        ]
+        .into();
+        let line = |folders: &[&str]| {
+            let folders: Vec<String> = folders.iter().map(|f| (*f).to_owned()).collect();
+            replaced_line("The zip", "local:Foo", &folders, &managed)
+        };
+        assert_eq!(line(&[]), None);
+        assert_eq!(line(&["foo"]), None, "only its own older copy");
+        assert_eq!(
+            line(&["Lost"]).unwrap(),
+            "The zip replaced Lost, and the old copy is gone."
+        );
+        assert_eq!(
+            line(&["Questie"]).unwrap(),
+            "The zip replaced Questie. Install a again to get its own back."
+        );
+        assert_eq!(
+            line(&["Shared"]).unwrap(),
+            "The zip replaced Shared. Install a again to get its own back.",
+            "shared, so not only its own"
+        );
+        assert_eq!(
+            line(&["Foo", "Questie", "Bags"]).unwrap(),
+            "The zip replaced Questie and Bags. Install a and b again to get their own back."
         );
     }
 

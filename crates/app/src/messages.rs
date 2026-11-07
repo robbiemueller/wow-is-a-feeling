@@ -93,6 +93,16 @@ impl Messages {
         self.list.iter().map(|m| m.text.as_str()).collect()
     }
 
+    /// Just the red ones.
+    #[cfg(test)]
+    pub fn errors(&self) -> Vec<&str> {
+        self.list
+            .iter()
+            .filter(|m| m.kind == Kind::Error)
+            .map(|m| m.text.as_str())
+            .collect()
+    }
+
     /// When this needs another frame. Nothing while there's nothing to show.
     pub fn next_wake(&self, now: Instant) -> Option<Duration> {
         self.list

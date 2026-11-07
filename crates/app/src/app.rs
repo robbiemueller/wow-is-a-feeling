@@ -139,6 +139,8 @@ pub struct App {
     pub actions: Vec<Action>,
     /// What to carry on with once the player has chosen a game folder.
     pub after_folder: Vec<Action>,
+    /// What to carry on with once the AddOns folder has been read.
+    pub after_scan: Vec<Action>,
     pub backups: Option<Vec<BackupEntry>>,
     pub list_text: String,
     pub diagnostics_wanted: bool,
@@ -259,6 +261,7 @@ impl App {
             changelog_open: false,
             actions: Vec::new(),
             after_folder: Vec::new(),
+            after_scan: Vec::new(),
             backups: None,
             list_text: String::new(),
             diagnostics_wanted: false,

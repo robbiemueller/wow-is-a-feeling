@@ -2,21 +2,21 @@
 //! halfway through being drawn.
 
 use crate::app::App;
-use crate::dialogs::{ListPreview, Popup, RemovePlan};
+use crate::dialogs::{ListPreview, Popup, RemovePlan, ReplacePlan};
 use crate::easter;
 use crate::model::{self, HeaderId, Section, Selection, Tab};
-use crate::ops::{self, Op, OpKind, Verb, folder_set};
+use crate::ops::{self, FolderConflict, Op, OpKind, Verb, folder_set};
 use crate::views::settings::VERSION;
 use crate::worker::FoundGame;
 use eframe::egui::OpenUrl;
 use feeling_core::backup::{self, BackupEntry};
-use feeling_core::catalog::Channel;
+use feeling_core::catalog::{Addon, Channel, Release};
 use feeling_core::deps;
 use feeling_core::listfile;
 use feeling_core::search::SortBy;
 use feeling_core::selfupdate::UpdateInfo;
 use feeling_core::state::{ManagedAddon, Origin};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -32,6 +32,8 @@ pub enum Action {
     SearchChanged,
     /// Install, update or reinstall these, whichever each one needs.
     Install(Vec<String>),
+    /// The player said yes to the popup: go ahead, and this addon may replace these folders.
+    ReplaceAndInstall(String, Vec<String>),
     UpdateAll,
     Rollback(String),
     AskRemove(Selection),
@@ -115,10 +117,10 @@ impl App {
                 self.list_to_top = true;
             }
             Action::Install(ids) => self.install_addons(ids),
-            Action::UpdateAll => {
-                let ids = self.updates.clone();
-                self.install_addons(ids);
+            Action::ReplaceAndInstall(id, folders) => {
+                self.queue_installs(std::slice::from_ref(&id), &folders);
             }
+            Action::UpdateAll => self.update_all(),
             Action::Rollback(id) => self.roll_back(&id),
             Action::AskRemove(selection) => self.ask_remove(&selection),
             Action::ConfirmRemove(plan) => self.remove(plan),
@@ -221,50 +223,168 @@ impl App {
         true
     }
 
+    /// What's on disk decides what an install may replace. If the first look at the disk is
+    /// still on its way, the request waits for it, so it doesn't get decided blind.
+    fn needs_a_scan(&mut self, action: Action) -> bool {
+        if self.scanned {
+            return false;
+        }
+        self.after_scan.push(action);
+        true
+    }
+
+    /// The Install or Update button. One addon gets to ask first if it would replace a folder
+    /// that isn't its own. Several at once can't, so those sit out and say so.
     pub fn install_addons(&mut self, ids: Vec<String>) {
-        if ids.is_empty() || self.needs_a_folder(Action::Install(ids.clone())) {
+        if ids.is_empty()
+            || self.needs_a_folder(Action::Install(ids.clone()))
+            || self.needs_a_scan(Action::Install(ids.clone()))
+        {
             return;
         }
+        if let [id] = ids.as_slice()
+            && !self.queue.busy_with(id)
+            && let Some(plan) = self.replace_plan(id)
+        {
+            self.show_popup(Popup::Replace(plan));
+            return;
+        }
+        self.queue_installs(&ids, &[]);
+    }
+
+    /// Update all never asks: it just does what it can without taking anything from anyone.
+    fn update_all(&mut self) {
+        if self.updates.is_empty()
+            || self.needs_a_folder(Action::UpdateAll)
+            || self.needs_a_scan(Action::UpdateAll)
+        {
+            return;
+        }
+        let ids = self.updates.clone();
+        self.queue_installs(&ids, &[]);
+    }
+
+    fn folder_conflicts(&self, addon: &Addon) -> Vec<FolderConflict> {
+        let empty = BTreeMap::new();
+        ops::folder_conflicts(
+            addon,
+            self.managed_map().unwrap_or(&empty),
+            &self.folders,
+            &self.folder_lookup,
+            &self.queue,
+        )
+    }
+
+    /// The question to put to the player before installing this, if there is one.
+    fn replace_plan(&self, id: &str) -> Option<ReplacePlan> {
+        let addon = self.bundle.as_deref()?.addon(id)?;
+        let conflicts = self.folder_conflicts(addon);
+        if conflicts.is_empty() {
+            return None;
+        }
+        let record = self.managed(id);
+        let channel = model::channel_for(
+            record,
+            self.channel_choice.get(id).copied(),
+            self.state.settings.default_channel,
+        );
+        Some(ReplacePlan {
+            addon_id: id.to_owned(),
+            name: addon.name.clone(),
+            source: model::source_text(addon),
+            verb: verb_for(record, addon.release(channel)?),
+            conflicts,
+        })
+    }
+
+    /// Queue these and what they require. `agreed` is what the player said one of them may
+    /// replace. Nothing here asks: what would take a folder from someone else stays out of
+    /// the queue, with a yellow line saying why.
+    fn queue_installs(&mut self, ids: &[String], agreed: &[String]) {
         let Some(bundle) = self.bundle.clone() else {
             return;
         };
         let installed = self.installed_folders();
         let mut plan: Vec<String> = Vec::new();
         let mut chained: HashSet<String> = HashSet::new();
-        for id in &ids {
-            let resolved = deps::resolve(id, &bundle.catalog, &bundle.folders, installed.iter());
+        for id in ids {
+            if self.queue.busy_with(id) {
+                continue;
+            }
             let name = bundle.addon(id).map_or(id.as_str(), |a| a.name.as_str());
+            if agreed.is_empty()
+                && let Some(addon) = bundle.addon(id)
+            {
+                let conflicts = self.folder_conflicts(addon);
+                if !conflicts.is_empty() {
+                    let line = sitting_out_line(name, self.managed(id).is_some(), &conflicts);
+                    self.yellow(line);
+                    continue;
+                }
+            }
+            let resolved = deps::resolve(id, &bundle.catalog, &bundle.folders, installed.iter());
             for missing in &resolved.missing {
                 self.yellow(format!(
-                    "{name} requires {}, which isn't in the catalog. Installing it anyway.",
+                    "{name} requires {}, which this app can't pick for you. Look for it yourself, \
+                     in Browse or on the web. Installing {name} anyway.",
                     model::clean_line(missing, 60)
                 ));
             }
             for (position, step) in resolved.to_install.iter().enumerate() {
+                if plan.contains(step) || self.queue.busy_with(step) {
+                    continue;
+                }
                 if step != id
-                    && !ids.contains(step)
-                    && !plan.contains(step)
                     && let Some(dep) = bundle.addon(step)
                 {
-                    self.yellow(format!(
-                        "{name} requires {}, so that installs first.",
-                        dep.name
-                    ));
-                }
-                if !plan.contains(step) {
-                    plan.push(step.clone());
-                    if position > 0 {
-                        chained.insert(step.clone());
+                    let asked_for = ids.contains(step);
+                    let conflicts = self.folder_conflicts(dep);
+                    if !conflicts.is_empty() {
+                        // One that was asked for says so in its own turn.
+                        if !asked_for {
+                            self.yellow(format!(
+                                "{name} requires {}, which wasn't added because it would replace \
+                                 {}. Install it from its own page to choose.",
+                                dep.name,
+                                conflict_names(&conflicts)
+                            ));
+                        }
+                        continue;
                     }
+                    if !asked_for {
+                        self.yellow(format!(
+                            "{name} requires {}, so that installs first.",
+                            dep.name
+                        ));
+                    }
+                }
+                plan.push(step.clone());
+                if position > 0 {
+                    chained.insert(step.clone());
                 }
             }
         }
         let mut drafts = Vec::with_capacity(plan.len());
+        let mut earlier: HashSet<String> = HashSet::new();
         for id in &plan {
-            if self.queue.busy_with(id) {
-                continue;
+            // Two addons in one batch can both bring a folder that's new to the disk. Whichever
+            // lands second replaces the first's copy, and they share it from then on.
+            let mut allowed = if ids.contains(id) {
+                agreed.to_vec()
+            } else {
+                Vec::new()
+            };
+            if let Some(addon) = bundle.addon(id) {
+                allowed.extend(
+                    addon
+                        .folders
+                        .iter()
+                        .filter(|folder| earlier.contains(&folder.to_lowercase()))
+                        .cloned(),
+                );
+                earlier.extend(folder_set(&addon.folders));
             }
-            if let Some(mut draft) = self.install_draft(id) {
+            if let Some(mut draft) = self.install_draft(id, allowed) {
                 draft.chained = chained.contains(id) && !drafts.is_empty();
                 drafts.push(draft);
             }
@@ -280,7 +400,8 @@ impl App {
         folders
     }
 
-    fn install_draft(&mut self, id: &str) -> Option<Draft> {
+    /// `allowed` is what this may replace on top of its own folders.
+    fn install_draft(&mut self, id: &str, allowed: Vec<String>) -> Option<Draft> {
         let bundle = self.bundle.clone()?;
         let addon = bundle.addon(id)?;
         let record = self.managed(id).cloned();
@@ -293,17 +414,18 @@ impl App {
             self.red(format!("{} has no build for Forever yet.", addon.name));
             return None;
         };
-        let verb = match &record {
-            None => Verb::Install,
-            Some(m) if model::same_version(&m.version, &release.version) => Verb::Reinstall,
-            Some(_) => Verb::Update,
-        };
+        let verb = verb_for(record.as_ref(), release);
         let old_folders = self
             .managed_map()
             .map(|m| ops::own_folders(id, m))
             .unwrap_or_default();
+        // The record's folders, not `old_folders`, which leaves out what it shares: an update
+        // goes on replacing a folder two addons claim without asking every time.
+        let mut may_replace = record.as_ref().map_or_else(Vec::new, |m| m.folders.clone());
+        may_replace.extend(allowed);
         let mut folders = folder_set(&addon.folders);
         folders.extend(folder_set(&old_folders));
+        folders.extend(folder_set(&may_replace));
         let origin = record.as_ref().map_or(Origin::Catalog, |m| m.origin);
         Some(Draft {
             verb,
@@ -312,6 +434,7 @@ impl App {
                 channel,
                 origin,
                 old_folders,
+                may_replace,
             },
             addon_id: id.to_owned(),
             name: addon.name.clone(),
@@ -592,6 +715,32 @@ impl App {
             exclusive: true,
         }]);
     }
+}
+
+fn verb_for(record: Option<&ManagedAddon>, release: &Release) -> Verb {
+    match record {
+        None => Verb::Install,
+        Some(m) if model::same_version(&m.version, &release.version) => Verb::Reinstall,
+        Some(_) => Verb::Update,
+    }
+}
+
+fn conflict_names(conflicts: &[FolderConflict]) -> String {
+    let folders: Vec<&str> = conflicts.iter().map(|c| c.folder.as_str()).collect();
+    ops::short_list(&folders)
+}
+
+/// Why an addon stayed out of a batch, and where the player gets to decide.
+fn sitting_out_line(name: &str, updating: bool, conflicts: &[FolderConflict]) -> String {
+    let (done, verb) = if updating {
+        ("updated", "Update")
+    } else {
+        ("installed", "Install")
+    };
+    format!(
+        "{name} wasn't {done} because it would replace {}. {verb} it from its own page to choose.",
+        conflict_names(conflicts)
+    )
 }
 
 fn backup_draft() -> Draft {
