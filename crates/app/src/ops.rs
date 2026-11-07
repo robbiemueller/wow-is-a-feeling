@@ -501,7 +501,8 @@ pub fn replaced_line(
         .collect();
     let folders = short_list(&went);
     Some(match owners.as_slice() {
-        [] => format!("{how} replaced {folders}, and the old copy is gone."),
+        [] if went.len() == 1 => format!("{how} replaced {folders}, and the old copy is gone."),
+        [] => format!("{how} replaced {folders}, and the old copies are gone."),
         [owner] => format!("{how} replaced {folders}. Install {owner} again to get its own back."),
         many => format!(
             "{how} replaced {folders}. Install {} again to get their own back.",
@@ -1122,6 +1123,10 @@ mod tests {
         assert_eq!(
             line(&["Lost"]).unwrap(),
             "The zip replaced Lost, and the old copy is gone."
+        );
+        assert_eq!(
+            line(&["Lost", "Gone"]).unwrap(),
+            "The zip replaced Lost and Gone, and the old copies are gone."
         );
         assert_eq!(
             line(&["Questie"]).unwrap(),

@@ -1084,6 +1084,7 @@ fn a_zip_with_a_surprise_folder_is_refused_in_red() {
         "{:?}",
         app(&h).messages.texts()
     );
+    assert!(has_label(&h, REFUSAL), "it's really on screen");
     close(h);
 
     // An addon the player already has can't start doing it in an update either.
