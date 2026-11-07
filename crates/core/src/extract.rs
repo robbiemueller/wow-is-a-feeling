@@ -52,17 +52,39 @@ const JUNK_NAMES: [&str; 8] = [
 /// things. Skipped and reported rather than fatal, since dev scripts turn up in real
 /// source archives. The last few aren't in the design's list, but a shortcut or an
 /// HTML application in an addon folder is the same lure as an `.exe`. Checked on every
-/// segment of a path, so nothing inside a `Foo.app/` bundle gets written either.
-const BLOCKED_EXTENSIONS: [&str; 19] = [
-    "exe", "dll", "scr", "com", "msi", "bat", "cmd", "ps1", "sh", "jar", "vbs", "app", "dylib",
-    "so", "lnk", "pif", "hta", "cpl", "wsf",
+/// segment of a path, so nothing inside a `Foo.app/` bundle gets written either, and the
+/// same goes for macOS installers and disk images, which can be bundles too.
+const BLOCKED_EXTENSIONS: [&str; 22] = [
+    "exe",
+    "dll",
+    "scr",
+    "com",
+    "msi",
+    "bat",
+    "cmd",
+    "ps1",
+    "sh",
+    "jar",
+    "vbs",
+    "app",
+    "dylib",
+    "so",
+    "lnk",
+    "pif",
+    "hta",
+    "cpl",
+    "wsf",
+    "pkg",
+    "mpkg",
+    "sparsebundle",
 ];
 
 /// The same lure, on file names only, because a folder called `Foo.Terminal` is just a
-/// folder: script hosts and shortcuts that run on a double-click, then disk images and
-/// archives that put a program one click away. The game reads none of these. It loads
-/// what its TOCs list, which is `lua`, `xml`, `blp`, `tga`, `ogg`, `mp3`, `ttf` and so on.
-const BLOCKED_FILE_EXTENSIONS: [&str; 32] = [
+/// folder: script hosts and shortcuts that run on a double-click, then disk images,
+/// app installers and archives that put a program one click away. The game reads none of
+/// these. It loads what its TOCs list, which is `lua`, `xml`, `blp`, `tga`, `ogg`, `mp3`,
+/// `ttf` and so on.
+const BLOCKED_FILE_EXTENSIONS: [&str; 44] = [
     "vbe",
     "jse",
     "js",
@@ -85,12 +107,24 @@ const BLOCKED_FILE_EXTENSIONS: [&str; 32] = [
     "py",
     "pyw",
     "pyz",
+    "pyzw",
+    "jnlp",
     "command",
     "terminal",
+    "desktop",
+    "rdp",
+    "msu",
+    "msix",
+    "msixbundle",
+    "appx",
+    "appxbundle",
+    "appinstaller",
     "iso",
     "img",
     "vhd",
     "vhdx",
+    "dmg",
+    "sparseimage",
     "zip",
     "7z",
     "rar",
@@ -2575,6 +2609,42 @@ mod tests {
                 ]
             })
             .collect();
+        let mut entries = vec![
+            RawEntry::new("Foo/Foo.toc", TOC),
+            RawEntry::new("Foo/fine.lua", b"ok"),
+        ];
+        entries.extend(names.iter().map(|n| RawEntry::new(n, b"payload")));
+        let fixture = Fixture::new();
+        let extracted = fixture.extract(&raw_zip(&entries), &[]).unwrap();
+        assert_eq!(paths(&fixture), ["Foo/Foo.toc", "Foo/fine.lua"]);
+        names.sort();
+        assert_eq!(extracted.skipped_files, names);
+    }
+
+    #[test]
+    fn installers_and_disk_images_for_every_os_are_skipped_and_reported() {
+        let mut names: Vec<String> = [
+            "Foo/Setup.dmg",
+            "Foo/Setup.pkg",
+            "Foo/Setup.mpkg",
+            "Foo/Disk.sparseimage",
+            "Foo/App.msix",
+            "Foo/App.msixbundle",
+            "Foo/App.appx",
+            "Foo/App.appxbundle",
+            "Foo/App.appinstaller",
+            "Foo/Patch.msu",
+            "Foo/tool.pyzw",
+            "Foo/start.jnlp",
+            "Foo/start.desktop",
+            "Foo/remote.rdp",
+            // Bundles are folders, so nothing inside one gets written either.
+            "Foo/Installer.pkg/Contents/Resources/postinstall",
+            "Foo/Installer.mpkg/Contents/Info.plist",
+            "Foo/Disk.sparsebundle/bands/0",
+        ]
+        .map(String::from)
+        .to_vec();
         let mut entries = vec![
             RawEntry::new("Foo/Foo.toc", TOC),
             RawEntry::new("Foo/fine.lua", b"ok"),
