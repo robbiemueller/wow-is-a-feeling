@@ -228,6 +228,8 @@ fn hash_file(path: &Path) -> Result<(String, u64), String> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::signing::sign_file;
     use super::*;
 
@@ -288,6 +290,68 @@ mod tests {
             ("macos-universal", "app.zip"),
         ] {
             assert_eq!(value["assets"][key]["kind"], kind, "{key}");
+        }
+    }
+
+    /// Every `wow-is-a-feeling-...` file name in a text.
+    fn release_files(text: &str) -> BTreeSet<String> {
+        text.match_indices("wow-is-a-feeling-")
+            .map(|(at, _)| {
+                text[at..]
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.'))
+                    .collect::<String>()
+            })
+            .filter(|name| {
+                [".exe", ".gz", ".AppImage", ".zip", ".dmg"]
+                    .iter()
+                    .any(|extension| name.ends_with(extension))
+            })
+            .collect()
+    }
+
+    /// These names live in five places, and if they drift an update or a download link breaks
+    /// for everyone on that platform, which nothing else would catch before a real release.
+    #[test]
+    fn asset_names_agree_everywhere_they_appear() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .unwrap();
+        let read = |path: &str| fs::read_to_string(root.join(path)).unwrap();
+
+        // What the release publishes, and what its build jobs actually make.
+        let workflow = read(".github/workflows/release.yml");
+        let (gather, rest): (Vec<&str>, Vec<&str>) = workflow
+            .lines()
+            .partition(|line| line.trim_start().starts_with("take "));
+        let published = release_files(&gather.join("\n"));
+        assert_eq!(published.len(), 6, "{published:?}");
+        assert_eq!(release_files(&rest.join("\n")), published);
+
+        // What xtask describes in latest.json.
+        for (name, _, _) in ASSETS {
+            assert!(published.contains(name), "{name} isn't published");
+        }
+
+        // What the landing page and the README link to.
+        let site = release_files(&read("site/index.html"));
+        assert!(site.len() >= 3, "{site:?}");
+        for name in site.iter().chain(&release_files(&read("README.md"))) {
+            assert!(
+                published.contains(name),
+                "{name} is linked to, not published"
+            );
+        }
+
+        // What the app asks for.
+        let selfupdate = read("crates/core/src/selfupdate.rs");
+        for (_, key, kind) in ASSETS {
+            assert!(selfupdate.contains(&format!("\"{key}\"")), "{key}");
+            assert!(selfupdate.contains(&format!("\"{kind}\"")), "{kind}");
+        }
+        if let Some(wanted) = selfupdate::asset_key() {
+            assert!(ASSETS.iter().any(|(_, key, _)| *key == wanted), "{wanted}");
         }
     }
 
