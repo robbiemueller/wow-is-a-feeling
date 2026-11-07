@@ -59,6 +59,121 @@ pub struct Curated {
     /// else merges a listing, whatever a repository's own files claim.
     #[serde(default)]
     pub merges: BTreeMap<String, String>,
+    /// Entries whose next build may ship a main folder the last catalog didn't list them
+    /// with: a real rename. Each one comes out again once the catalog with it is out.
+    #[serde(default)]
+    pub allow_new_main: Vec<String>,
+    /// Repositories that publish several addons, each under its own tag prefix.
+    #[serde(default)]
+    pub split: Vec<SplitSpec>,
+    /// Addons that go with another, such as the voice packs it plays, as groups.
+    #[serde(default)]
+    pub packs: Vec<PackSpec>,
+}
+
+/// One repository that publishes several addons, each under its own tag prefix, as tags
+/// like `<prefix>/v1.2.3`. See "One product per entry" in `docs/DESIGN.md`.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SplitSpec {
+    /// `owner/repo`. It's seeded too, so it's always read.
+    pub repo: String,
+    /// The tag prefix of the repository's own addon, the one `gh:owner/repo` lists.
+    pub main: String,
+    /// Tag prefixes that are addons of their own, each listed as `gh:owner/repo/<line>`.
+    #[serde(default)]
+    pub lines: Vec<String>,
+}
+
+/// One group of packs for an addon: any one of `ids` meets it.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PackSpec {
+    /// The addon the packs go with.
+    pub addon: String,
+    /// What the group is for, such as "Quest voices".
+    pub name: String,
+    /// The addon does nothing useful until one of these is installed.
+    #[serde(default)]
+    pub needed: bool,
+    /// Catalog ids, in the order to offer them.
+    pub ids: Vec<String>,
+}
+
+/// More lines than any repository needs, since each costs requests on every full look.
+const MAX_LINES: usize = 32;
+/// A line's prefix ends up in its id, which shared addon lists carry.
+const MAX_LINE_BYTES: usize = 64;
+/// A pack group's name is a label on the addon's page.
+const MAX_PACK_GROUP_CHARS: usize = 40;
+
+impl SplitSpec {
+    /// The catalog id of a release line: the repository as GitHub spells it, and the
+    /// prefix in lower case, so the author changing a tag's case can't orphan installs.
+    pub fn line_id(repo: &str, line: &str) -> String {
+        format!("gh:{repo}/{}", line.to_ascii_lowercase())
+    }
+
+    /// Every tag prefix this repository is read under, its own addon's first.
+    pub fn prefixes(&self) -> Vec<&str> {
+        std::iter::once(self.main.as_str())
+            .chain(self.lines.iter().map(String::as_str))
+            .collect()
+    }
+}
+
+/// The plain repository of a GitHub catalog id: `owner/repo` for `gh:owner/repo`, and for a
+/// release line's `gh:owner/repo/<line>` too.
+pub fn repo_of_id(id: &str) -> Option<&str> {
+    let rest = id.strip_prefix("gh:")?;
+    let mut parts = rest.split('/');
+    let owner = parts.next()?;
+    let repo = parts.next()?;
+    Some(&rest[..owner.len() + 1 + repo.len()])
+}
+
+/// A tag prefix a repository's releases can be read under: `[A-Za-z0-9._-]`, so it can only
+/// ever be one whole segment of a tag, and never a dot first.
+fn is_tag_prefix(prefix: &str) -> bool {
+    !prefix.is_empty()
+        && prefix.len() <= 100
+        && !prefix.starts_with('.')
+        && prefix
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+
+/// A prefix that can be the last part of a catalog id: letters, digits and dashes only,
+/// which is all the app accepts there.
+fn is_line_prefix(prefix: &str) -> bool {
+    prefix.len() <= MAX_LINE_BYTES
+        && !prefix.starts_with('-')
+        && !prefix.ends_with('-')
+        && is_tag_prefix(prefix)
+        && prefix
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+}
+
+/// `gh:owner/repo`, `gh:owner/repo/<line>`, `wowi:1234` or `direct:name`.
+fn looks_like_id(id: &str) -> bool {
+    ["gh:", "wowi:", "direct:"].iter().any(|kind| {
+        id.strip_prefix(kind)
+            .is_some_and(|rest| !rest.trim().is_empty())
+    })
+}
+
+/// The id of a GitHub entry: a repository's own, or one of its release lines'.
+fn is_github_id(id: &str) -> bool {
+    let Some(repo) = repo_of_id(id).filter(|repo| valid_repo_name(repo)) else {
+        return false;
+    };
+    match &id["gh:".len() + repo.len()..] {
+        "" => true,
+        line => line.strip_prefix('/').is_some_and(|line| {
+            is_line_prefix(line) && line.bytes().all(|b| !b.is_ascii_uppercase())
+        }),
+    }
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -149,12 +264,43 @@ impl Curated {
             .featured
             .iter()
             .chain(self.kits.iter().flat_map(|kit| kit.addons.iter()))
-            .chain(self.overrides.keys());
+            .chain(self.overrides.keys())
+            .chain(self.pack_ids());
         mentioned
-            .filter_map(|id| id.strip_prefix("gh:"))
+            .filter_map(|id| repo_of_id(id))
             .map(str::to_ascii_lowercase)
             .chain(self.source.iter().map(|s| s.repo.to_ascii_lowercase()))
+            .chain(self.split.iter().map(|s| s.repo.to_ascii_lowercase()))
             .collect()
+    }
+
+    /// Every id `[[packs]]` names, the addons and their packs.
+    fn pack_ids(&self) -> impl Iterator<Item = &String> {
+        self.packs
+            .iter()
+            .flat_map(|group| std::iter::once(&group.addon).chain(group.ids.iter()))
+    }
+
+    /// The `[[split]]` for this repository, if it has one.
+    pub fn split_of(&self, repo: &str) -> Option<&SplitSpec> {
+        self.split
+            .iter()
+            .find(|s| s.repo.eq_ignore_ascii_case(repo))
+    }
+
+    /// Whether this entry's next build may ship another main folder than the last one.
+    pub fn allows_new_main(&self, id: &str) -> bool {
+        self.allow_new_main
+            .iter()
+            .any(|allowed| allowed.eq_ignore_ascii_case(id))
+    }
+
+    /// A split repository that isn't seeded, which nothing promises to read on every run.
+    pub fn unseeded_split(&self, seeds: &Seeds) -> Option<String> {
+        self.split
+            .iter()
+            .find(|s| !seeds.repos.iter().any(|r| r.eq_ignore_ascii_case(&s.repo)))
+            .map(|s| format!("split: {} isn't in seeds.toml", s.repo))
     }
 
     pub fn excludes_repo(&self, repo: &str) -> bool {
@@ -170,12 +316,11 @@ impl Curated {
                 .any(|r| r.eq_ignore_ascii_case(repo))
     }
 
-    /// Whether this catalog id is left out on purpose, by name or by owner.
+    /// Whether this catalog id is left out on purpose, by name or by owner. A release line
+    /// goes with its repository.
     pub fn excludes_id(&self, id: &str) -> bool {
         self.exclude.ids.iter().any(|x| x.eq_ignore_ascii_case(id))
-            || id
-                .strip_prefix("gh:")
-                .is_some_and(|r| self.excludes_repo(r))
+            || repo_of_id(id).is_some_and(|r| self.excludes_repo(r))
     }
 
     fn mistake(&self) -> Option<String> {
@@ -187,16 +332,101 @@ impl Curated {
                 return Some(format!("merges: {repo} isn't owner/repo"));
             }
         }
+        if let Some(id) = self.allow_new_main.iter().find(|id| !is_github_id(id)) {
+            return Some(format!("allow_new_main: {id} isn't a GitHub entry's id"));
+        }
+        if let Some(problem) = self.split_mistake().or_else(|| self.packs_mistake()) {
+            return Some(problem);
+        }
         let gap_folders = self.gaps.iter().flat_map(|gap| gap.folders.iter());
         gap_folders
             .chain(self.reserved.iter())
             .find(|folder| !is_safe_folder(folder))
             .map(|folder| format!("{folder} can't be a folder name"))
     }
+
+    fn split_mistake(&self) -> Option<String> {
+        let mut repos = BTreeSet::new();
+        for split in &self.split {
+            let repo = &split.repo;
+            if !valid_repo_name(repo) {
+                return Some(format!("split: {repo} isn't owner/repo"));
+            }
+            if !repos.insert(repo.to_ascii_lowercase()) {
+                return Some(format!("split: {repo} is split twice"));
+            }
+            if !is_tag_prefix(&split.main) {
+                return Some(format!(
+                    "split {repo}: {} can't be a tag prefix",
+                    split.main
+                ));
+            }
+            if split.lines.len() > MAX_LINES {
+                return Some(format!(
+                    "split {repo}: {} lines is more than {MAX_LINES}",
+                    split.lines.len()
+                ));
+            }
+            let mut seen = BTreeSet::new();
+            for line in &split.lines {
+                if !is_line_prefix(line) {
+                    return Some(format!(
+                        "split {repo}: {line} can't be a line, which takes up to {MAX_LINE_BYTES} letters, digits and dashes"
+                    ));
+                }
+                if line.eq_ignore_ascii_case(&split.main) {
+                    return Some(format!("split {repo}: {line} is its main prefix"));
+                }
+                if !seen.insert(line.to_ascii_lowercase()) {
+                    return Some(format!("split {repo}: {line} is listed twice"));
+                }
+            }
+        }
+        None
+    }
+
+    fn packs_mistake(&self) -> Option<String> {
+        let mut groups = BTreeSet::new();
+        for group in &self.packs {
+            let addon = &group.addon;
+            if !looks_like_id(addon) {
+                return Some(format!("packs: {addon} isn't a catalog id"));
+            }
+            let name = group.name.trim();
+            if name.is_empty() {
+                return Some(format!("packs for {addon}: a group has no name"));
+            }
+            if name.chars().count() > MAX_PACK_GROUP_CHARS {
+                return Some(format!(
+                    "packs for {addon}: {name} is longer than {MAX_PACK_GROUP_CHARS} characters"
+                ));
+            }
+            if !groups.insert((addon.to_ascii_lowercase(), name.to_lowercase())) {
+                return Some(format!("packs for {addon}: two groups are called {name}"));
+            }
+            if group.ids.is_empty() {
+                return Some(format!("packs for {addon}: {name} names no addons"));
+            }
+            let mut seen = BTreeSet::new();
+            for id in &group.ids {
+                if !looks_like_id(id) {
+                    return Some(format!("packs for {addon}: {id} isn't a catalog id"));
+                }
+                if id.eq_ignore_ascii_case(addon) {
+                    return Some(format!("packs for {addon}: {name} lists the addon itself"));
+                }
+                if !seen.insert(id.to_ascii_lowercase()) {
+                    return Some(format!("packs for {addon}: {name} lists {id} twice"));
+                }
+            }
+        }
+        None
+    }
 }
 
 /// Everything a person chose: `seeds.toml`, what `curated.toml` names, and both sides
-/// of an approved merge. Always beats anything found by search.
+/// of an approved merge. Always beats anything found by search. Release lines exist only
+/// because someone wrote them down, so they're always in here.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct HandPicked {
     ids: BTreeSet<String>,
@@ -212,7 +442,16 @@ impl HandPicked {
             .chain(curated.overrides.keys())
             .chain(curated.gaps.iter().flat_map(|gap| gap.alternatives.iter()))
             .chain(curated.gaps.iter().flat_map(|gap| gap.unrelated.iter()))
+            .chain(curated.pack_ids())
             .cloned();
+        let lines = curated.split.iter().flat_map(|split| {
+            std::iter::once(repo(&split.repo)).chain(
+                split
+                    .lines
+                    .iter()
+                    .map(|line| SplitSpec::line_id(&split.repo, line)),
+            )
+        });
         let ids = named
             .chain(seeds.repos.iter().map(|name| repo(name)))
             .chain(seeds.wowi.iter().map(|id| format!("wowi:{id}")))
@@ -220,6 +459,7 @@ impl HandPicked {
             .chain(curated.direct.iter().map(|spec| spec.id.clone()))
             .chain(curated.merges.keys().map(|id| format!("wowi:{id}")))
             .chain(curated.merges.values().map(|name| repo(name)))
+            .chain(lines)
             .map(|id| id.to_ascii_lowercase())
             .collect();
         Self { ids }
@@ -1271,6 +1511,47 @@ mod tests {
                 );
             }
         }
+
+        assert_eq!(curated.unseeded_split(&seeds), None);
+        for split in &curated.split {
+            for line in &split.lines {
+                let id = SplitSpec::line_id(&split.repo, line);
+                assert!(is_github_id(&id), "{id}");
+                assert!(picks.contains(&id), "{id} should be hand-picked");
+                let edit = curated.overrides.get(&id);
+                assert!(
+                    edit.is_some_and(|e| e.name.is_some() && e.summary.is_some()),
+                    "{id} needs a name and a summary in [overrides]"
+                );
+            }
+        }
+        for id in curated.pack_ids() {
+            assert!(picks.contains(id), "{id} should be hand-picked");
+        }
+        let spoken: Vec<(&str, bool, &[String])> = curated
+            .packs
+            .iter()
+            .filter(|group| group.addon == "gh:rusty-key/spoken-wow")
+            .map(|group| (group.name.as_str(), group.needed, group.ids.as_slice()))
+            .collect();
+        assert_eq!(spoken.len(), 4);
+        assert_eq!(
+            spoken[0],
+            (
+                "Quest voices",
+                true,
+                &["gh:rusty-key/spoken-wow/quests-audio".to_string()][..]
+            ),
+            "the quest voices come first, and Spoken does nothing without them"
+        );
+        assert!(spoken[1..].iter().all(|(_, needed, _)| !needed));
+        for folder in ["SpokenQuestsAudioAlliance", "SpokenQuestsAudioGossip"] {
+            assert!(curated.reserved.contains(&folder.to_string()), "{folder}");
+        }
+        assert!(
+            curated.allow_new_main.is_empty(),
+            "a rename is let through once, then taken out again"
+        );
     }
 
     #[test]
@@ -1282,16 +1563,154 @@ mod tests {
         assert!(error.contains("mistake"), "{error}");
         assert!(load_seeds(&dir.path().join("missing.toml")).is_err());
 
+        let split = |repo: &str, main: &str, lines: &str| {
+            format!("[[split]]\nrepo = \"{repo}\"\nmain = \"{main}\"\nlines = [{lines}]\n")
+        };
+        let pack = |addon: &str, name: &str, ids: &str| {
+            format!("[[packs]]\naddon = \"{addon}\"\nname = \"{name}\"\nids = [{ids}]\n")
+        };
+        let twice = split("a/b", "main", "") + &split("A/B", "other", "");
+        let long_name = pack("gh:a/b", &"x".repeat(41), "\"gh:a/c\"");
+        let same_group =
+            pack("gh:a/b", "Voices", "\"gh:a/c\"") + &pack("gh:a/b", "voices", "\"gh:a/d\"");
+        let many: Vec<String> = (0..=MAX_LINES).map(|i| format!("\"l{i}\"")).collect();
         for wrong in [
-            "[merges]\nabc = \"a/b\"\n",
-            "[merges]\n12 = \"not a repo\"\n",
-            "reserved = [\"../evil\"]\n",
-            "[[gaps]]\nname = \"G\"\nreason = \"R.\"\nfolders = [\"a/b\"]\n",
+            "[merges]\nabc = \"a/b\"\n".to_string(),
+            "[merges]\n12 = \"not a repo\"\n".to_string(),
+            "reserved = [\"../evil\"]\n".to_string(),
+            "[[gaps]]\nname = \"G\"\nreason = \"R.\"\nfolders = [\"a/b\"]\n".to_string(),
+            split("not a repo", "main", ""),
+            twice,
+            split("a/b", "main", "\"main\""),
+            split("a/b", "main", "\"MAIN\""),
+            split("a/b", "main", "\"x/y\""),
+            split("a/b", "main", "\".hidden\""),
+            split("a/b", "main", "\"with_underscore\""),
+            split("a/b", "main", "\"-dash\""),
+            split("a/b", "main", "\"x\", \"X\""),
+            split("a/b", "", ""),
+            split("a/b", ".main", ""),
+            split("a/b", "main", &many.join(", ")),
+            pack("gh:a/b", " ", "\"gh:a/c\""),
+            long_name,
+            pack("gh:a/b", "Voices", ""),
+            pack("gh:a/b", "Voices", "\"gh:a/c\", \"GH:A/C\""),
+            pack("gh:a/b", "Voices", "\"gh:a/b\""),
+            pack("gh:a/b", "Voices", "\"a/c\""),
+            pack("nothing", "Voices", "\"gh:a/c\""),
+            same_group,
+            "allow_new_main = [\"wowi:12\"]\n".to_string(),
+            "allow_new_main = [\"gh:not a repo\"]\n".to_string(),
+            "allow_new_main = [\"gh:a/b/Upper\"]\n".to_string(),
+            "allow_new_main = [\"gh:a/b/c/d\"]\n".to_string(),
         ] {
-            std::fs::write(&path, wrong).unwrap();
+            std::fs::write(&path, &wrong).unwrap();
             let error = load_curated(&path).unwrap_err();
             assert!(error.contains("mistake"), "{wrong}: {error}");
         }
+
+        let fine = "allow_new_main = [\"gh:a/b\", \"gh:a/b/quests-audio\"]\n".to_string()
+            + &split("a/b", "spoken", "\"quests-audio\", \"places2\"")
+            + &pack("gh:a/b", "Quest voices", "\"gh:a/b/quests-audio\"");
+        std::fs::write(&path, &fine).unwrap();
+        let curated = load_curated(&path).unwrap();
+        assert_eq!(
+            curated.split[0].prefixes(),
+            ["spoken", "quests-audio", "places2"]
+        );
+        assert!(!curated.packs[0].needed, "an extra unless it says so");
+    }
+
+    #[test]
+    fn a_split_repository_must_be_seeded() {
+        let curated = Curated {
+            split: vec![SplitSpec {
+                repo: "rusty-key/spoken-wow".into(),
+                main: "spoken".into(),
+                lines: vec![],
+            }],
+            ..Curated::default()
+        };
+        let mut seeds = Seeds::default();
+        assert!(
+            curated
+                .unseeded_split(&seeds)
+                .unwrap()
+                .contains("rusty-key/spoken-wow")
+        );
+        seeds.repos.push("Rusty-Key/Spoken-WoW".into());
+        assert_eq!(curated.unseeded_split(&seeds), None);
+    }
+
+    #[test]
+    fn a_release_line_goes_with_its_repository() {
+        assert_eq!(
+            SplitSpec::line_id("rusty-key/spoken-wow", "Quests-Audio"),
+            "gh:rusty-key/spoken-wow/quests-audio"
+        );
+        assert_eq!(
+            repo_of_id("gh:rusty-key/spoken-wow/quests-audio"),
+            Some("rusty-key/spoken-wow")
+        );
+        assert_eq!(repo_of_id("gh:a/b"), Some("a/b"));
+        assert_eq!(repo_of_id("gh:a"), None);
+        assert_eq!(repo_of_id("wowi:12"), None);
+
+        let curated = Curated {
+            exclude: Exclude {
+                repos: vec!["rusty-key/spoken-wow".into()],
+                ..Exclude::default()
+            },
+            overrides: BTreeMap::from([("gh:Other/Repo/pack".to_string(), Override::default())]),
+            packs: vec![PackSpec {
+                addon: "gh:third/main".into(),
+                name: "Voices".into(),
+                needed: false,
+                ids: vec!["gh:fourth/voices".into()],
+            }],
+            ..Curated::default()
+        };
+        assert!(curated.excludes_id("gh:rusty-key/spoken-wow/quests-audio"));
+        assert!(curated.excludes_id("gh:rusty-key/spoken-wow"));
+        assert!(!curated.excludes_id("gh:rusty-key/other/quests-audio"));
+        let named = curated.named_repos();
+        for repo in ["other/repo", "third/main", "fourth/voices"] {
+            assert!(named.contains(repo), "{repo}: {named:?}");
+        }
+        assert!(!named.iter().any(|repo| repo.contains("pack")), "{named:?}");
+    }
+
+    #[test]
+    fn lines_and_everything_packs_name_are_hand_picked() {
+        let curated = Curated {
+            split: vec![SplitSpec {
+                repo: "rusty-key/spoken-wow".into(),
+                main: "spoken".into(),
+                lines: vec!["quests-audio".into()],
+            }],
+            packs: vec![PackSpec {
+                addon: "gh:third/main".into(),
+                name: "Voices".into(),
+                needed: true,
+                ids: vec!["wowi:99".into()],
+            }],
+            allow_new_main: vec!["gh:fifth/renamed".into()],
+            ..Curated::default()
+        };
+        let picks = HandPicked::new(&Seeds::default(), &curated);
+        for id in [
+            "gh:rusty-key/spoken-wow",
+            "gh:rusty-key/spoken-wow/quests-audio",
+            "gh:third/main",
+            "wowi:99",
+        ] {
+            assert!(picks.contains(id), "{id}");
+        }
+        assert!(!picks.contains("gh:rusty-key/spoken-wow/places-audio"));
+        assert!(
+            !picks.contains("gh:fifth/renamed"),
+            "allowing a rename doesn't pick anything"
+        );
     }
 
     #[test]

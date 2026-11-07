@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use feeling_core::catalog::{Catalog, Source};
+use feeling_core::catalog::{Addon, Catalog, Source};
 
 use crate::curated::{Curated, HandPicked};
 use crate::detect::FOREVER_EPOCH;
@@ -415,6 +415,46 @@ impl Ledger {
     }
 }
 
+/// What the last catalog listed one GitHub entry as. A new build only counts while it still
+/// ships the same main folder, so a release of another addon from the same repository can
+/// never take the entry's place. See "One product per entry" in `docs/DESIGN.md`.
+#[derive(Debug, Clone, Copy)]
+pub struct Pin<'a> {
+    /// The main folder the entry was listed with.
+    pub main: &'a str,
+    /// The entry as it was listed.
+    pub last: &'a Addon,
+}
+
+/// Every GitHub entry the last catalog listed, by id, except the ones `allow_new_main` in
+/// `curated.toml` lets change. Without a last catalog nothing is pinned.
+#[derive(Debug, Default)]
+pub struct Pins<'a> {
+    by_id: HashMap<String, &'a Addon>,
+}
+
+impl<'a> Pins<'a> {
+    pub fn new(previous: Option<&'a Catalog>, curated: &Curated) -> Self {
+        let by_id = previous
+            .map_or(&[][..], |catalog| catalog.addons.as_slice())
+            .iter()
+            .filter(|addon| addon.id.starts_with("gh:") && !addon.folders.is_empty())
+            .filter(|addon| !curated.allows_new_main(&addon.id))
+            .map(|addon| (addon.id.to_ascii_lowercase(), addon))
+            .collect();
+        Self { by_id }
+    }
+
+    /// The addon this entry has to stay, if the last catalog listed it.
+    pub fn get(&self, id: &str) -> Option<Pin<'a>> {
+        let last = *self.by_id.get(&id.to_ascii_lowercase())?;
+        Some(Pin {
+            main: last.folders.first()?,
+            last,
+        })
+    }
+}
+
 /// Which folders the last catalog listed, and for whom.
 #[derive(Default)]
 struct LastCatalog<'a> {
@@ -630,7 +670,7 @@ mod tests {
     use feeling_core::catalog::{Addon, ExternalIds};
 
     use super::*;
-    use crate::curated::{GapSpec, Seeds};
+    use crate::curated::{GapSpec, Seeds, SplitSpec};
 
     const NOW: i64 = 1_800_000_000;
     const DAY: i64 = 24 * 60 * 60;
@@ -1376,6 +1416,73 @@ mod tests {
         let others = vec![gh("other/One", &["One"]), gh("other/Two", &["Two"])];
         let (kept, _) = pass(others, &picks(&[]), None);
         assert_eq!(kept.len(), 2);
+    }
+
+    #[test]
+    fn release_lines_never_count_toward_their_owners_cap() {
+        let at_cap: Vec<Candidate> = (0..MAX_ENTRIES_PER_OWNER)
+            .map(|at| {
+                named(
+                    gh(&format!("flood/R{at}"), &[&format!("F{at}")]),
+                    &format!("N{at}"),
+                )
+            })
+            .collect();
+        let listed: Vec<(&Candidate, i64)> = at_cap.iter().map(|c| (c, NOW - 100 * DAY)).collect();
+        let previous = published(&listed);
+        let curated = Curated {
+            split: vec![SplitSpec {
+                repo: "flood/Packs".into(),
+                main: "main".into(),
+                lines: vec!["one".into(), "two".into()],
+            }],
+            ..Curated::default()
+        };
+        let chosen = HandPicked::new(&Seeds::default(), &curated);
+        let mut list = at_cap;
+        for line in ["one", "two"] {
+            let mut pack = named(
+                gh("flood/Packs", &[&format!("Pack{line}")]),
+                &format!("Pack {line}"),
+            );
+            pack.addon.id = SplitSpec::line_id("flood/Packs", line);
+            list.push(pack);
+        }
+        let (kept, held) = pass(list, &chosen, Some(&previous));
+        assert!(held.is_empty(), "{held:?}");
+        assert_eq!(kept.len(), MAX_ENTRIES_PER_OWNER + 2);
+    }
+
+    #[test]
+    fn pins_come_from_the_last_catalogs_github_entries_less_allowed_renames() {
+        let entry = |id: &str, folders: &[&str]| Addon {
+            id: id.into(),
+            folders: folders.iter().map(|f| f.to_string()).collect(),
+            ..Addon::default()
+        };
+        let previous = Catalog {
+            addons: vec![
+                entry("gh:A/Addon", &["Addon", "Addon_Options"]),
+                entry("gh:b/renamed", &["Old"]),
+                entry("gh:b/renamed/line", &["OldPack"]),
+                entry("wowi:7", &["Listing"]),
+                entry("gh:c/empty", &[]),
+            ],
+            ..Catalog::default()
+        };
+        let curated = Curated {
+            allow_new_main: vec!["GH:B/Renamed".into()],
+            ..Curated::default()
+        };
+        let pins = Pins::new(Some(&previous), &curated);
+        let pin = pins.get("gh:a/addon").unwrap();
+        assert_eq!(pin.main, "Addon", "the main folder, compared ignoring case");
+        assert_eq!(pin.last.id, "gh:A/Addon");
+        assert_eq!(pins.get("gh:b/renamed/line").unwrap().main, "OldPack");
+        for free in ["gh:b/renamed", "wowi:7", "gh:c/empty", "gh:new/one"] {
+            assert!(pins.get(free).is_none(), "{free}");
+        }
+        assert!(Pins::new(None, &curated).get("gh:a/addon").is_none());
     }
 
     fn trust(

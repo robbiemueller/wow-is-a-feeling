@@ -6,7 +6,7 @@ use std::fs;
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
 
-use feeling_core::catalog::{Addon, CATEGORIES, Catalog, Channel};
+use feeling_core::catalog::{Addon, CATEGORIES, Catalog, Channel, Source};
 use feeling_core::install::{self, InstallRequest, Layout};
 use feeling_core::net::{self, Http};
 use feeling_core::scan;
@@ -70,6 +70,18 @@ fn static_problems(catalog: &Catalog) -> Vec<String> {
         if addon.release(Channel::Stable).is_none() {
             problems.push(format!("{} has no release", addon.id));
         }
+        problems.extend(github_id_problem(addon));
+        for group in &addon.packs {
+            if group.name.trim().is_empty() {
+                problems.push(format!("{} has a group of packs with no name", addon.id));
+            }
+            if group.ids.is_empty() {
+                problems.push(format!(
+                    "{}'s {} packs name no addons",
+                    addon.id, group.name
+                ));
+            }
+        }
         for release in [&addon.stable, &addon.beta].into_iter().flatten() {
             if !net::is_public_url(&release.url) {
                 problems.push(format!(
@@ -102,7 +114,48 @@ fn static_problems(catalog: &Catalog) -> Vec<String> {
             check(&gap.name, id);
         }
     }
+    for addon in &catalog.addons {
+        for group in &addon.packs {
+            for id in &group.ids {
+                check(&format!("{}'s {} packs", addon.id, group.name), id);
+            }
+        }
+    }
     problems
+}
+
+/// A `gh:` id is a repository, `gh:owner/repo`, or one of its release lines,
+/// `gh:owner/repo/<line>`. A line is lowercase letters, digits and dashes, because shared
+/// addon lists carry it, and it comes from the plain repository.
+fn github_id_problem(addon: &Addon) -> Option<String> {
+    let rest = addon.id.strip_prefix("gh:")?;
+    match rest.split('/').collect::<Vec<_>>().as_slice() {
+        [_, _] => None,
+        [owner, repo, line] => {
+            let plain_line = !line.is_empty()
+                && line
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+            if !plain_line {
+                return Some(format!(
+                    "{} has a line part that isn't lowercase letters, digits and dashes",
+                    addon.id
+                ));
+            }
+            let expected = format!("{owner}/{repo}");
+            match &addon.source {
+                Source::Github { repo } if *repo == expected => None,
+                _ => Some(format!(
+                    "{} is a line of {expected}, but its source isn't that repository",
+                    addon.id
+                )),
+            }
+        }
+        _ => Some(format!(
+            "{} isn't gh:owner/repo or gh:owner/repo/<line>",
+            addon.id
+        )),
+    }
 }
 
 /// The download sites README.md lists under "What it connects to". A catalog that sends
@@ -224,7 +277,119 @@ fn try_install(http: &Http, addon: &Addon) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
+    use feeling_core::catalog::{PackGroup, Release};
+
     use super::*;
+
+    fn entry(id: &str, repo: &str) -> Addon {
+        Addon {
+            id: id.into(),
+            name: "Spoken".into(),
+            category: "quests".into(),
+            source: Source::Github { repo: repo.into() },
+            folders: vec!["Spoken".into()],
+            stable: Some(Release {
+                version: "v1".into(),
+                url: format!("https://github.com/{repo}/releases/download/v1/a.zip"),
+                ..Release::default()
+            }),
+            ..Addon::default()
+        }
+    }
+
+    fn catalog(addons: Vec<Addon>) -> Catalog {
+        Catalog {
+            addons,
+            ..Catalog::default()
+        }
+    }
+
+    const SPOKEN: &str = "rusty-key/spoken-wow";
+
+    #[test]
+    fn a_healthy_addon_with_packs_has_no_problems() {
+        let mut spoken = entry("gh:rusty-key/spoken-wow", SPOKEN);
+        spoken.packs = vec![PackGroup {
+            name: "Quest voices".into(),
+            needed: true,
+            ids: vec!["gh:rusty-key/spoken-wow/quests-audio".into()],
+        }];
+        let quests = entry("gh:rusty-key/spoken-wow/quests-audio", SPOKEN);
+        let problems = static_problems(&catalog(vec![spoken, quests]));
+        assert!(problems.is_empty(), "{problems:?}");
+    }
+
+    #[test]
+    fn packs_must_name_listed_addons_and_have_a_name() {
+        let mut spoken = entry("gh:rusty-key/spoken-wow", SPOKEN);
+        spoken.packs = vec![
+            PackGroup {
+                name: "Quest voices".into(),
+                needed: true,
+                ids: vec!["gh:rusty-key/spoken-wow/quests-audio".into()],
+            },
+            PackGroup {
+                name: " ".into(),
+                needed: false,
+                ids: vec![],
+            },
+        ];
+        let problems = static_problems(&catalog(vec![spoken]));
+        assert!(
+            problems.iter().any(|p| p.contains(
+                "Quest voices packs points at gh:rusty-key/spoken-wow/quests-audio, which isn't listed"
+            )),
+            "{problems:?}"
+        );
+        assert!(
+            problems.iter().any(|p| p.contains("with no name")),
+            "{problems:?}"
+        );
+        assert!(
+            problems.iter().any(|p| p.contains("name no addons")),
+            "{problems:?}"
+        );
+    }
+
+    #[test]
+    fn a_release_lines_id_is_plain_and_comes_from_its_repository() {
+        for (id, repo, wanted) in [
+            (
+                "gh:rusty-key/spoken-wow/Quests-Audio",
+                SPOKEN,
+                "isn't lowercase",
+            ),
+            (
+                "gh:rusty-key/spoken-wow/quests_audio",
+                SPOKEN,
+                "isn't lowercase",
+            ),
+            ("gh:rusty-key/spoken-wow/", SPOKEN, "isn't lowercase"),
+            (
+                "gh:rusty-key/spoken-wow/quests-audio",
+                "rusty-key/spoken-wow/quests-audio",
+                "its source isn't",
+            ),
+            (
+                "gh:rusty-key/spoken-wow/quests-audio",
+                "rusty-key/other",
+                "its source isn't",
+            ),
+            ("gh:a/b/c/d", "a/b", "isn't gh:owner/repo"),
+            ("gh:alone", "alone", "isn't gh:owner/repo"),
+        ] {
+            let problems = static_problems(&catalog(vec![entry(id, repo)]));
+            assert!(
+                problems.iter().any(|p| p.contains(wanted)),
+                "{id}: {problems:?}"
+            );
+        }
+        let mut listing = entry("wowi:7", SPOKEN);
+        listing.source = Source::Wowi { id: 7 };
+        listing.stable.as_mut().unwrap().url =
+            "https://cdn.wowinterface.com/downloads/getfile.php?id=7".into();
+        assert!(static_problems(&catalog(vec![listing])).is_empty());
+    }
 
     #[test]
     fn only_the_download_sites_the_readme_lists_pass() {

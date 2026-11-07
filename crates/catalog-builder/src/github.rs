@@ -645,6 +645,177 @@ pub fn search_code(http: &Http) -> Vec<String> {
     found
 }
 
+/// Each tag prefix's own releases, with the prefix cut off their tags.
+pub type PrefixReleases = BTreeMap<String, Vec<GhRelease>>;
+
+/// Tags read per prefix, as many as a whole repository gets releases.
+const TAGS_PER_PREFIX: usize = 15;
+/// Release lookups per query.
+const MAX_TAGS_PER_QUERY: usize = 50;
+
+/// The fields of one release, the same as `REPO_FRAGMENT` asks for.
+const RELEASE_FRAGMENT: &str = "fragment R on Release {
+  tagName isPrerelease isDraft publishedAt
+  releaseAssets(first: 40) { nodes { name size downloadCount downloadUrl digest } }
+}";
+
+/// A string as a GraphQL literal. Tag names are anyone's to write, so they're never pasted
+/// into a query as they are: JSON's escaping is GraphQL's too.
+fn quoted(text: &str) -> String {
+    serde_json::Value::from(text).to_string()
+}
+
+/// One query for the newest tags under every prefix of one repository.
+fn prefix_tags_query(owner: &str, name: &str, prefixes: &[&str]) -> String {
+    let mut query = format!(
+        "query {{ rateLimit {{ cost remaining resetAt }}\n  repository(owner: {}, name: {}) {{\n",
+        quoted(owner),
+        quoted(name)
+    );
+    for (at, prefix) in prefixes.iter().enumerate() {
+        query.push_str(&format!(
+            "    p{at}: refs(refPrefix: {}, first: {TAGS_PER_PREFIX}, orderBy: {{field: TAG_COMMIT_DATE, direction: DESC}}) {{ nodes {{ name }} }}\n",
+            quoted(&format!("refs/tags/{prefix}/"))
+        ));
+    }
+    query.push_str("  }\n}\n");
+    query
+}
+
+/// One query for the releases of these tags, which must already be whole tag names.
+fn releases_query(owner: &str, name: &str, tags: &[(usize, String)]) -> String {
+    let mut query = format!(
+        "query {{ rateLimit {{ cost remaining resetAt }}\n  repository(owner: {}, name: {}) {{\n",
+        quoted(owner),
+        quoted(name)
+    );
+    for (at, (_, tag)) in tags.iter().enumerate() {
+        query.push_str(&format!(
+            "    t{at}: release(tagName: {}) {{ ...R }}\n",
+            quoted(tag)
+        ));
+    }
+    query.push_str("  }\n}\n");
+    query.push_str(RELEASE_FRAGMENT);
+    query
+}
+
+/// The `repository` part of an answer, or why there isn't a usable one.
+fn repository_data(body: &[u8]) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+    let reply: GraphQlReply =
+        serde_json::from_slice(body).map_err(|e| format!("GraphQL reply doesn't parse: {e}"))?;
+    if let Some(error) = reply.errors.first() {
+        return Err(format!("GitHub answered with an error ({})", error.kind));
+    }
+    match reply.data.and_then(|mut data| data.remove("repository")) {
+        Some(serde_json::Value::Object(repository)) => Ok(repository),
+        _ => Err("GitHub doesn't know this repository".to_string()),
+    }
+}
+
+/// The whole tags found under each prefix, by the prefix's place in `prefixes`. A tag nested
+/// deeper, such as `legacy/quests/v1.0` under `legacy`, belongs to no prefix that's asked for.
+fn read_prefix_tags(body: &[u8], prefixes: &[&str]) -> Result<Vec<(usize, String)>, String> {
+    #[derive(Deserialize)]
+    struct RawRefName {
+        name: String,
+    }
+    let mut repository = repository_data(body)?;
+    let mut tags = Vec::new();
+    for (at, prefix) in prefixes.iter().enumerate() {
+        let value = repository
+            .remove(&format!("p{at}"))
+            .ok_or_else(|| format!("GitHub said nothing about {prefix}/"))?;
+        if value.is_null() {
+            continue;
+        }
+        let refs: Nodes<RawRefName> = serde_json::from_value(value).map_err(|e| e.to_string())?;
+        tags.extend(
+            refs.nodes
+                .into_iter()
+                .flatten()
+                .filter(|r| !r.name.is_empty() && !r.name.contains('/'))
+                .map(|r| (at, format!("{prefix}/{}", r.name))),
+        );
+    }
+    Ok(tags)
+}
+
+/// The releases of the tags asked for, each by its prefix's place, with the prefix cut off.
+/// A tag with no release is simply not one, and neither is a draft.
+fn read_prefix_releases(
+    body: &[u8],
+    asked: &[(usize, String)],
+    prefixes: &[&str],
+) -> Result<Vec<(usize, GhRelease)>, String> {
+    let mut repository = repository_data(body)?;
+    let mut found = Vec::new();
+    for (at, (prefix_at, tag)) in asked.iter().enumerate() {
+        let value = repository.remove(&format!("t{at}"));
+        let Some(value) = value.filter(|v| !v.is_null()) else {
+            continue;
+        };
+        let raw: RawRelease = serde_json::from_value(value).map_err(|e| e.to_string())?;
+        if raw
+            .release_assets
+            .as_ref()
+            .is_some_and(|assets| assets.nodes.iter().any(Option::is_none))
+        {
+            return Err(format!("{tag}: GitHub's answer has gaps in it"));
+        }
+        let own = format!("{}/", prefixes[*prefix_at]);
+        if raw.is_draft || raw.tag_name != *tag {
+            continue;
+        }
+        let mut release = raw.into_release();
+        release.tag = release.tag[own.len()..].to_string();
+        found.push((*prefix_at, release));
+    }
+    Ok(found)
+}
+
+/// The newest releases under each tag prefix of one repository, each prefix asked for on its
+/// own so a busy one can't push another out of reach. Keyed by prefix, and every prefix asked
+/// for is there, if only with nothing in it.
+pub fn fetch_prefix_releases(
+    http: &Http,
+    repo: &str,
+    prefixes: &[&str],
+) -> Result<PrefixReleases, String> {
+    fetch_prefix_releases_from(http, GRAPHQL_URL, repo, prefixes)
+}
+
+fn fetch_prefix_releases_from(
+    http: &Http,
+    url: &str,
+    repo: &str,
+    prefixes: &[&str],
+) -> Result<PrefixReleases, String> {
+    let Some((owner, name)) = repo.split_once('/').filter(|_| valid_repo_name(repo)) else {
+        return Err(format!("{repo} isn't an owner/repo name"));
+    };
+    let ask = |query: String| -> Result<Vec<u8>, String> {
+        let body = serde_json::json!({ "query": query }).to_string();
+        http.post_json(Channel::GraphQl, url, &body)
+            .map(|reply| reply.body)
+            .map_err(|e| e.to_string())
+    };
+    let tags = read_prefix_tags(&ask(prefix_tags_query(owner, name, prefixes))?, prefixes)?;
+    let mut found: PrefixReleases = prefixes
+        .iter()
+        .map(|prefix| ((*prefix).to_string(), Vec::new()))
+        .collect();
+    for chunk in tags.chunks(MAX_TAGS_PER_QUERY) {
+        let body = ask(releases_query(owner, name, chunk))?;
+        for (at, release) in read_prefix_releases(&body, chunk, prefixes)? {
+            if let Some(list) = found.get_mut(prefixes[at]) {
+                list.push(release);
+            }
+        }
+    }
+    Ok(found)
+}
+
 /// A tag, newest first, with the date of the commit it points at.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TagInfo {
@@ -1068,6 +1239,145 @@ mod tests {
         assert!(read_tags(br#"{"data":{"repository":null}}"#).is_err());
         let partial = br#"{"data":{"repository":{"nameWithOwner":"T/D","refs":{"nodes":[]}}},"errors":[{"type":"RESOURCE_LIMITS_EXCEEDED"}]}"#;
         assert!(read_tags(partial).is_err());
+    }
+
+    const PREFIXES: [&str; 3] = ["spoken", "quests-audio", "legacy"];
+
+    fn release_json(tag: &str, draft: bool, assets: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({"tagName": tag, "isPrerelease": false, "isDraft": draft,
+            "publishedAt": "2026-10-31T19:05:53Z", "releaseAssets": {"nodes": assets}})
+    }
+
+    fn pack_zip() -> serde_json::Value {
+        serde_json::json!([{"name": "SpokenQuestsAudioAll-2.5.0.zip", "size": 1_479_966_451u64,
+            "downloadCount": 1394,
+            "downloadUrl": "https://github.com/rusty-key/spoken-wow/releases/download/quests-audio/v2.5.0/SpokenQuestsAudioAll-2.5.0.zip",
+            "digest": format!("sha256:{}", "b".repeat(64))}])
+    }
+
+    #[test]
+    fn each_prefix_gets_its_own_tags_and_nested_ones_belong_to_none() {
+        let body = serde_json::json!({"data": {"rateLimit": {"cost": 1}, "repository": {
+            "p0": {"nodes": [{"name": "v3.8.3"}, {"name": "v3.8.2"}]},
+            "p1": {"nodes": [{"name": "v2.5.0"}]},
+            "p2": {"nodes": [{"name": "quests/v1.4.3"}]}
+        }}})
+        .to_string();
+        let tags = read_prefix_tags(body.as_bytes(), &PREFIXES).unwrap();
+        assert_eq!(
+            tags,
+            [
+                (0, "spoken/v3.8.3".to_string()),
+                (0, "spoken/v3.8.2".to_string()),
+                (1, "quests-audio/v2.5.0".to_string()),
+            ],
+            "legacy/quests/v1.4.3 is the quests line under legacy, not legacy's own"
+        );
+
+        let none = serde_json::json!({"data": {"repository": {"p0": null, "p1": {"nodes": []}, "p2": {"nodes": []}}}});
+        assert!(
+            read_prefix_tags(none.to_string().as_bytes(), &PREFIXES)
+                .unwrap()
+                .is_empty()
+        );
+        let missing = serde_json::json!({"data": {"repository": {"p0": {"nodes": []}}}});
+        assert!(read_prefix_tags(missing.to_string().as_bytes(), &PREFIXES).is_err());
+        let refused = br#"{"data":null,"errors":[{"type":"RATE_LIMITED"}]}"#;
+        assert!(read_prefix_tags(refused, &PREFIXES).is_err());
+    }
+
+    #[test]
+    fn prefix_releases_lose_their_prefix_and_skip_drafts_and_tags_without_one() {
+        let asked = [
+            (1, "quests-audio/v2.5.0".to_string()),
+            (1, "quests-audio/v2.4.0".to_string()),
+            (0, "spoken/v3.9.0".to_string()),
+        ];
+        let body = serde_json::json!({"data": {"repository": {
+            "t0": release_json("quests-audio/v2.5.0", false, pack_zip()),
+            "t1": null,
+            "t2": release_json("spoken/v3.9.0", true, serde_json::json!([]))
+        }}})
+        .to_string();
+        let found = read_prefix_releases(body.as_bytes(), &asked, &PREFIXES).unwrap();
+        assert_eq!(found.len(), 1);
+        let (at, release) = &found[0];
+        assert_eq!(*at, 1);
+        assert_eq!(release.tag, "v2.5.0", "the prefix never reaches detection");
+        assert_eq!(release.assets[0].size, 1_479_966_451);
+        assert_eq!(release.assets[0].sha256, Some("b".repeat(64)));
+        assert!(release.published > 0);
+
+        let gaps = serde_json::json!({"data": {"repository": {
+            "t0": release_json("quests-audio/v2.5.0", false, serde_json::json!([null])),
+            "t1": null, "t2": null
+        }}})
+        .to_string();
+        assert!(
+            read_prefix_releases(gaps.as_bytes(), &asked, &PREFIXES).is_err(),
+            "a blank node means GitHub gave up, not that there's nothing"
+        );
+    }
+
+    #[test]
+    fn a_tag_name_cant_break_out_of_the_query() {
+        let evil = "v1\") { x } t9: release(tagName: \"v2\\\n";
+        let query = releases_query("rusty-key", "spoken-wow", &[(0, evil.to_string())]);
+        let literal = quoted(evil);
+        assert_eq!(
+            serde_json::from_str::<String>(&literal).unwrap(),
+            evil,
+            "the literal reads back as the tag"
+        );
+        let rest = query.replacen(&literal, "TAG", 1);
+        assert!(
+            rest.contains("t0: release(tagName: TAG) { ...R }"),
+            "{query}"
+        );
+        assert_eq!(
+            rest.matches("release(").count(),
+            1,
+            "only the one lookup, whatever the tag says: {query}"
+        );
+        let tags = prefix_tags_query("rusty-key", "spoken-wow", &["quests-audio"]);
+        assert!(tags.contains(r#"refs(refPrefix: "refs/tags/quests-audio/", first: 15"#));
+    }
+
+    #[test]
+    fn prefix_releases_are_fetched_per_prefix_and_keyed_by_it() {
+        let tags = serde_json::json!({"data": {"repository": {
+            "p0": {"nodes": [{"name": "v3.8.3"}]},
+            "p1": {"nodes": [{"name": "v2.5.0"}]},
+            "p2": {"nodes": []}
+        }}})
+        .to_string();
+        let releases = serde_json::json!({"data": {"repository": {
+            "t0": release_json("spoken/v3.8.3", false, serde_json::json!([])),
+            "t1": release_json("quests-audio/v2.5.0", false, pack_zip())
+        }}})
+        .to_string();
+        let (base, seen) = serve(vec![
+            reply(200, &[], tags.as_bytes()),
+            reply(200, &[], releases.as_bytes()),
+        ]);
+        let http = client(Some("t"));
+        let found = fetch_prefix_releases_from(
+            &http,
+            &format!("{base}/graphql"),
+            "rusty-key/spoken-wow",
+            &PREFIXES,
+        )
+        .unwrap();
+        assert_eq!(found["spoken"][0].tag, "v3.8.3");
+        assert_eq!(found["quests-audio"][0].tag, "v2.5.0");
+        assert!(found["legacy"].is_empty(), "asked for, so it's there");
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            2,
+            "one for the tags, one for releases"
+        );
+
+        assert!(fetch_prefix_releases(&http, "not a repo", &PREFIXES).is_err());
     }
 
     #[test]

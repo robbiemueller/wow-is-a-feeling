@@ -57,6 +57,32 @@ pub struct ReleaseVerdict {
     /// A release for the addon's main flavor was examined and lacks Forever.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub confirmed_negative: bool,
+    /// The release was read for the addon with this main folder, and every Forever build in
+    /// it is another addon's. Read for any other addon, the same zips could be its build.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skipped_for: Option<String>,
+}
+
+impl ReleaseVerdict {
+    /// Whether this verdict still answers for an entry pinned to `pin`.
+    fn fits(&self, pin: Option<&str>) -> bool {
+        match (&self.scan, &self.skipped_for) {
+            (Some(scan), _) => ships(&scan.folders, pin),
+            (None, Some(wanted)) => pin.is_some_and(|pin| pin.eq_ignore_ascii_case(wanted)),
+            (None, None) => true,
+        }
+    }
+}
+
+/// Whether a build is still the addon an entry is pinned to: it ships the main folder the
+/// last catalog listed the entry with. Folders it adds, or a new main folder among them,
+/// don't matter. With no pin, any build is.
+pub fn ships(folders: &[String], pin: Option<&str>) -> bool {
+    pin.is_none_or(|main| {
+        folders
+            .iter()
+            .any(|folder| folder.eq_ignore_ascii_case(main))
+    })
 }
 
 /// A release with a Forever build.
@@ -75,6 +101,8 @@ pub struct Chosen {
     /// Releases that couldn't be examined this run.
     pub errors: Vec<String>,
     pub no_longer_forever: bool,
+    /// The newest release passed over because its Forever build is another addon's.
+    pub skipped: Option<String>,
 }
 
 /// What `release.json` says about a release.
@@ -231,12 +259,15 @@ pub fn assets_signature(assets: &[GhAsset]) -> String {
     format!("{hash:016x}")
 }
 
-/// Decide whether one release has a Forever build, and read its TOCs if so.
+/// Decide whether one release has a Forever build, and read its TOCs if so. With a `pin`,
+/// only a build that still ships that main folder counts: one release can hold several
+/// addons' zips, and another addon's is passed over, never counted against the release.
 /// `Err` means something failed along the way, and nothing should be cached.
 pub fn classify_release(
     release: &GhRelease,
     repo_name: &str,
     allow_toc_reads: bool,
+    pin: Option<&str>,
     probe: &mut dyn Probe,
 ) -> Result<ReleaseVerdict, String> {
     let mut verdict = ReleaseVerdict {
@@ -298,6 +329,7 @@ pub fn classify_release(
 
     let mut seen: Vec<&str> = Vec::new();
     let mut read_something = false;
+    let mut passed_over = false;
     for asset in queue {
         if seen.contains(&asset.name.as_str()) {
             continue;
@@ -305,12 +337,20 @@ pub fn classify_release(
         seen.push(&asset.name);
         let stem = zip_stem(&asset.name);
         let scan = probe.read_zip(asset, &[repo_name, &stem])?;
-        if scan.forever && !scan.folders.is_empty() {
+        if !scan.forever || scan.folders.is_empty() {
+            read_something = true;
+        } else if ships(&scan.folders, pin) {
             verdict.asset = Some(asset.name.clone());
             verdict.scan = Some(scan);
             return Ok(verdict);
+        } else {
+            passed_over = true;
         }
-        read_something = true;
+    }
+    if passed_over {
+        // Another addon's release, which says nothing about whether this one still has Forever.
+        verdict.skipped_for = pin.map(str::to_string);
+        return Ok(verdict);
     }
     verdict.confirmed_negative = read_something || (meta.lists_mainline && !release_is_flavored);
     Ok(verdict)
@@ -319,11 +359,14 @@ pub fn classify_release(
 /// Look through a repository's releases, newest first, for its newest stable
 /// Forever build and any pre-release newer than that. `cache` holds verdicts by
 /// tag: hits cost nothing, and tags that are gone get pruned.
+/// `pin` is the main folder the last catalog listed the entry with, when it did: a build
+/// that no longer ships it is another addon, and its release is passed over, stable or not.
 /// `out_of_time` stops new network work, leaving the rest to the next run.
 pub fn choose_builds(
     repo_name: &str,
     releases: &[GhRelease],
     cache: &mut BTreeMap<String, ReleaseVerdict>,
+    pin: Option<&str>,
     probe: &mut dyn Probe,
     out_of_time: &dyn Fn() -> bool,
 ) -> Chosen {
@@ -338,7 +381,10 @@ pub fn choose_builds(
             continue;
         }
         let sig = assets_signature(&release.assets);
-        let verdict = match cache.get(&release.tag).filter(|v| v.sig == sig) {
+        let cached = cache
+            .get(&release.tag)
+            .filter(|v| v.sig == sig && v.fits(pin));
+        let verdict = match cached {
             Some(hit) => hit.clone(),
             None => {
                 if out_of_time() {
@@ -346,7 +392,7 @@ pub fn choose_builds(
                     continue;
                 }
                 let allow_reads = negative_reads < MAX_NEGATIVE_READS;
-                match classify_release(release, repo_name, allow_reads, probe) {
+                match classify_release(release, repo_name, allow_reads, pin, probe) {
                     Ok(fresh) => {
                         cache.insert(release.tag.clone(), fresh.clone());
                         fresh
@@ -358,6 +404,10 @@ pub fn choose_builds(
                 }
             }
         };
+        if verdict.skipped_for.is_some() {
+            chosen.skipped.get_or_insert_with(|| release.tag.clone());
+            continue;
+        }
 
         let build = verdict.asset.as_ref().and_then(|name| {
             let asset = release.assets.iter().find(|a| &a.name == name)?;
@@ -464,7 +514,7 @@ mod tests {
 
     fn run(fake: &mut Fake, releases: &[GhRelease]) -> (Chosen, BTreeMap<String, ReleaseVerdict>) {
         let mut cache = BTreeMap::new();
-        let chosen = choose_builds("Addon", releases, &mut cache, fake, &|| false);
+        let chosen = choose_builds("Addon", releases, &mut cache, None, fake, &|| false);
         (chosen, cache)
     }
 
@@ -686,10 +736,10 @@ mod tests {
             .insert("Addon-1.zip".into(), Ok(forever_scan("Addon")));
         let releases = [release("v1", 1, &["Addon-1.zip", "release.json"])];
         let mut cache = BTreeMap::new();
-        let first = choose_builds("Addon", &releases, &mut cache, &mut fake, &|| false);
+        let first = choose_builds("Addon", &releases, &mut cache, None, &mut fake, &|| false);
         assert!(first.stable.is_some());
         let (json_reads, zip_reads) = (fake.json_reads.len(), fake.zip_reads.len());
-        let second = choose_builds("Addon", &releases, &mut cache, &mut fake, &|| false);
+        let second = choose_builds("Addon", &releases, &mut cache, None, &mut fake, &|| false);
         assert_eq!(second.stable, first.stable);
         assert_eq!(fake.json_reads.len(), json_reads);
         assert_eq!(fake.zip_reads.len(), zip_reads);
@@ -701,8 +751,8 @@ mod tests {
         fake.zips.insert("A-1.zip".into(), Ok(other_scan("A")));
         let releases = [release("v1", 1, &["A-1.zip"])];
         let mut cache = BTreeMap::new();
-        choose_builds("A", &releases, &mut cache, &mut fake, &|| false);
-        choose_builds("A", &releases, &mut cache, &mut fake, &|| false);
+        choose_builds("A", &releases, &mut cache, None, &mut fake, &|| false);
+        choose_builds("A", &releases, &mut cache, None, &mut fake, &|| false);
         assert_eq!(fake.zip_reads.len(), 1);
     }
 
@@ -712,10 +762,10 @@ mod tests {
         fake.zips.insert("A-1.zip".into(), Ok(other_scan("A")));
         let mut releases = [release("v1", 1, &["A-1.zip"])];
         let mut cache = BTreeMap::new();
-        choose_builds("A", &releases, &mut cache, &mut fake, &|| false);
+        choose_builds("A", &releases, &mut cache, None, &mut fake, &|| false);
         fake.zips.insert("A-1.zip".into(), Ok(forever_scan("A")));
         releases[0].assets[0].size = 2000;
-        let chosen = choose_builds("A", &releases, &mut cache, &mut fake, &|| false);
+        let chosen = choose_builds("A", &releases, &mut cache, None, &mut fake, &|| false);
         assert!(chosen.stable.is_some());
     }
 
@@ -726,7 +776,7 @@ mod tests {
         let mut releases = [release("v1", 1, &["A-1.zip"])];
         releases[0].assets[0].sha256 = Some("a".repeat(64));
         let mut cache = BTreeMap::new();
-        choose_builds("A", &releases, &mut cache, &mut fake, &|| false);
+        choose_builds("A", &releases, &mut cache, None, &mut fake, &|| false);
         assert_eq!(fake.zip_reads.len(), 1);
 
         // Same name and size, different bytes: the old folders must not stay paired
@@ -734,13 +784,13 @@ mod tests {
         fake.zips
             .insert("A-1.zip".into(), Ok(forever_scan("Other")));
         releases[0].assets[0].sha256 = Some("b".repeat(64));
-        let chosen = choose_builds("A", &releases, &mut cache, &mut fake, &|| false);
+        let chosen = choose_builds("A", &releases, &mut cache, None, &mut fake, &|| false);
         assert_eq!(fake.zip_reads.len(), 2, "the new file was read");
         let stable = chosen.stable.unwrap();
         assert_eq!(stable.scan.folders, ["Other"]);
         assert_eq!(stable.asset.sha256, Some("b".repeat(64)));
 
-        choose_builds("A", &releases, &mut cache, &mut fake, &|| false);
+        choose_builds("A", &releases, &mut cache, None, &mut fake, &|| false);
         assert_eq!(fake.zip_reads.len(), 2, "and it's cached like any other");
     }
 
@@ -865,13 +915,13 @@ mod tests {
         fake.zips.insert("A-1.zip".into(), Ok(forever_scan("A")));
         let releases = [release("v1", 1, &["A-1.zip"])];
         let mut cache = BTreeMap::new();
-        let chosen = choose_builds("A", &releases, &mut cache, &mut fake, &|| true);
+        let chosen = choose_builds("A", &releases, &mut cache, None, &mut fake, &|| true);
         assert!(chosen.stable.is_none());
         assert_eq!(chosen.errors.len(), 1);
         assert!(fake.zip_reads.is_empty());
 
-        choose_builds("A", &releases, &mut cache, &mut fake, &|| false);
-        let chosen = choose_builds("A", &releases, &mut cache, &mut fake, &|| true);
+        choose_builds("A", &releases, &mut cache, None, &mut fake, &|| false);
+        let chosen = choose_builds("A", &releases, &mut cache, None, &mut fake, &|| true);
         assert!(chosen.stable.is_some(), "a cached verdict needs no network");
     }
 
@@ -884,12 +934,137 @@ mod tests {
             "A",
             &[release("v1", 1, &["A-1.zip"])],
             &mut cache,
+            None,
             &mut fake,
             &|| false,
         );
         assert!(cache.contains_key("v1"));
-        choose_builds("A", &[], &mut cache, &mut fake, &|| false);
+        choose_builds("A", &[], &mut cache, None, &mut fake, &|| false);
         assert!(cache.is_empty());
+    }
+
+    fn pinned(
+        fake: &mut Fake,
+        releases: &[GhRelease],
+        cache: &mut BTreeMap<String, ReleaseVerdict>,
+        pin: &str,
+    ) -> Chosen {
+        choose_builds("Repo", releases, cache, Some(pin), fake, &|| false)
+    }
+
+    #[test]
+    fn another_addons_releases_are_passed_over_without_counting_as_negatives() {
+        let mut fake = Fake::default();
+        let mut releases: Vec<GhRelease> = (0..6)
+            .map(|i| {
+                let name = format!("Pack-{i}.zip");
+                fake.zips.insert(name.clone(), Ok(forever_scan("Pack")));
+                release(&format!("pack/v{i}"), i, &[name.as_str()])
+            })
+            .collect();
+        fake.zips
+            .insert("Main-1.zip".into(), Ok(forever_scan("Main")));
+        releases.push(release("v1", 10, &["Main-1.zip"]));
+
+        let mut cache = BTreeMap::new();
+        let chosen = pinned(&mut fake, &releases, &mut cache, "main");
+        assert_eq!(
+            chosen.stable.unwrap().tag,
+            "v1",
+            "six of another addon's releases and the pinned one is still reached"
+        );
+        assert_eq!(chosen.skipped.as_deref(), Some("pack/v0"), "the newest");
+        assert!(!chosen.no_longer_forever);
+        let verdict = &cache["pack/v0"];
+        assert!(!verdict.confirmed_negative);
+        assert_eq!(verdict.skipped_for.as_deref(), Some("main"));
+        assert_eq!(verdict.asset, None);
+    }
+
+    #[test]
+    fn the_beta_pick_is_pinned_too() {
+        let mut fake = Fake::default();
+        fake.zips
+            .insert("Pack-2b.zip".into(), Ok(forever_scan("Pack")));
+        fake.zips
+            .insert("Main-2b.zip".into(), Ok(forever_scan("Main")));
+        fake.zips
+            .insert("Main-1.zip".into(), Ok(forever_scan("Main")));
+        let mut pack_beta = release("pack/v2-beta", 1, &["Pack-2b.zip"]);
+        pack_beta.prerelease = true;
+        let mut main_beta = release("v2-beta", 2, &["Main-2b.zip"]);
+        main_beta.prerelease = true;
+        let releases = [pack_beta, main_beta, release("v1", 3, &["Main-1.zip"])];
+
+        let chosen = pinned(&mut fake, &releases, &mut BTreeMap::new(), "Main");
+        assert_eq!(chosen.beta.unwrap().tag, "v2-beta");
+        assert_eq!(chosen.stable.unwrap().tag, "v1");
+        assert_eq!(chosen.skipped.as_deref(), Some("pack/v2-beta"));
+    }
+
+    #[test]
+    fn a_release_with_several_addons_offers_the_pinned_ones_zip() {
+        let mut fake = Fake::default();
+        fake.zips
+            .insert("Pack.zip".into(), Ok(forever_scan("Pack")));
+        fake.zips
+            .insert("Main.zip".into(), Ok(forever_scan("Main")));
+        let releases = [release("v1", 1, &["Pack.zip", "Main.zip"])];
+
+        let chosen = pinned(&mut fake, &releases, &mut BTreeMap::new(), "Main");
+        assert_eq!(chosen.stable.unwrap().asset.name, "Main.zip");
+        assert_eq!(fake.zip_reads, ["Pack.zip", "Main.zip"]);
+        assert_eq!(
+            chosen.skipped, None,
+            "the release had the pinned addon after all"
+        );
+    }
+
+    #[test]
+    fn a_verdict_is_read_again_only_for_another_pin() {
+        let mut fake = Fake::default();
+        fake.zips
+            .insert("Pack.zip".into(), Ok(forever_scan("Pack")));
+        let releases = [release("pack/v1", 1, &["Pack.zip"])];
+        let mut cache = BTreeMap::new();
+
+        // A brand-new entry takes whatever the release has.
+        let first = choose_builds("Repo", &releases, &mut cache, None, &mut fake, &|| false);
+        assert_eq!(first.stable.unwrap().scan.folders, ["Pack"]);
+        assert_eq!(fake.zip_reads.len(), 1);
+
+        // Pinned to another addon, that answer doesn't hold, so the release is read again.
+        let pinned_once = pinned(&mut fake, &releases, &mut cache, "Main");
+        assert!(pinned_once.stable.is_none());
+        assert_eq!(pinned_once.skipped.as_deref(), Some("pack/v1"));
+        assert_eq!(fake.zip_reads.len(), 2);
+
+        // The same pin costs nothing on the next run.
+        pinned(&mut fake, &releases, &mut cache, "MAIN");
+        assert_eq!(fake.zip_reads.len(), 2, "folders compare ignoring case");
+
+        // Unpinned, or pinned to the pack itself, the release is the pack's build again.
+        let free = choose_builds("Repo", &releases, &mut cache, None, &mut fake, &|| false);
+        assert_eq!(free.stable.unwrap().scan.folders, ["Pack"]);
+        assert_eq!(fake.zip_reads.len(), 3);
+        let pack = pinned(&mut fake, &releases, &mut cache, "Pack");
+        assert!(pack.stable.is_some());
+        assert_eq!(
+            fake.zip_reads.len(),
+            3,
+            "the cached build ships the pack's folder"
+        );
+    }
+
+    #[test]
+    fn a_build_still_ships_its_main_folder_whatever_else_it_adds() {
+        let folders =
+            |names: &[&str]| -> Vec<String> { names.iter().map(|n| n.to_string()).collect() };
+        assert!(ships(&folders(&["Main"]), Some("main")));
+        assert!(ships(&folders(&["Main_Options", "Main"]), Some("Main")));
+        assert!(!ships(&folders(&["MainAudio"]), Some("Main")));
+        assert!(!ships(&[], Some("Main")));
+        assert!(ships(&folders(&["Anything"]), None));
     }
 
     #[test]

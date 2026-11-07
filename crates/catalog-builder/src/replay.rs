@@ -15,8 +15,8 @@ use std::path::{Path, PathBuf};
 
 use feeling_core::catalog::{Addon, Catalog, Release, Source};
 
-use crate::build::{Published, Scanned, publish, settle};
-use crate::curated::{self, Curated, HandPicked, Seeds};
+use crate::build::{Published, Scanned, listed_entries, publish, settle};
+use crate::curated::{self, Curated, HandPicked, Seeds, SplitSpec};
 use crate::gate::GateContext;
 use crate::model::Candidate;
 use crate::state::State;
@@ -53,12 +53,12 @@ fn load() -> Real {
 }
 
 /// What the scans would hand over if every repository answered exactly what it did
-/// the last time it was read.
-fn scanned(state: &State) -> Scanned {
+/// the last time it was read, release lines included.
+fn scanned(state: &State, curated: &Curated) -> Scanned {
     let mut repos: Vec<Candidate> = state
         .repos
-        .values()
-        .filter_map(|record| record.entry.clone())
+        .iter()
+        .flat_map(|(name, record)| listed_entries(record, curated.split_of(name)))
         .collect();
     let known: BTreeSet<String> = repos
         .iter()
@@ -215,7 +215,7 @@ fn run(
     edit: impl FnOnce(&mut Scanned),
 ) -> Result<Outcome, String> {
     let picks = HandPicked::new(&real.seeds, &real.curated);
-    let mut input = scanned(&real.state);
+    let mut input = scanned(&real.state, &real.curated);
     for candidate in extra {
         match candidate.addon.source {
             Source::Wowi { .. } => input.wowi.push(candidate),
@@ -372,7 +372,11 @@ fn replay_real_data_with_nobody_attacking() {
     );
 
     assert!(missing.is_empty(), "{missing:?}");
-    assert!(added.is_empty(), "{added:?}");
+    // A release line appears once the builder first reads it, so a scan cache that's newer
+    // than the catalog can add those, and nothing else.
+    let lines = configured_lines(&real.curated);
+    let unexpected: Vec<&&String> = added.iter().filter(|id| !lines.contains(**id)).collect();
+    assert!(unexpected.is_empty(), "{unexpected:?}");
     assert_eq!(new.gaps.len(), real.curated.gaps.len(), "every gap stays");
     assert_eq!(new.featured.len(), real.previous.featured.len());
     assert!(
@@ -838,7 +842,7 @@ fn replay_real_data_with_each_attack() {
     let attempt = |answered: &BTreeSet<String>| {
         let picks = HandPicked::new(&real.seeds, &real.curated);
         let settled = settle(
-            scanned(&real.state),
+            scanned(&real.state, &real.curated),
             &real.curated,
             &picks,
             Some(&doubled),
@@ -953,4 +957,202 @@ fn replay_real_data_dependency_links() {
         );
     }
     assert_eq!(same + other + gone + unfilled, links);
+}
+
+/// Every release line `[[split]]` names, by its lowercased id.
+fn configured_lines(curated: &Curated) -> BTreeSet<String> {
+    curated
+        .split
+        .iter()
+        .flat_map(|split| {
+            split
+                .lines
+                .iter()
+                .map(|line| SplitSpec::line_id(&split.repo, line).to_ascii_lowercase())
+        })
+        .collect()
+}
+
+const SPOKEN: &str = "rusty-key/spoken-wow";
+
+/// A release line as the builder lists it, from what its zip really holds. Measured from the
+/// releases on 2026-11-07: sizes, folders in the scan's order, and the main folder's title.
+fn line(
+    prefix: &str,
+    version: &str,
+    zip: &str,
+    size: u64,
+    title: &str,
+    folders: &[&str],
+) -> Candidate {
+    let tag = format!("{prefix}/{version}");
+    let addon = Addon {
+        id: SplitSpec::line_id(SPOKEN, prefix),
+        name: title.into(),
+        author: "rusty".into(),
+        source: Source::Github {
+            repo: SPOKEN.into(),
+        },
+        website: Some(format!("https://github.com/{SPOKEN}/releases/tag/{tag}")),
+        stable: Some(Release {
+            version: version.into(),
+            url: format!("https://github.com/{SPOKEN}/releases/download/{tag}/{zip}"),
+            size,
+            date: NOW - 7 * DAY,
+            ..Release::default()
+        }),
+        folders: folders.iter().map(|f| f.to_string()).collect(),
+        downloads: 500,
+        ..Addon::default()
+    };
+    Candidate {
+        addon,
+        ..Candidate::default()
+    }
+}
+
+/// Spoken's four English voice packs, until the real scan cache has them.
+fn spoken_lines() -> Vec<Candidate> {
+    vec![
+        line(
+            "quests-audio",
+            "v2.5.0",
+            "SpokenQuestsAudioAll-2.5.0.zip",
+            1_479_966_451,
+            "Spoken Audio: Quests - Alliance",
+            &[
+                "SpokenQuestsAudioAlliance",
+                "SpokenQuestsAudioHorde",
+                "SpokenQuestsAudioGossip",
+                "SpokenQuestsAudioShared",
+            ],
+        ),
+        line(
+            "places-audio",
+            "v2.1.0",
+            "SpokenPlacesAudio-2.1.0.zip",
+            456_216_109,
+            "Spoken Audio: Places",
+            &["SpokenPlacesAudio"],
+        ),
+        line(
+            "readables-audio",
+            "v2.3.0",
+            "SpokenReadablesAudio-2.3.0.zip",
+            475_448_118,
+            "Spoken Audio: Readables",
+            &["SpokenReadablesAudio"],
+        ),
+        line(
+            "bosses-audio",
+            "v1.0.0",
+            "SpokenBossesAudio-1.0.0.zip",
+            157_070_901,
+            "Spoken Audio: Bosses",
+            &["SpokenBossesAudio"],
+        ),
+    ]
+}
+
+#[test]
+#[ignore = "needs the real catalog data, see the top of this file"]
+fn replay_real_data_with_spokens_voice_packs() {
+    let real = load();
+    let clean = run(&real, vec![], &real.previous, without_changes).unwrap();
+    let baseline: BTreeMap<String, String> = clean
+        .published
+        .catalog
+        .addons
+        .iter()
+        .map(|a| (a.id.clone(), fingerprint(a)))
+        .collect();
+    let lines = configured_lines(&real.curated);
+    assert_eq!(
+        lines.len(),
+        spoken_lines().len(),
+        "every configured line is replayed"
+    );
+    let with_lines = |extra: Vec<Candidate>| -> Vec<Candidate> {
+        spoken_lines().into_iter().chain(extra).collect()
+    };
+
+    check(
+        &real,
+        &baseline,
+        "Spoken's voice packs, listed for the first time",
+        spoken_lines(),
+        |o| {
+            let spoken = o.listed("gh:rusty-key/spoken-wow").unwrap();
+            let mut claimed: BTreeMap<String, String> = spoken
+                .folders
+                .iter()
+                .map(|f| (f.to_ascii_lowercase(), spoken.id.clone()))
+                .collect();
+            for id in &lines {
+                let addon = o
+                    .listed(id)
+                    .unwrap_or_else(|| panic!("{id} isn't listed: {:?}", o.reason(id)));
+                assert!(addon.reviewed && addon.trusted, "{id}");
+                let wanted = real.curated.overrides[&addon.id].name.as_deref();
+                assert_eq!(Some(addon.name.as_str()), wanted, "{id}");
+                assert_eq!(addon.category, "quests", "{id}");
+                for folder in &addon.folders {
+                    let before = claimed.insert(folder.to_ascii_lowercase(), id.clone());
+                    assert_eq!(before, None, "{folder} is shipped twice");
+                }
+            }
+            assert_eq!(spoken.packs.len(), 4);
+            assert!(spoken.packs[0].needed);
+            assert!(
+                spoken
+                    .packs
+                    .iter()
+                    .flat_map(|g| g.ids.iter())
+                    .all(|id| o.listed(id).is_some())
+            );
+            assert!(o.published.raw < 8 * 1024 * 1024);
+            format!(
+                "{} lines listed, reviewed and named by hand, {} groups on Spoken's page, catalog {} bytes",
+                lines.len(),
+                spoken.packs.len(),
+                o.published.raw
+            )
+        },
+    );
+    check(
+        &real,
+        &baseline,
+        "A stranger shipping a quest pack's folder before the packs are listed",
+        vec![repo(
+            "zebra/Voices",
+            "Free Voices",
+            &["SpokenQuestsAudioAlliance"],
+            1,
+        )],
+        |o| held_because(o, "gh:zebra/Voices"),
+    );
+    check(
+        &real,
+        &baseline,
+        "A stranger shipping a quest pack's folder beside the real pack",
+        with_lines(vec![repo(
+            "zebra/Voices",
+            "Free Voices",
+            &["FreeVoices", "SpokenQuestsAudioGossip"],
+            1,
+        )]),
+        |o| held_because(o, "gh:zebra/Voices"),
+    );
+    check(
+        &real,
+        &baseline,
+        "A stranger titled Spoken Audio: Quests",
+        with_lines(vec![repo(
+            "zebra/Quests",
+            "Spoken Audio: Quests",
+            &["ZebraQuests"],
+            1,
+        )]),
+        |o| held_because(o, "gh:zebra/Quests"),
+    );
 }

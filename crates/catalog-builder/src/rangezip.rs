@@ -219,14 +219,26 @@ impl<'a> HttpRange<'a> {
     }
 }
 
+/// How much of a reply to read. A server that ignores the range sends the whole file, which
+/// is only any use when the file is small enough to keep. For a bigger one, everything past
+/// the range is waste, and reading it would cost up to `ZIP_BODY` before failing anyway. One
+/// byte over the range, because the end of a reply is only seen by trying to read past it.
+fn reply_limit(start: u64, end: u64, size: Option<u64>) -> u64 {
+    match size {
+        Some(size) if size > ZIP_BODY => (end - start + 1).saturating_add(1),
+        _ => ZIP_BODY,
+    }
+}
+
 impl RangeSource for HttpRange<'_> {
     fn fetch(&mut self, start: u64, end: u64) -> io::Result<RangeReply> {
         let range = format!("bytes={start}-{end}");
         // Compression would make the byte offsets meaningless.
         let headers = [("range", range.as_str()), ("accept-encoding", "identity")];
+        let limit = reply_limit(start, end, self.size);
         let reply = self
             .http
-            .get_with(self.channel, self.url, &headers, ZIP_BODY)
+            .get_with(self.channel, self.url, &headers, limit)
             .map_err(io::Error::other)?;
         match reply.status {
             200 => Ok(RangeReply::Whole(reply.body)),
@@ -515,6 +527,37 @@ mod tests {
             "{}",
             heads[0]
         );
+    }
+
+    #[test]
+    fn a_server_ignoring_ranges_on_a_huge_file_costs_about_the_range_not_the_file() {
+        let huge = ZIP_BODY + 1;
+        assert_eq!(reply_limit(0, 1023, Some(huge)), 1025);
+        assert_eq!(
+            reply_limit(0, 1023, Some(10)),
+            ZIP_BODY,
+            "a small file may still come whole"
+        );
+        assert_eq!(reply_limit(0, 1023, None), ZIP_BODY);
+
+        let total = format!("bytes 100-103/{huge}");
+        let (base, _) = serve(vec![
+            reply(206, &[("content-range", total.as_str())], b"abcd"),
+            reply(200, &[], &vec![7u8; 2 * 1024 * 1024]),
+        ]);
+        let http = client(None);
+        let url = format!("{base}/pack.zip");
+        let mut source = HttpRange::new(&http, Channel::Asset, &url, Some(huge));
+        assert!(
+            matches!(source.fetch(100, 103), Ok(RangeReply::Partial(b)) if b == b"abcd"),
+            "exactly the range fits the limit"
+        );
+        let error = source
+            .fetch(0, 1023)
+            .err()
+            .expect("the whole file is refused");
+        assert!(error.to_string().contains("larger than allowed"), "{error}");
+        assert_eq!(http.bytes(), 4, "nothing past the range was kept");
     }
 
     #[test]

@@ -2,11 +2,11 @@
 //! warning, because a single odd repository shouldn't stop the whole catalog from
 //! updating. A catalog that looks broken as a whole is refused outright.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
-use feeling_core::catalog::{Addon, CATALOG_SCHEMA, CATEGORIES, Catalog, Release};
+use feeling_core::catalog::{Addon, CATALOG_SCHEMA, CATEGORIES, Catalog, PackGroup, Release};
 
-use crate::curated::{Curated, HandPicked};
+use crate::curated::{Curated, HandPicked, PackSpec};
 use crate::model::{Held, MAX_DEPS};
 use crate::text::fold_name;
 use crate::zipscan::MAX_FOLDERS;
@@ -237,6 +237,56 @@ fn shrink_problem(catalog: &Catalog, context: &GateContext<'_>) -> Option<String
     None
 }
 
+/// Puts each `[[packs]]` group on the addon it's for, with the ids as the catalog spells them,
+/// and drops ids the catalog doesn't list and groups left with none. These groups are the only
+/// ones an addon has: nothing an addon's own files say becomes one.
+fn attach_packs(catalog: &mut Catalog, specs: &[PackSpec], warnings: &mut Vec<String>) {
+    let listed: BTreeMap<String, String> = catalog
+        .addons
+        .iter()
+        .map(|addon| (addon.id.to_ascii_lowercase(), addon.id.clone()))
+        .collect();
+    let mut groups: BTreeMap<String, Vec<PackGroup>> = BTreeMap::new();
+    for spec in specs {
+        let name = spec.name.trim();
+        let Some(addon) = listed.get(&spec.addon.to_ascii_lowercase()) else {
+            warnings.push(format!(
+                "packs for {}: it isn't in the catalog, dropped its {name} group",
+                spec.addon
+            ));
+            continue;
+        };
+        let mut ids = Vec::with_capacity(spec.ids.len());
+        for id in &spec.ids {
+            match listed.get(&id.to_ascii_lowercase()) {
+                Some(listed) => ids.push(listed.clone()),
+                None => warnings.push(format!(
+                    "packs {name} for {addon}: {id} isn't in the catalog, dropped it"
+                )),
+            }
+        }
+        if ids.is_empty() {
+            warnings.push(format!(
+                "packs {name} for {addon}: nothing left, dropped the group"
+            ));
+            continue;
+        }
+        groups
+            .entry(addon.to_ascii_lowercase())
+            .or_default()
+            .push(PackGroup {
+                name: name.to_string(),
+                needed: spec.needed,
+                ids,
+            });
+    }
+    for addon in &mut catalog.addons {
+        addon.packs = groups
+            .remove(&addon.id.to_ascii_lowercase())
+            .unwrap_or_default();
+    }
+}
+
 /// Check everything and fix what can be fixed. `Err` means don't publish.
 pub fn run_gate(mut catalog: Catalog, context: &GateContext<'_>) -> Result<Passed, String> {
     if catalog.schema != CATALOG_SCHEMA {
@@ -337,6 +387,7 @@ pub fn run_gate(mut catalog: Catalog, context: &GateContext<'_>) -> Result<Passe
         kept_gaps.push(gap);
     }
     catalog.gaps = kept_gaps;
+    attach_packs(&mut catalog, &context.curated.packs, &mut warnings);
     Ok(Passed {
         catalog,
         warnings,
@@ -812,6 +863,140 @@ mod tests {
         assert!(warnings.iter().any(|w| w.contains("featured")));
         assert!(warnings.iter().any(|w| w.contains("Hollow")));
         assert!(warnings.iter().any(|w| w.contains("alternative")));
+    }
+
+    fn group(addon: &str, name: &str, needed: bool, ids: &[&str]) -> PackSpec {
+        PackSpec {
+            addon: addon.into(),
+            name: name.into(),
+            needed,
+            ids: ids.iter().map(|id| (*id).to_string()).collect(),
+        }
+    }
+
+    fn spoken_and_packs() -> Catalog {
+        catalog(vec![
+            addon("gh:rusty-key/spoken-wow", "Spoken"),
+            addon("gh:rusty-key/spoken-wow/quests-audio", "Quests Audio"),
+            addon("gh:rusty-key/spoken-wow/places-audio", "Places Audio"),
+        ])
+    }
+
+    fn with_packs(c: Catalog, packs: Vec<PackSpec>) -> Passed {
+        let curated = Curated {
+            packs,
+            ..Curated::default()
+        };
+        gate_with(c, &curated, &HandPicked::default(), None, &[]).unwrap()
+    }
+
+    #[test]
+    fn packs_go_on_their_addon_with_ids_as_the_catalog_spells_them() {
+        let passed = with_packs(
+            spoken_and_packs(),
+            vec![
+                group(
+                    "GH:Rusty-Key/Spoken-WoW",
+                    " Quest voices ",
+                    true,
+                    &["gh:rusty-key/spoken-wow/QUESTS-AUDIO"],
+                ),
+                group(
+                    "gh:rusty-key/spoken-wow",
+                    "Place voices",
+                    false,
+                    &["gh:rusty-key/spoken-wow/places-audio"],
+                ),
+            ],
+        );
+        assert!(passed.warnings.is_empty(), "{:?}", passed.warnings);
+        let spoken = &passed.catalog.addons[0];
+        assert_eq!(
+            spoken.packs,
+            [
+                PackGroup {
+                    name: "Quest voices".into(),
+                    needed: true,
+                    ids: vec!["gh:rusty-key/spoken-wow/quests-audio".into()],
+                },
+                PackGroup {
+                    name: "Place voices".into(),
+                    needed: false,
+                    ids: vec!["gh:rusty-key/spoken-wow/places-audio".into()],
+                },
+            ],
+            "in the order they were written"
+        );
+        assert!(
+            passed.catalog.addons[1..]
+                .iter()
+                .all(|a| a.packs.is_empty())
+        );
+    }
+
+    #[test]
+    fn unlisted_pack_ids_and_the_groups_they_empty_are_dropped_with_warnings() {
+        let passed = with_packs(
+            spoken_and_packs(),
+            vec![
+                group(
+                    "gh:rusty-key/spoken-wow",
+                    "Quest voices",
+                    true,
+                    &[
+                        "gh:rusty-key/spoken-wow/quests-audio-dede",
+                        "gh:rusty-key/spoken-wow/quests-audio",
+                    ],
+                ),
+                group(
+                    "gh:rusty-key/spoken-wow",
+                    "Boss voices",
+                    false,
+                    &["gh:rusty-key/spoken-wow/bosses-audio"],
+                ),
+                group(
+                    "gh:gone/addon",
+                    "Voices",
+                    true,
+                    &["gh:rusty-key/spoken-wow/quests-audio"],
+                ),
+            ],
+        );
+        let spoken = &passed.catalog.addons[0];
+        assert_eq!(spoken.packs.len(), 1);
+        assert_eq!(
+            spoken.packs[0].ids,
+            ["gh:rusty-key/spoken-wow/quests-audio"]
+        );
+        let warned = |text: &str| passed.warnings.iter().any(|w| w.contains(text));
+        assert!(
+            warned("quests-audio-dede isn't in the catalog"),
+            "{:?}",
+            passed.warnings
+        );
+        assert!(warned(
+            "packs Boss voices for gh:rusty-key/spoken-wow: nothing left"
+        ));
+        assert!(warned("packs for gh:gone/addon: it isn't in the catalog"));
+        assert_eq!(passed.warnings.len(), 4, "{:?}", passed.warnings);
+    }
+
+    #[test]
+    fn an_entry_carries_only_the_packs_written_down_now() {
+        let mut c = spoken_and_packs();
+        c.addons[0].packs = vec![PackGroup {
+            name: "Old".into(),
+            needed: true,
+            ids: vec!["gh:rusty-key/spoken-wow/places-audio".into()],
+        }];
+        let passed = with_packs(c, vec![]);
+        assert!(passed.catalog.addons[0].packs.is_empty());
+    }
+
+    #[test]
+    fn a_release_lines_id_is_a_fine_id() {
+        let line = addon("gh:rusty-key/spoken-wow/quests-audio", "Quests Audio");
+        assert_eq!(addon_problem(&line), None);
     }
 
     #[test]

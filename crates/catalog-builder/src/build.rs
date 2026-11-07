@@ -12,18 +12,18 @@ use flate2::Compression;
 use flate2::write::GzEncoder;
 
 use crate::categorize::categorize;
-use crate::curated::{self, Curated, HandPicked, Seeds};
-use crate::detect::{self, Build, Chosen, GhAsset, Probe};
+use crate::curated::{self, Curated, HandPicked, Seeds, SplitSpec};
+use crate::detect::{self, Build, Chosen, GhAsset, Probe, ReleaseVerdict};
 use crate::gate::{GateContext, run_gate};
-use crate::github::{self, BatchResult, RepoInfo};
+use crate::github::{self, BatchResult, PrefixReleases, RepoInfo};
 use crate::http::{Channel, Http, unix_now};
-use crate::merge;
+use crate::merge::{self, Pin, Pins};
 use crate::model::{Candidate, Held, ZipScan};
 use crate::rangezip::{HttpRange, RangeReader};
 use crate::state::{RepoState, State, write_atomic};
 use crate::text::{
-    clean_author, clean_name, clean_summary, clean_version, round_sig, says_nothing_new,
-    valid_repo_name,
+    clean_author, clean_name, clean_summary, clean_version, encode_path, round_sig,
+    says_nothing_new, valid_repo_name,
 };
 use crate::tier::assign_tiers;
 use crate::wowi::{self, WowiState};
@@ -305,71 +305,321 @@ struct Tally {
     held: usize,
     /// Lowercased ids a source gave a clear answer about this run, whatever the answer.
     answered: BTreeSet<String>,
+    /// Entries kept at their last build, because every newer release is another addon's.
+    pinned: Vec<String>,
+    /// Entries `allow_new_main` let change their main folder.
+    renamed: Vec<String>,
 }
 
 fn repo_id(name: &str) -> String {
     format!("gh:{}", name.to_ascii_lowercase())
 }
 
-fn process_repo(
+/// Notes that a source answered for a repository, and so for each of its release lines.
+fn answer(tally: &mut Tally, name: &str, split: Option<&SplitSpec>) {
+    tally.answered.insert(repo_id(name));
+    for line in split.into_iter().flat_map(|s| s.lines.iter()) {
+        tally
+            .answered
+            .insert(SplitSpec::line_id(name, line).to_ascii_lowercase());
+    }
+}
+
+/// The `[[split]]` for a repository GitHub answered for. After a rename, `curated.toml` may
+/// still use the name it was asked for, or already the new one.
+fn split_of<'a>(curated: &'a Curated, asked: &str, name: &str) -> Option<&'a SplitSpec> {
+    curated.split_of(name).or_else(|| curated.split_of(asked))
+}
+
+/// What a repository's last looks found that's still wanted: its own entry, then the entries
+/// of the release lines `[[split]]` still names.
+pub fn listed_entries(record: &RepoState, split: Option<&SplitSpec>) -> Vec<Candidate> {
+    let lines = split
+        .into_iter()
+        .flat_map(|split| split.lines.iter())
+        .filter_map(|line| record.lines.get(line)?.entry.clone());
+    record.entry.iter().cloned().chain(lines).collect()
+}
+
+/// What reading one repository's releases goes by, besides the repository itself.
+struct Look<'a> {
+    /// Someone chose the repository by hand, so a placeholder title doesn't keep it out.
+    picked: bool,
+    pins: &'a Pins<'a>,
+    out_of_time: &'a dyn Fn() -> bool,
+}
+
+/// One addon a repository publishes, read on its own: the repository's own addon, or a
+/// release line of one in `[[split]]`.
+struct Product<'a> {
+    id: String,
+    /// The repository, with only this addon's releases.
+    info: &'a RepoInfo,
+    known_downloads: u64,
+    picked: bool,
+    pin: Option<Pin<'a>>,
+    /// The tag prefix cut off its releases' tags, in a split repository.
+    prefix: Option<&'a str>,
+    /// A release line, whose page is its own release's rather than the repository's.
+    is_line: bool,
+}
+
+impl Product<'_> {
+    /// A tag as GitHub has it.
+    fn full_tag(&self, tag: &str) -> String {
+        match self.prefix {
+            Some(prefix) => format!("{prefix}/{tag}"),
+            None => tag.to_string(),
+        }
+    }
+
+    /// The entry under this addon's own id, and for a line, with its own release's page.
+    fn own(&self, mut entry: Candidate, chosen: &Chosen) -> Candidate {
+        if self.is_line {
+            entry.addon.id.clone_from(&self.id);
+            if let Some(build) = chosen.stable.as_ref().or(chosen.beta.as_ref()) {
+                entry.addon.website = Some(format!(
+                    "https://github.com/{}/releases/tag/{}",
+                    self.info.name,
+                    encode_path(&self.full_tag(&build.tag))
+                ));
+            }
+        }
+        entry
+    }
+}
+
+/// What an entry keeps when every newer release is another addon's: its last result, or the
+/// entry as the last catalog listed it when the scan cache has nothing that's still this addon.
+/// A source install isn't kept here: `[[source]]` reads it fresh, and a packaged entry under
+/// the same id would replace that.
+fn kept_build(last: Option<&Candidate>, pin: Pin<'_>) -> Option<Candidate> {
+    if let Some(entry) = last.filter(|entry| detect::ships(&entry.addon.folders, Some(pin.main))) {
+        return Some(entry.clone());
+    }
+    let release = pin.last.stable.as_ref().or(pin.last.beta.as_ref())?;
+    release.moves.is_empty().then(|| Candidate {
+        addon: pin.last.clone(),
+        ..Candidate::default()
+    })
+}
+
+/// Reads one addon's releases into its entry: its newest build that's still the same addon,
+/// or what to keep when there isn't one. Returns the entry, which is also what the scan cache
+/// keeps as the last result, and whether anything failed.
+fn read_product(
     probe: &mut dyn Probe,
-    info: &RepoInfo,
-    record: &mut RepoState,
-    hand_picked: bool,
+    product: &Product<'_>,
+    verdicts: &mut BTreeMap<String, ReleaseVerdict>,
+    last: Option<&Candidate>,
     out_of_time: &dyn Fn() -> bool,
     tally: &mut Tally,
-) -> Option<Candidate> {
+) -> (Option<Candidate>, bool) {
+    let info = product.info;
     let repo_name = info.name.split('/').nth(1).unwrap_or(&info.name);
+    let pin = product.pin;
     let chosen = detect::choose_builds(
         repo_name,
         &info.releases,
-        &mut record.releases,
+        verdicts,
+        pin.map(|pin| pin.main),
         probe,
         out_of_time,
     );
     for problem in &chosen.errors {
-        eprintln!("{} {problem}", info.name);
+        eprintln!("{} {problem}", product.id);
     }
-    record.newest_tag = info.releases.first().map(|r| r.tag.clone());
-    // Rounded to the day, so looking at something and finding no change leaves the
-    // state file byte-identical, and a run with no news doesn't need to push anything.
-    record.looked_at = unix_now().div_euclid(DAY_SECS) * DAY_SECS;
-    record.incomplete = !chosen.errors.is_empty();
+    let incomplete = !chosen.errors.is_empty();
+    let skipped = chosen.skipped.as_deref().map(|tag| product.full_tag(tag));
 
-    match github_candidate(info, &chosen, record.known_downloads) {
-        Some(entry) if merge::is_placeholder_name(&entry.addon.name) && !hand_picked => {
+    let entry = match github_candidate(info, &chosen, product.known_downloads) {
+        Some(entry) if merge::is_placeholder_name(&entry.addon.name) && !product.picked => {
             tally.placeholder += 1;
-            eprintln!("{}: skipped, its title is only a placeholder", info.name);
-            record.entry = None;
+            eprintln!("{}: skipped, its title is only a placeholder", product.id);
             None
         }
         Some(entry) => {
-            record.entry = Some(entry.clone());
-            Some(entry)
+            if let Some(tag) = &skipped {
+                eprintln!("{}: {tag} is another addon's, passed it over", product.id);
+            }
+            Some(product.own(entry, &chosen))
         }
-        None if !chosen.errors.is_empty() => {
-            if record.entry.is_some() {
+        None if incomplete => {
+            if last.is_some() {
                 tally.kept_last_known += 1;
             }
-            record.entry.clone()
+            last.cloned()
         }
-        None => {
-            tally.no_build += 1;
-            let grey = record
-                .entry
-                .as_ref()
-                .and_then(|previous| grey_previous(previous, info));
-            record.entry.clone_from(&grey);
-            grey
+        None => match (pin, skipped) {
+            (Some(pin), Some(tag)) => {
+                let kept = kept_build(last, pin);
+                if kept.is_some() {
+                    tally.pinned.push(format!(
+                        "{} keeps {}, as {tag} is another addon's",
+                        product.id, pin.main
+                    ));
+                }
+                kept
+            }
+            _ => {
+                tally.no_build += 1;
+                last.and_then(|previous| grey_previous(previous, info))
+            }
+        },
+    };
+    (entry, incomplete)
+}
+
+/// The repository's newest tag, whatever addon it's for, so the quick look notices any new
+/// release. Rounded to the day, so looking at something and finding no change leaves the
+/// state file byte-identical, and a run with no news doesn't need to push anything.
+fn note_look(record: &mut RepoState, info: &RepoInfo) {
+    record.newest_tag = info.releases.first().map(|r| r.tag.clone());
+    record.looked_at = unix_now().div_euclid(DAY_SECS) * DAY_SECS;
+}
+
+fn process_repo(
+    probe: &mut dyn Probe,
+    info: &RepoInfo,
+    record: &mut RepoState,
+    look: &Look<'_>,
+    tally: &mut Tally,
+) -> Option<Candidate> {
+    note_look(record, info);
+    let id = format!("gh:{}", info.name);
+    let product = Product {
+        pin: look.pins.get(&id),
+        id,
+        info,
+        known_downloads: record.known_downloads,
+        picked: look.picked,
+        prefix: None,
+        is_line: false,
+    };
+    let (entry, incomplete) = read_product(
+        probe,
+        &product,
+        &mut record.releases,
+        record.entry.as_ref(),
+        look.out_of_time,
+        tally,
+    );
+    record.incomplete = incomplete;
+    record.entry.clone_from(&entry);
+    entry
+}
+
+/// A repository in `[[split]]`. Its own addon reads only the main prefix's releases, and each
+/// line is an entry of its own that reads only its own. No other prefix is ever read.
+/// `fetched` is each prefix's releases, or why they couldn't be fetched.
+fn process_split(
+    probe: &mut dyn Probe,
+    info: &RepoInfo,
+    split: &SplitSpec,
+    fetched: Option<&Result<PrefixReleases, String>>,
+    record: &mut RepoState,
+    look: &Look<'_>,
+    tally: &mut Tally,
+) -> Vec<Candidate> {
+    note_look(record, info);
+    record.lines.retain(|line, _| split.lines.contains(line));
+    let fetched = match fetched {
+        Some(Ok(fetched)) => fetched,
+        failed => {
+            let problem = failed.and_then(|f| f.as_ref().err());
+            eprintln!(
+                "{}: {}",
+                info.name,
+                problem.map_or("its releases weren't fetched", String::as_str)
+            );
+            record.incomplete = true;
+            for line in &split.lines {
+                record.lines.entry(line.clone()).or_default().incomplete = true;
+            }
+            let kept = listed_entries(record, Some(split));
+            tally.kept_last_known += u32::try_from(kept.len()).unwrap_or(u32::MAX);
+            return kept;
         }
+    };
+    let own = |prefix: &str| fetched.get(prefix).cloned().unwrap_or_default();
+
+    let main_info = RepoInfo {
+        releases: own(&split.main),
+        ..info.clone()
+    };
+    let id = format!("gh:{}", info.name);
+    let main = Product {
+        pin: look.pins.get(&id),
+        id,
+        info: &main_info,
+        // Counts from elsewhere cover the whole repository, every line's downloads included.
+        known_downloads: 0,
+        picked: look.picked,
+        prefix: Some(&split.main),
+        is_line: false,
+    };
+    let (entry, incomplete) = read_product(
+        probe,
+        &main,
+        &mut record.releases,
+        record.entry.as_ref(),
+        look.out_of_time,
+        tally,
+    );
+    record.incomplete = incomplete;
+    record.entry.clone_from(&entry);
+    let mut entries: Vec<Candidate> = entry.into_iter().collect();
+
+    for line in &split.lines {
+        // An addon of its own: the repository's text, stars, topics and forks are its own addon's.
+        let line_info = RepoInfo {
+            name: info.name.clone(),
+            releases: own(line),
+            ..RepoInfo::default()
+        };
+        let id = SplitSpec::line_id(&info.name, line);
+        let product = Product {
+            pin: look.pins.get(&id),
+            id,
+            info: &line_info,
+            known_downloads: 0,
+            picked: true,
+            prefix: Some(line),
+            is_line: true,
+        };
+        let state = record.lines.entry(line.clone()).or_default();
+        let (entry, incomplete) = read_product(
+            probe,
+            &product,
+            &mut state.releases,
+            state.entry.as_ref(),
+            look.out_of_time,
+            tally,
+        );
+        state.incomplete = incomplete;
+        state.entry.clone_from(&entry);
+        entries.extend(entry);
     }
+    entries
+}
+
+/// A release line that was never read, such as one just added to `[[split]]`. The quick look
+/// only sees the repository's newest tag, which says nothing about that.
+fn has_unread_lines(record: &RepoState, split: Option<&SplitSpec>) -> bool {
+    split.is_some_and(|split| {
+        split
+            .lines
+            .iter()
+            .any(|line| !record.lines.contains_key(line))
+    })
 }
 
 /// Does this repository need its releases fetched, or does the quick look say
 /// nothing can have changed? This is what keeps a routine run cheap.
 pub fn needs_full_look(record: &RepoState, head: &RepoInfo, now: i64) -> bool {
     let newest = head.releases.first().map(|r| r.tag.as_str());
-    if record.incomplete || record.newest_tag.as_deref() != newest {
+    let failed = record.incomplete || record.lines.values().any(|line| line.incomplete);
+    if failed || record.newest_tag.as_deref() != newest {
         return true;
     }
     // No releases, yet something is listed: the tag comparison can't see this when a
@@ -416,13 +666,13 @@ fn triage_heads(
     tally.gone += u32::try_from(heads.gone.len()).unwrap_or(u32::MAX);
     for name in &heads.gone {
         state.repos.remove(name);
-        tally.answered.insert(repo_id(name));
+        answer(tally, name, curated.split_of(name));
     }
     let hand_picked = curated.named_repos();
 
     let mut entries = Vec::new();
     for name in &heads.failed {
-        entries.extend(keep_last_known(state, name, tally));
+        entries.extend(keep_last_known(state, curated, name, tally));
     }
 
     let mut seen = BTreeSet::new();
@@ -431,14 +681,15 @@ fn triage_heads(
     // single release is read. Ones that were skipped are simply looked at on a later run.
     let mut per_owner = listed_per_owner(state, picks);
     for (asked, head) in &heads.found {
+        let split = split_of(curated, asked, &head.name);
         if !seen.insert(head.name.to_ascii_lowercase()) || curated.excludes_repo(&head.name) {
             state.repos.remove(asked);
-            tally.answered.insert(repo_id(asked));
+            answer(tally, asked, split);
             continue;
         }
         if !asked.eq_ignore_ascii_case(&head.name) {
             // Renamed: GitHub answered for the old name, and the new one is looked at below.
-            tally.answered.insert(repo_id(asked));
+            answer(tally, asked, split);
         }
         state.rename_repo(asked, &head.name);
         let record = state.repos.entry(head.name.clone()).or_default();
@@ -448,8 +699,9 @@ fn triage_heads(
             *tally.rejected.entry(reason.to_string()).or_default() += 1;
             record.entry = None;
             record.releases.clear();
-            tally.answered.insert(repo_id(&head.name));
-        } else if needs_full_look(record, head, now) {
+            record.lines.clear();
+            answer(tally, &head.name, split);
+        } else if needs_full_look(record, head, now) || has_unread_lines(record, split) {
             if record.entry.is_none() && !picks.contains(&repo_id(&head.name)) {
                 let count = per_owner.entry(owner_of(&head.name)).or_default();
                 if *count >= merge::MAX_ENTRIES_PER_OWNER {
@@ -461,21 +713,40 @@ fn triage_heads(
             to_read.push(head.name.clone());
         } else {
             tally.unchanged += 1;
-            tally.answered.insert(repo_id(&head.name));
+            answer(tally, &head.name, split);
             if let Some(entry) = &mut record.entry {
                 entry.addon.stars = rounded_stars(head.stars);
-                entries.push(entry.clone());
             }
+            entries.extend(listed_entries(record, split));
         }
     }
     (entries, to_read)
 }
 
+/// Each split repository's releases, prefix by prefix, keyed by the name it was asked for in
+/// lower case. A failure stays one, and that repository keeps what it had.
+type SplitReleases = BTreeMap<String, Result<PrefixReleases, String>>;
+
+fn fetch_split_releases(http: &Http, batch: &BatchResult, curated: &Curated) -> SplitReleases {
+    batch
+        .found
+        .iter()
+        .filter_map(|(asked, info)| {
+            let split = split_of(curated, asked, &info.name)?;
+            let fetched = github::fetch_prefix_releases(http, &info.name, &split.prefixes());
+            Some((asked.to_ascii_lowercase(), fetched))
+        })
+        .collect()
+}
+
 /// The proper look: every release of the repositories that need one.
+#[allow(clippy::too_many_arguments)]
 fn read_releases(
     batch: &BatchResult,
+    split_releases: &SplitReleases,
     state: &mut State,
     curated: &Curated,
+    pins: &Pins<'_>,
     probe: &mut dyn Probe,
     out_of_time: &dyn Fn() -> bool,
     saver: &mut Saver,
@@ -484,11 +755,11 @@ fn read_releases(
     tally.gone += u32::try_from(batch.gone.len()).unwrap_or(u32::MAX);
     for name in &batch.gone {
         state.repos.remove(name);
-        tally.answered.insert(repo_id(name));
+        answer(tally, name, curated.split_of(name));
     }
     let mut entries = Vec::new();
     for name in &batch.failed {
-        entries.extend(keep_last_known(state, name, tally));
+        entries.extend(keep_last_known(state, curated, name, tally));
     }
     let hand_picked = curated.named_repos();
     let total = batch.found.len();
@@ -497,18 +768,33 @@ fn read_releases(
             eprintln!("releases: {done} of {total} repositories");
         }
         let record = state.repos.entry(asked.clone()).or_default();
-        let picked = hand_picked.contains(&asked.to_ascii_lowercase());
-        entries.extend(process_repo(
-            probe,
-            info,
-            record,
-            picked,
+        let look = Look {
+            picked: hand_picked.contains(&asked.to_ascii_lowercase()),
+            pins,
             out_of_time,
-            tally,
-        ));
-        if !record.incomplete {
-            tally.answered.insert(repo_id(asked));
-            tally.answered.insert(repo_id(&info.name));
+        };
+        match split_of(curated, asked, &info.name) {
+            Some(split) => {
+                let fetched = split_releases.get(&asked.to_ascii_lowercase());
+                entries.extend(process_split(
+                    probe, info, split, fetched, record, &look, tally,
+                ));
+            }
+            None => {
+                record.lines.clear();
+                entries.extend(process_repo(probe, info, record, &look, tally));
+            }
+        }
+        for name in [asked, &info.name] {
+            if !record.incomplete {
+                tally.answered.insert(repo_id(name));
+            }
+            for (line, line_state) in &record.lines {
+                if !line_state.incomplete {
+                    let id = SplitSpec::line_id(name, line);
+                    tally.answered.insert(id.to_ascii_lowercase());
+                }
+            }
         }
         saver.maybe_save(state);
     }
@@ -522,6 +808,7 @@ fn run_github(
     names: &[String],
     curated: &Curated,
     picks: &HandPicked,
+    pins: &Pins<'_>,
     out_of_time: &dyn Fn() -> bool,
     saver: &mut Saver,
     tally: &mut Tally,
@@ -544,11 +831,14 @@ fn run_github(
         batch.gone.len(),
         batch.failed.len()
     );
+    let split_releases = fetch_split_releases(http, &batch, curated);
     let mut probe = LiveProbe { http };
     entries.extend(read_releases(
         &batch,
+        &split_releases,
         state,
         curated,
+        pins,
         &mut probe,
         out_of_time,
         saver,
@@ -557,15 +847,19 @@ fn run_github(
     entries
 }
 
-fn keep_last_known(state: &State, name: &str, tally: &mut Tally) -> Option<Candidate> {
-    let entry = state
+fn keep_last_known(
+    state: &State,
+    curated: &Curated,
+    name: &str,
+    tally: &mut Tally,
+) -> Vec<Candidate> {
+    let entries = state
         .repos
         .get(name)
-        .and_then(|record| record.entry.clone());
-    if entry.is_some() {
-        tally.kept_last_known += 1;
-    }
-    entry
+        .map(|record| listed_entries(record, curated.split_of(name)))
+        .unwrap_or_default();
+    tally.kept_last_known += u32::try_from(entries.len()).unwrap_or(u32::MAX);
+    entries
 }
 
 fn run_wowi(
@@ -902,6 +1196,30 @@ fn gzipped_len(bytes: &[u8]) -> Result<usize, String> {
     Ok(encoder.finish().map_err(|e| e.to_string())?.len())
 }
 
+/// Entries `allow_new_main` let stop shipping the main folder the last catalog listed them
+/// with. Each should come out of that list once this catalog is out, or the entry is unpinned
+/// for good and a later release of another addon could take its place.
+fn renamed_entries(
+    candidates: &[Candidate],
+    previous: Option<&Catalog>,
+    curated: &Curated,
+) -> Vec<String> {
+    let listed = previous.map_or(&[][..], |catalog| catalog.addons.as_slice());
+    candidates
+        .iter()
+        .filter(|c| curated.allows_new_main(&c.addon.id))
+        .filter_map(|c| {
+            let last = listed
+                .iter()
+                .find(|addon| addon.id.eq_ignore_ascii_case(&c.addon.id))?;
+            let old = last.folders.first()?;
+            let new = c.addon.folders.first()?;
+            (!detect::ships(&c.addon.folders, Some(old)))
+                .then(|| format!("{} went from {old} to {new}", c.addon.id))
+        })
+        .collect()
+}
+
 fn print_summary(
     catalog: &Catalog,
     raw: usize,
@@ -964,6 +1282,24 @@ fn print_summary(
         "kept last-known results for {} that failed this run, {} repositories unchanged since last time",
         tally.kept_last_known, tally.unchanged
     );
+    if !tally.pinned.is_empty() {
+        println!(
+            "kept at their last build, because everything newer is another addon's: {}. A real rename goes in allow_new_main in curated.toml.",
+            tally.pinned.len()
+        );
+        for line in &tally.pinned {
+            println!("    {line}");
+        }
+    }
+    if !tally.renamed.is_empty() {
+        println!(
+            "main folders changed through allow_new_main: {}. Take them out of it once this catalog is out.",
+            tally.renamed.len()
+        );
+        for line in &tally.renamed {
+            println!("    {line}");
+        }
+    }
     println!("requests:");
     for (channel, count) in http.counts() {
         println!("    {:<28} {count}", channel.label());
@@ -994,7 +1330,17 @@ pub fn run(options: &Options) -> Result<(), String> {
     }
     let seeds = curated::load_seeds(&options.seeds)?;
     let curated = curated::load_curated(&options.curated)?;
+    if let Some(problem) = curated.unseeded_split(&seeds) {
+        return Err(format!(
+            "{} has a mistake in it: {problem}",
+            options.curated.display()
+        ));
+    }
     let picks = HandPicked::new(&seeds, &curated);
+    // Ages come from the last catalog, and so does which addon each entry is, so it's read
+    // before anything is fetched. Nothing is lost by stopping here.
+    let previous = load_previous(options.previous.as_deref(), options.accept_smaller)?;
+    let pins = Pins::new(previous.as_ref(), &curated);
     std::fs::create_dir_all(&options.out)
         .map_err(|e| format!("Couldn't create {}: {e}", options.out.display()))?;
 
@@ -1017,11 +1363,13 @@ pub fn run(options: &Options) -> Result<(), String> {
         &names,
         &curated,
         &picks,
+        &pins,
         &out_of_time,
         &mut saver,
         &mut tally,
     );
     saver.save(&state);
+    tally.renamed = renamed_entries(&packaged, previous.as_ref(), &curated);
 
     let wowi_entries = if options.no_wowi {
         Vec::new()
@@ -1054,8 +1402,6 @@ pub fn run(options: &Options) -> Result<(), String> {
             .filter(|c| !packaged_ids.contains(&c.addon.id.to_ascii_lowercase())),
     );
 
-    // Everything scanned is saved by now, so stopping here loses no progress.
-    let previous = load_previous(options.previous.as_deref(), options.accept_smaller)?;
     let scanned = Scanned {
         repos: packaged,
         wowi: wowi_entries,
@@ -1160,6 +1506,7 @@ mod tests {
     use super::*;
     use crate::curated::{GapSpec, Override};
     use crate::detect::GhRelease;
+    use crate::state::LineState;
 
     fn scan(title: Option<&str>) -> ZipScan {
         ZipScan {
@@ -2260,8 +2607,10 @@ mod tests {
         };
         read_releases(
             &batch,
+            &SplitReleases::new(),
             &mut state,
             &curated,
+            &Pins::default(),
             &mut probe,
             &|| false,
             &mut saver,
@@ -2348,7 +2697,12 @@ mod tests {
         picked: bool,
         tally: &mut Tally,
     ) -> Option<Candidate> {
-        process_repo(probe, info, record, picked, &|| false, tally)
+        let look = Look {
+            picked,
+            pins: &Pins::default(),
+            out_of_time: &|| false,
+        };
+        process_repo(probe, info, record, &look, tally)
     }
 
     #[test]
@@ -2801,5 +3155,1151 @@ mod tests {
         let text = vec![b'a'; 100_000];
         let small = gzipped_len(&text).unwrap();
         assert!(small > 0 && small < 1000);
+    }
+
+    // One product per entry.
+
+    fn scan_of(folders: &[&str], title: &str) -> ZipScan {
+        ZipScan {
+            folders: folders.iter().map(|f| f.to_string()).collect(),
+            forever: true,
+            title: Some(title.into()),
+            ..ZipScan::default()
+        }
+    }
+
+    /// Releases of `a/Addon`, newest first, one zip each.
+    fn repo_with_releases(releases: &[(&str, &str)]) -> RepoInfo {
+        let mut info = repo_with_release("unused", "unused.zip");
+        info.releases = releases
+            .iter()
+            .enumerate()
+            .map(|(at, (tag, zip))| {
+                let mut release = repo_with_release(tag, zip).releases.remove(0);
+                release.published -= i64::try_from(at).unwrap() * 100;
+                release
+            })
+            .collect();
+        info
+    }
+
+    /// The last catalog, listing these entries with these folders.
+    fn listed(entries: &[(&str, &[&str])]) -> Catalog {
+        Catalog {
+            schema: CATALOG_SCHEMA,
+            addons: entries
+                .iter()
+                .map(|(id, folders)| Addon {
+                    id: (*id).to_string(),
+                    name: "Listed".into(),
+                    folders: folders.iter().map(|f| f.to_string()).collect(),
+                    stable: Some(Release {
+                        version: "v1".into(),
+                        url: "https://github.com/a/Addon/releases/download/v1/Addon-1.zip".into(),
+                        ..Release::default()
+                    }),
+                    ..Addon::default()
+                })
+                .collect(),
+            ..Catalog::default()
+        }
+    }
+
+    fn process_pinned(
+        probe: &mut ScriptedProbe,
+        info: &RepoInfo,
+        record: &mut RepoState,
+        pins: &Pins<'_>,
+        tally: &mut Tally,
+    ) -> Option<Candidate> {
+        let look = Look {
+            picked: false,
+            pins,
+            out_of_time: &|| false,
+        };
+        process_repo(probe, info, record, &look, tally)
+    }
+
+    /// A repository whose addon is `Addon`, and whose newest release is a module of its own.
+    fn module_then_addon() -> (ScriptedProbe, RepoInfo) {
+        let mut probe = ScriptedProbe::default();
+        probe
+            .zips
+            .insert("Module-2.zip".into(), Ok(scan_of(&["Module"], "Module")));
+        probe
+            .zips
+            .insert("Addon-1.zip".into(), Ok(forever_scan("Good Thing")));
+        let info = repo_with_releases(&[("module-v2", "Module-2.zip"), ("v1", "Addon-1.zip")]);
+        (probe, info)
+    }
+
+    fn version_of(entry: &Candidate) -> &str {
+        &entry.addon.stable.as_ref().unwrap().version
+    }
+
+    #[test]
+    fn a_newer_release_of_another_addon_is_skipped_and_the_older_one_is_listed() {
+        let (mut probe, info) = module_then_addon();
+        let last = listed(&[("gh:a/Addon", &["addon"])]);
+        let pins = Pins::new(Some(&last), &Curated::default());
+        let mut record = RepoState::default();
+        let mut tally = Tally::default();
+        let entry = process_pinned(&mut probe, &info, &mut record, &pins, &mut tally).unwrap();
+        assert_eq!(version_of(&entry), "v1");
+        assert_eq!(entry.addon.folders, ["Addon"]);
+        assert!(tally.pinned.is_empty(), "nothing was kept back");
+        assert!(!record.incomplete);
+        assert!(
+            !record.releases["module-v2"].confirmed_negative,
+            "another addon's release isn't a negative"
+        );
+        assert_eq!(record.newest_tag.as_deref(), Some("module-v2"));
+    }
+
+    #[test]
+    fn with_nothing_matching_the_last_build_is_kept_and_reported() {
+        let (mut probe, info) = module_then_addon();
+        let last = listed(&[("gh:a/Addon", &["Addon"])]);
+        let pins = Pins::new(Some(&last), &Curated::default());
+        let mut record = RepoState::default();
+        let mut tally = Tally::default();
+        let good = process_pinned(&mut probe, &info, &mut record, &pins, &mut tally).unwrap();
+
+        // The addon's own release has left the list, and only the module's is in reach.
+        let only_module = repo_with_releases(&[("module-v2", "Module-2.zip")]);
+        let kept = process_pinned(&mut probe, &only_module, &mut record, &pins, &mut tally);
+        assert_eq!(kept.as_ref(), Some(&good));
+        assert_eq!(record.entry.as_ref(), Some(&good));
+        assert!(!record.incomplete, "nothing failed");
+        assert_eq!(
+            tally.pinned,
+            ["gh:a/Addon keeps Addon, as module-v2 is another addon's"]
+        );
+        assert_eq!(tally.no_build, 0);
+
+        // With nothing in the scan cache that's still the addon, the last catalog's entry stays.
+        let mut lost = RepoState::default();
+        let from_catalog =
+            process_pinned(&mut probe, &only_module, &mut lost, &pins, &mut tally).unwrap();
+        assert_eq!(from_catalog.addon, last.addons[0]);
+        assert_eq!(tally.pinned.len(), 2);
+
+        // Unless it was a source install, which [[source]] reads fresh instead.
+        let mut source = last.clone();
+        source.addons[0].stable.as_mut().unwrap().moves = vec![feeling_core::catalog::Move {
+            from: "*/".into(),
+            to: "Addon".into(),
+        }];
+        let pins = Pins::new(Some(&source), &Curated::default());
+        let mut tally = Tally::default();
+        let none = process_pinned(
+            &mut probe,
+            &only_module,
+            &mut RepoState::default(),
+            &pins,
+            &mut tally,
+        );
+        assert_eq!(none, None);
+        assert!(tally.pinned.is_empty());
+    }
+
+    #[test]
+    fn allow_new_main_lets_a_rename_through() {
+        let (mut probe, info) = module_then_addon();
+        let last = listed(&[("gh:a/Addon", &["Addon"])]);
+        let curated = Curated {
+            allow_new_main: vec!["gh:a/addon".into()],
+            ..Curated::default()
+        };
+        let pins = Pins::new(Some(&last), &curated);
+        let mut tally = Tally::default();
+        let entry = process_pinned(
+            &mut probe,
+            &info,
+            &mut RepoState::default(),
+            &pins,
+            &mut tally,
+        )
+        .unwrap();
+        assert_eq!(entry.addon.folders, ["Module"]);
+        assert_eq!(
+            renamed_entries(&[entry], Some(&last), &curated),
+            ["gh:a/Addon went from Addon to Module"],
+            "and the summary says to take it out of the list again"
+        );
+    }
+
+    #[test]
+    fn a_brand_new_entry_with_no_last_catalog_still_takes_the_newest() {
+        for last in [None, Some(listed(&[("gh:someone/Else", &["Addon"])]))] {
+            let (mut probe, info) = module_then_addon();
+            let pins = Pins::new(last.as_ref(), &Curated::default());
+            let mut tally = Tally::default();
+            let entry = process_pinned(
+                &mut probe,
+                &info,
+                &mut RepoState::default(),
+                &pins,
+                &mut tally,
+            )
+            .unwrap();
+            assert_eq!(entry.addon.folders, ["Module"]);
+            assert!(tally.pinned.is_empty());
+        }
+    }
+
+    #[test]
+    fn an_update_that_adds_folders_or_moves_its_main_folder_is_still_taken() {
+        let last = listed(&[("gh:a/Addon", &["Addon"])]);
+        let pins = Pins::new(Some(&last), &Curated::default());
+        for folders in [
+            &["Addon", "Addon_Extra"][..],
+            &["Addon_Options", "Addon"][..],
+        ] {
+            let mut probe = ScriptedProbe::default();
+            probe
+                .zips
+                .insert("Addon-2.zip".into(), Ok(scan_of(folders, "Good Thing")));
+            probe
+                .zips
+                .insert("Addon-1.zip".into(), Ok(forever_scan("Good Thing")));
+            let info = repo_with_releases(&[("v2", "Addon-2.zip"), ("v1", "Addon-1.zip")]);
+            let mut tally = Tally::default();
+            let entry = process_pinned(
+                &mut probe,
+                &info,
+                &mut RepoState::default(),
+                &pins,
+                &mut tally,
+            )
+            .unwrap();
+            assert_eq!(version_of(&entry), "v2", "{folders:?}");
+            assert_eq!(entry.addon.folders, folders);
+            assert_eq!(probe.reads, 1, "the older release wasn't needed");
+        }
+    }
+
+    // Release lines.
+
+    const SPOKEN: &str = "rusty-key/spoken-wow";
+
+    fn spoken_split() -> SplitSpec {
+        SplitSpec {
+            repo: SPOKEN.into(),
+            main: "spoken".into(),
+            lines: vec!["quests-audio".into(), "bosses-audio".into()],
+        }
+    }
+
+    /// A release under a prefix, as the fetch hands it over: the prefix already cut off.
+    fn line_release(prefix: &str, version: &str, zip: &str, age: i64, downloads: u64) -> GhRelease {
+        GhRelease {
+            tag: version.into(),
+            published: detect::FOREVER_EPOCH + 100_000 - age,
+            assets: vec![GhAsset {
+                name: zip.into(),
+                size: 10,
+                downloads,
+                url: format!(
+                    "https://github.com/{SPOKEN}/releases/download/{prefix}/{version}/{zip}"
+                ),
+                sha256: Some("c".repeat(64)),
+            }],
+            ..GhRelease::default()
+        }
+    }
+
+    fn spoken_info() -> RepoInfo {
+        let newest = |tag: &str| GhRelease {
+            tag: tag.into(),
+            ..GhRelease::default()
+        };
+        RepoInfo {
+            name: SPOKEN.into(),
+            description: Some("Spoken reads quests aloud.".into()),
+            stars: 87,
+            topics: vec!["wow-addon".into()],
+            is_fork: true,
+            fork_of: Some("someone/original".into()),
+            // The repository-wide window, newest first, where the desktop app comes first.
+            releases: vec![newest("manager/v0.1.11"), newest("bosses-audio/v1.0.0")],
+            ..RepoInfo::default()
+        }
+    }
+
+    fn spoken_fetched() -> PrefixReleases {
+        PrefixReleases::from([
+            (
+                "spoken".to_string(),
+                vec![line_release(
+                    "spoken",
+                    "v3.8.3",
+                    "Spoken-3.8.3.zip",
+                    50,
+                    6000,
+                )],
+            ),
+            (
+                "quests-audio".to_string(),
+                vec![
+                    line_release(
+                        "quests-audio",
+                        "v2.5.0",
+                        "SpokenQuestsAudioAll-2.5.0.zip",
+                        10,
+                        1394,
+                    ),
+                    line_release(
+                        "quests-audio",
+                        "v2.4.0",
+                        "SpokenQuestsAudioAll-2.4.0.zip",
+                        90,
+                        400,
+                    ),
+                ],
+            ),
+            (
+                "bosses-audio".to_string(),
+                vec![line_release(
+                    "bosses-audio",
+                    "v1.0.0",
+                    "SpokenBossesAudio-1.0.0.zip",
+                    5,
+                    503,
+                )],
+            ),
+        ])
+    }
+
+    fn spoken_probe() -> ScriptedProbe {
+        let mut probe = ScriptedProbe::default();
+        probe.zips.insert(
+            "Spoken-3.8.3.zip".into(),
+            Ok(scan_of(&["Spoken", "Spoken_Quests"], "Spoken")),
+        );
+        let quests = [
+            "SpokenQuestsAudioAlliance",
+            "SpokenQuestsAudioGossip",
+            "SpokenQuestsAudioHorde",
+            "SpokenQuestsAudioShared",
+        ];
+        for zip in [
+            "SpokenQuestsAudioAll-2.5.0.zip",
+            "SpokenQuestsAudioAll-2.4.0.zip",
+        ] {
+            probe.zips.insert(
+                zip.into(),
+                Ok(scan_of(&quests, "Spoken Audio: Quests - Alliance")),
+            );
+        }
+        probe.zips.insert(
+            "SpokenBossesAudio-1.0.0.zip".into(),
+            Ok(scan_of(&["SpokenBossesAudio"], "Spoken Audio: Bosses")),
+        );
+        probe
+    }
+
+    fn split_once(
+        probe: &mut ScriptedProbe,
+        fetched: &Result<PrefixReleases, String>,
+        record: &mut RepoState,
+        pins: &Pins<'_>,
+        tally: &mut Tally,
+    ) -> Vec<Candidate> {
+        let look = Look {
+            picked: true,
+            pins,
+            out_of_time: &|| false,
+        };
+        process_split(
+            probe,
+            &spoken_info(),
+            &spoken_split(),
+            Some(fetched),
+            record,
+            &look,
+            tally,
+        )
+    }
+
+    fn entry_of<'a>(entries: &'a [Candidate], id: &str) -> &'a Candidate {
+        entries
+            .iter()
+            .find(|c| c.addon.id == id)
+            .unwrap_or_else(|| panic!("{id} isn't listed"))
+    }
+
+    #[test]
+    fn a_split_repository_lists_each_line_under_its_own_id() {
+        let mut probe = spoken_probe();
+        let mut record = RepoState {
+            known_downloads: 34_402,
+            ..RepoState::default()
+        };
+        let mut tally = Tally::default();
+        let fetched = Ok(spoken_fetched());
+        let entries = split_once(
+            &mut probe,
+            &fetched,
+            &mut record,
+            &Pins::default(),
+            &mut tally,
+        );
+        assert_eq!(entries.len(), 3);
+
+        let spoken = entry_of(&entries, "gh:rusty-key/spoken-wow");
+        assert_eq!(version_of(spoken), "v3.8.3");
+        assert_eq!(spoken.addon.stars, 87);
+        assert_eq!(
+            spoken.addon.downloads, 6000,
+            "only its own zips, not the repository's count that has every pack in it"
+        );
+        assert_eq!(
+            spoken.addon.website.as_deref(),
+            Some("https://github.com/rusty-key/spoken-wow")
+        );
+
+        let quests = entry_of(&entries, "gh:rusty-key/spoken-wow/quests-audio");
+        assert_eq!(
+            version_of(quests),
+            "v2.5.0",
+            "the prefix isn't part of the version"
+        );
+        assert_eq!(quests.addon.folders.len(), 4);
+        assert_eq!(
+            quests.addon.downloads, 1790,
+            "its own two releases' zips, 1394 and 400"
+        );
+        assert_eq!(quests.addon.stars, 0, "the repository's stars count once");
+        assert_eq!(quests.fork_of, None);
+        assert!(quests.topics.is_empty());
+        assert_eq!(
+            quests.addon.summary, "",
+            "the repository's text is Spoken's"
+        );
+        assert_eq!(
+            quests.addon.source,
+            Source::Github {
+                repo: SPOKEN.into()
+            }
+        );
+        assert_eq!(
+            quests.addon.website.as_deref(),
+            Some("https://github.com/rusty-key/spoken-wow/releases/tag/quests-audio/v2.5.0")
+        );
+        let stable = quests.addon.stable.as_ref().unwrap();
+        assert!(
+            stable
+                .url
+                .ends_with("/quests-audio/v2.5.0/SpokenQuestsAudioAll-2.5.0.zip")
+        );
+        assert_eq!(stable.sha256, Some("c".repeat(64)));
+
+        assert_eq!(
+            record.newest_tag.as_deref(),
+            Some("manager/v0.1.11"),
+            "the quick look still notices a release under any prefix"
+        );
+        assert_eq!(probe.reads, 3, "the desktop app's zips are never read");
+        assert!(record.lines["quests-audio"].releases.contains_key("v2.5.0"));
+        assert!(record.releases.contains_key("v3.8.3"));
+
+        let again = split_once(
+            &mut probe,
+            &fetched,
+            &mut record,
+            &Pins::default(),
+            &mut tally,
+        );
+        assert_eq!(again, entries);
+        assert_eq!(probe.reads, 3, "the second look reads nothing");
+    }
+
+    #[test]
+    fn the_main_entry_never_takes_another_lines_build() {
+        let mut probe = spoken_probe();
+        probe.zips.insert(
+            "Spoken-3.7.0.zip".into(),
+            Ok(scan_of(&["Spoken", "Spoken_Quests"], "Spoken")),
+        );
+        let mut fetched = spoken_fetched();
+        fetched.insert(
+            "spoken".into(),
+            vec![line_release(
+                "spoken",
+                "v3.7.0",
+                "Spoken-3.7.0.zip",
+                500,
+                10,
+            )],
+        );
+        let mut tally = Tally::default();
+        let entries = split_once(
+            &mut probe,
+            &Ok(fetched),
+            &mut RepoState::default(),
+            &Pins::default(),
+            &mut tally,
+        );
+        let spoken = entry_of(&entries, "gh:rusty-key/spoken-wow");
+        assert_eq!(
+            version_of(spoken),
+            "v3.7.0",
+            "bosses-audio/v1.0.0 is newer, and still not Spoken's"
+        );
+        assert_eq!(spoken.addon.folders, ["Spoken", "Spoken_Quests"]);
+    }
+
+    #[test]
+    fn a_line_prefix_is_never_a_prerelease_or_flavor() {
+        let split = SplitSpec {
+            repo: SPOKEN.into(),
+            main: "nightly".into(),
+            lines: vec!["classic-audio".into()],
+        };
+        let fetched = Ok(PrefixReleases::from([
+            (
+                "nightly".to_string(),
+                vec![line_release("nightly", "v1.0.0", "Main.zip", 1, 1)],
+            ),
+            (
+                "classic-audio".to_string(),
+                vec![line_release("classic-audio", "v1.0.0", "Pack.zip", 1, 1)],
+            ),
+        ]));
+        let mut probe = ScriptedProbe::default();
+        probe
+            .zips
+            .insert("Main.zip".into(), Ok(scan_of(&["Main"], "Main")));
+        probe
+            .zips
+            .insert("Pack.zip".into(), Ok(scan_of(&["Pack"], "Pack")));
+        let look = Look {
+            picked: true,
+            pins: &Pins::default(),
+            out_of_time: &|| false,
+        };
+        let mut tally = Tally::default();
+        let entries = process_split(
+            &mut probe,
+            &spoken_info(),
+            &split,
+            Some(&fetched),
+            &mut RepoState::default(),
+            &look,
+            &mut tally,
+        );
+        assert_eq!(
+            entries.len(),
+            2,
+            "both read, though classic is a flavor word"
+        );
+        for entry in &entries {
+            assert!(
+                entry.addon.stable.is_some(),
+                "{}: stable, though nightly isn't",
+                entry.addon.id
+            );
+            assert!(entry.addon.beta.is_none());
+        }
+    }
+
+    #[test]
+    fn one_line_failing_keeps_its_last_known_entry_and_the_rest_carry_on() {
+        let mut probe = spoken_probe();
+        let mut record = RepoState::default();
+        let mut tally = Tally::default();
+        let first = split_once(
+            &mut probe,
+            &Ok(spoken_fetched()),
+            &mut record,
+            &Pins::default(),
+            &mut tally,
+        );
+        let before = entry_of(&first, "gh:rusty-key/spoken-wow/quests-audio").clone();
+
+        let mut fetched = spoken_fetched();
+        fetched.insert(
+            "quests-audio".into(),
+            vec![line_release(
+                "quests-audio",
+                "v2.6.0",
+                "SpokenQuestsAudioAll-2.6.0.zip",
+                1,
+                0,
+            )],
+        );
+        probe.zips.insert(
+            "SpokenQuestsAudioAll-2.6.0.zip".into(),
+            Err("HTTP 503".into()),
+        );
+        let entries = split_once(
+            &mut probe,
+            &Ok(fetched),
+            &mut record,
+            &Pins::default(),
+            &mut tally,
+        );
+        assert_eq!(
+            entry_of(&entries, "gh:rusty-key/spoken-wow/quests-audio"),
+            &before
+        );
+        assert!(record.lines["quests-audio"].incomplete);
+        assert!(!record.incomplete, "Spoken itself was read fine");
+        assert!(!record.lines["bosses-audio"].incomplete);
+        assert!(
+            needs_full_look(&record, &spoken_info(), unix_now()),
+            "the next run tries the line again"
+        );
+    }
+
+    #[test]
+    fn a_line_without_a_forever_build_doesnt_grey_the_main_entry() {
+        let mut probe = spoken_probe();
+        probe.zips.insert(
+            "SpokenBossesAudio-1.0.0.zip".into(),
+            Ok(ZipScan {
+                folders: vec!["SpokenBossesAudio".into()],
+                ..ZipScan::default()
+            }),
+        );
+        let mut tally = Tally::default();
+        let entries = split_once(
+            &mut probe,
+            &Ok(spoken_fetched()),
+            &mut RepoState::default(),
+            &Pins::default(),
+            &mut tally,
+        );
+        assert!(
+            entries
+                .iter()
+                .all(|c| !c.addon.id.ends_with("bosses-audio"))
+        );
+        let spoken = entry_of(&entries, "gh:rusty-key/spoken-wow");
+        assert!(!spoken.no_longer_forever);
+        assert_eq!(tally.no_build, 1);
+    }
+
+    #[test]
+    fn a_split_repository_that_cant_be_fetched_keeps_everything_it_had() {
+        let mut probe = spoken_probe();
+        let mut record = RepoState::default();
+        let mut tally = Tally::default();
+        let first = split_once(
+            &mut probe,
+            &Ok(spoken_fetched()),
+            &mut record,
+            &Pins::default(),
+            &mut tally,
+        );
+        let kept = split_once(
+            &mut probe,
+            &Err("HTTP 502".into()),
+            &mut record,
+            &Pins::default(),
+            &mut tally,
+        );
+        assert_eq!(kept, first);
+        assert!(record.incomplete);
+        assert!(record.lines.values().all(|line| line.incomplete));
+        assert_eq!(tally.kept_last_known, 3);
+    }
+
+    #[test]
+    fn lines_are_pinned_like_any_entry() {
+        let mut probe = spoken_probe();
+        let mut record = RepoState::default();
+        let mut tally = Tally::default();
+        split_once(
+            &mut probe,
+            &Ok(spoken_fetched()),
+            &mut record,
+            &Pins::default(),
+            &mut tally,
+        );
+
+        // The author reuses the prefix for a different pack.
+        let mut fetched = spoken_fetched();
+        fetched.insert(
+            "bosses-audio".into(),
+            vec![line_release(
+                "bosses-audio",
+                "v2.0.0",
+                "SpokenRaidsAudio-2.0.0.zip",
+                1,
+                0,
+            )],
+        );
+        probe.zips.insert(
+            "SpokenRaidsAudio-2.0.0.zip".into(),
+            Ok(scan_of(&["SpokenRaidsAudio"], "Spoken Audio: Raids")),
+        );
+        let last = listed(&[(
+            "gh:rusty-key/spoken-wow/bosses-audio",
+            &["SpokenBossesAudio"],
+        )]);
+        let pins = Pins::new(Some(&last), &Curated::default());
+        let entries = split_once(&mut probe, &Ok(fetched), &mut record, &pins, &mut tally);
+        let bosses = entry_of(&entries, "gh:rusty-key/spoken-wow/bosses-audio");
+        assert_eq!(bosses.addon.folders, ["SpokenBossesAudio"]);
+        assert_eq!(
+            tally.pinned,
+            [
+                "gh:rusty-key/spoken-wow/bosses-audio keeps SpokenBossesAudio, as bosses-audio/v2.0.0 is another addon's"
+            ]
+        );
+    }
+
+    fn spoken_curated() -> Curated {
+        Curated {
+            split: vec![spoken_split()],
+            ..Curated::default()
+        }
+    }
+
+    #[test]
+    fn an_unchanged_split_repository_still_lists_its_lines_and_answers_for_them() {
+        let mut state = State::empty();
+        let record = state.note_repo(SPOKEN, "seed");
+        let mut tally = Tally::default();
+        split_once(
+            &mut spoken_probe(),
+            &Ok(spoken_fetched()),
+            record,
+            &Pins::default(),
+            &mut tally,
+        );
+        record.lines.insert("retired".into(), LineState::default());
+        let mut heads = heads_of(&[SPOKEN]);
+        heads.found.get_mut(SPOKEN).unwrap().releases[0].tag = "manager/v0.1.11".into();
+        heads.found.get_mut(SPOKEN).unwrap().stars = 90;
+
+        let mut tally = Tally::default();
+        let (entries, to_read) = triage_heads(
+            &heads,
+            &mut state,
+            &spoken_curated(),
+            &HandPicked::default(),
+            unix_now(),
+            &mut tally,
+        );
+        assert!(to_read.is_empty());
+        let ids: Vec<&str> = entries.iter().map(|c| c.addon.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                "gh:rusty-key/spoken-wow",
+                "gh:rusty-key/spoken-wow/quests-audio",
+                "gh:rusty-key/spoken-wow/bosses-audio"
+            ],
+            "and nothing for a line that isn't configured any more"
+        );
+        assert_eq!(entries[0].addon.stars, 90);
+        assert_eq!(entries[1].addon.stars, 0);
+        for id in [
+            "gh:rusty-key/spoken-wow",
+            "gh:rusty-key/spoken-wow/quests-audio",
+            "gh:rusty-key/spoken-wow/bosses-audio",
+        ] {
+            assert!(tally.answered.contains(id), "{id}");
+        }
+    }
+
+    #[test]
+    fn a_split_repository_that_failed_or_went_answers_for_its_lines_the_same_way() {
+        let curated = spoken_curated();
+        let mut state = State::empty();
+        let record = state.note_repo(SPOKEN, "seed");
+        split_once(
+            &mut spoken_probe(),
+            &Ok(spoken_fetched()),
+            record,
+            &Pins::default(),
+            &mut Tally::default(),
+        );
+
+        let failed = BatchResult {
+            failed: vec![SPOKEN.into()],
+            ..BatchResult::default()
+        };
+        let mut tally = Tally::default();
+        let (entries, _) = triage_heads(
+            &failed,
+            &mut state,
+            &curated,
+            &HandPicked::default(),
+            1,
+            &mut tally,
+        );
+        assert_eq!(entries.len(), 3, "the last-known entries of all three");
+        assert!(tally.answered.is_empty(), "a failure answers nothing");
+
+        let gone = BatchResult {
+            gone: vec![SPOKEN.into()],
+            ..BatchResult::default()
+        };
+        let mut tally = Tally::default();
+        triage_heads(
+            &gone,
+            &mut state,
+            &curated,
+            &HandPicked::default(),
+            1,
+            &mut tally,
+        );
+        assert!(
+            tally
+                .answered
+                .contains("gh:rusty-key/spoken-wow/quests-audio")
+        );
+        assert!(
+            tally
+                .answered
+                .contains("gh:rusty-key/spoken-wow/bosses-audio")
+        );
+        assert!(!state.repos.contains_key(SPOKEN));
+    }
+
+    #[test]
+    fn a_line_never_read_gets_its_repository_read_even_when_nothing_new_was_released() {
+        // Spoken as the last build left it, before [[split]] was written.
+        let mut state = State::empty();
+        let record = state.note_repo(SPOKEN, "seed");
+        record.entry = Some(real_entry(SPOKEN, "Spoken", &["Spoken"], 1));
+        record.newest_tag = Some("manager/v0.1.11".into());
+        record.looked_at = unix_now();
+        let mut heads = heads_of(&[SPOKEN]);
+        heads.found.get_mut(SPOKEN).unwrap().releases[0].tag = "manager/v0.1.11".into();
+
+        let read = |state: &mut State, curated: &Curated| {
+            let mut tally = Tally::default();
+            let (_, to_read) = triage_heads(
+                &heads,
+                state,
+                curated,
+                &HandPicked::default(),
+                unix_now(),
+                &mut tally,
+            );
+            to_read
+        };
+        assert!(
+            read(&mut state, &Curated::default()).is_empty(),
+            "unsplit, nothing has changed"
+        );
+        assert_eq!(read(&mut state, &spoken_curated()), [SPOKEN]);
+
+        let record = state.repos.get_mut(SPOKEN).unwrap();
+        for line in &spoken_split().lines {
+            record.lines.insert(line.clone(), LineState::default());
+        }
+        assert!(
+            read(&mut state, &spoken_curated()).is_empty(),
+            "once each line has been read, it's quiet again"
+        );
+    }
+
+    #[test]
+    fn a_renamed_split_repository_answers_for_its_lines_under_the_old_name() {
+        let mut state = State::empty();
+        state.note_repo(SPOKEN, "seed");
+        let mut heads = heads_of(&[SPOKEN]);
+        heads.found.get_mut(SPOKEN).unwrap().name = "rusty-key/spoken".into();
+        let mut tally = Tally::default();
+        let (_, to_read) = triage_heads(
+            &heads,
+            &mut state,
+            &spoken_curated(),
+            &HandPicked::default(),
+            1,
+            &mut tally,
+        );
+        assert_eq!(to_read, ["rusty-key/spoken"]);
+        assert!(tally.answered.contains("gh:rusty-key/spoken-wow"));
+        assert!(
+            tally
+                .answered
+                .contains("gh:rusty-key/spoken-wow/quests-audio")
+        );
+    }
+
+    #[test]
+    fn the_full_look_reads_a_split_repository_by_prefix_and_answers_line_by_line() {
+        let curated = spoken_curated();
+        let mut state = State::empty();
+        state.note_repo(SPOKEN, "seed");
+        let mut batch = BatchResult::default();
+        batch.found.insert(SPOKEN.into(), spoken_info());
+        let mut probe = spoken_probe();
+        probe
+            .zips
+            .insert("SpokenBossesAudio-1.0.0.zip".into(), Err("HTTP 503".into()));
+        let split_releases = SplitReleases::from([(SPOKEN.to_string(), Ok(spoken_fetched()))]);
+        let dir = tempfile::tempdir().unwrap();
+        let mut saver = Saver {
+            path: dir.path().join("state.json"),
+            last: Instant::now(),
+        };
+        let mut tally = Tally::default();
+        let entries = read_releases(
+            &batch,
+            &split_releases,
+            &mut state,
+            &curated,
+            &Pins::default(),
+            &mut probe,
+            &|| false,
+            &mut saver,
+            &mut tally,
+        );
+        assert_eq!(entries.len(), 2);
+        assert!(tally.answered.contains("gh:rusty-key/spoken-wow"));
+        assert!(
+            tally
+                .answered
+                .contains("gh:rusty-key/spoken-wow/quests-audio")
+        );
+        assert!(
+            !tally
+                .answered
+                .contains("gh:rusty-key/spoken-wow/bosses-audio"),
+            "its read failed"
+        );
+
+        // Taken out of [[split]], the repository is one addon again, and its lines' results go.
+        let mut tally = Tally::default();
+        read_releases(
+            &batch,
+            &SplitReleases::new(),
+            &mut state,
+            &Curated::default(),
+            &Pins::default(),
+            &mut probe,
+            &|| false,
+            &mut saver,
+            &mut tally,
+        );
+        assert!(state.repos[SPOKEN].lines.is_empty());
+    }
+
+    /// Reads zips for real, from memory, through the same scan the live builder uses.
+    #[derive(Default)]
+    struct ZipFiles {
+        zips: BTreeMap<String, Vec<u8>>,
+    }
+
+    impl Probe for ZipFiles {
+        fn release_json(&mut self, _: &GhAsset) -> Result<String, String> {
+            Err("not used".to_string())
+        }
+        fn read_zip(&mut self, asset: &GhAsset, hints: &[&str]) -> Result<ZipScan, String> {
+            let bytes = self.zips.get(&asset.name).ok_or("no such zip")?;
+            scan_zip(std::io::Cursor::new(bytes.clone()), hints).map_err(|e| e.to_string())
+        }
+    }
+
+    /// The quests pack as it really is: four folders, each with a TOC naming only itself.
+    fn quests_pack_zip() -> Vec<u8> {
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for part in ["Alliance", "Horde", "Shared", "Gossip"] {
+            let folder = format!("SpokenQuestsAudio{part}");
+            let title = if part == "Gossip" {
+                "Gossip".to_string()
+            } else {
+                format!("Quests - {part}")
+            };
+            writer
+                .start_file(
+                    format!("{folder}/{folder}.toc"),
+                    zip::write::SimpleFileOptions::default(),
+                )
+                .unwrap();
+            writer
+                .write_all(
+                    format!(
+                        "## Interface: 11509, 20506, 16001\n## Title: |cffb48cffSpoken|r Audio: {title}\n## Notes: Narrated quests and gossip from the Vanilla era, for Spoken Quests.\n## LoadOnDemand: 1\n\nModule.lua\n"
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
+            writer
+                .start_file(
+                    format!("{folder}/Module.lua"),
+                    zip::write::SimpleFileOptions::default(),
+                )
+                .unwrap();
+            writer.write_all(b"-- registers the voices\n").unwrap();
+        }
+        writer.finish().unwrap().into_inner()
+    }
+
+    #[test]
+    fn the_quests_pack_goes_by_its_hand_given_name_and_lists_all_four_folders() {
+        let mut probe = ZipFiles::default();
+        probe
+            .zips
+            .insert("SpokenQuestsAudioAll-2.5.0.zip".into(), quests_pack_zip());
+        let split = SplitSpec {
+            repo: SPOKEN.into(),
+            main: "spoken".into(),
+            lines: vec!["quests-audio".into()],
+        };
+        let fetched = Ok(PrefixReleases::from([
+            ("spoken".to_string(), vec![]),
+            (
+                "quests-audio".to_string(),
+                vec![line_release(
+                    "quests-audio",
+                    "v2.5.0",
+                    "SpokenQuestsAudioAll-2.5.0.zip",
+                    1,
+                    1394,
+                )],
+            ),
+        ]));
+        let look = Look {
+            picked: true,
+            pins: &Pins::default(),
+            out_of_time: &|| false,
+        };
+        let entries = process_split(
+            &mut probe,
+            &spoken_info(),
+            &split,
+            Some(&fetched),
+            &mut RepoState::default(),
+            &look,
+            &mut Tally::default(),
+        );
+        let quests = entry_of(&entries, "gh:rusty-key/spoken-wow/quests-audio");
+        assert_eq!(
+            quests.addon.name, "Spoken Audio: Quests - Alliance",
+            "the zip's name runs into the Alliance folder's, so its TOC is the one read"
+        );
+        let mut folders = quests.addon.folders.clone();
+        assert_eq!(folders[0], "SpokenQuestsAudioAlliance", "the main folder");
+        folders.sort();
+        assert_eq!(
+            folders,
+            [
+                "SpokenQuestsAudioAlliance",
+                "SpokenQuestsAudioGossip",
+                "SpokenQuestsAudioHorde",
+                "SpokenQuestsAudioShared"
+            ]
+        );
+
+        let curated = Curated {
+            split: vec![split],
+            overrides: BTreeMap::from([(
+                "gh:rusty-key/spoken-wow/quests-audio".to_string(),
+                Override {
+                    name: Some("Spoken Audio: Quests".into()),
+                    summary: Some("English voices for Spoken.".into()),
+                    category: Some("quests".into()),
+                    boost: None,
+                },
+            )]),
+            ..Curated::default()
+        };
+        let picks = HandPicked::new(&Seeds::default(), &curated);
+        let scanned = Scanned {
+            repos: entries,
+            ..Scanned::default()
+        };
+        let settled = settle(scanned, &curated, &picks, None, BUILT_AT);
+        let quests = entry_of(&settled.candidates, "gh:rusty-key/spoken-wow/quests-audio");
+        assert_eq!(quests.addon.name, "Spoken Audio: Quests");
+        assert_eq!(quests.addon.summary, "English voices for Spoken.");
+        assert_eq!(quests.addon.category, "quests");
+        assert_eq!(quests.addon.folders.len(), 4);
+        assert!(quests.addon.reviewed && quests.addon.trusted);
+    }
+
+    #[test]
+    fn spokens_packs_are_listed_reviewed_and_offered_on_its_page_and_their_folders_are_its_own() {
+        let mut w = world();
+        w.seeds.repos.push(SPOKEN.into());
+        w.curated.split = vec![spoken_split()];
+        w.curated.reserved = vec![
+            "SpokenQuestsAudioAlliance".into(),
+            "SpokenBossesAudio".into(),
+        ];
+        w.curated.packs = vec![
+            crate::curated::PackSpec {
+                addon: "gh:rusty-key/spoken-wow".into(),
+                name: "Quest voices".into(),
+                needed: true,
+                ids: vec!["gh:rusty-key/spoken-wow/quests-audio".into()],
+            },
+            crate::curated::PackSpec {
+                addon: "gh:rusty-key/spoken-wow".into(),
+                name: "Boss voices".into(),
+                needed: false,
+                ids: vec!["gh:rusty-key/spoken-wow/bosses-audio".into()],
+            },
+        ];
+        for (line, name) in [
+            ("quests-audio", "Spoken Audio: Quests"),
+            ("bosses-audio", "Spoken Audio: Bosses"),
+        ] {
+            w.curated.overrides.insert(
+                SplitSpec::line_id(SPOKEN, line),
+                Override {
+                    name: Some(name.into()),
+                    ..Override::default()
+                },
+            );
+        }
+        let spoken = real_entry(SPOKEN, "Spoken", &["Spoken", "Spoken_Quests"], 6000);
+        w.previous.addons.push(spoken.addon.clone());
+        let line = |id: &str, title: &str, folders: &[&str]| {
+            let mut c = addon_candidate(id, title, 1394);
+            c.addon.folders = folders.iter().map(|f| f.to_string()).collect();
+            c.addon.source = Source::Github {
+                repo: SPOKEN.into(),
+            };
+            c
+        };
+        let quests = line(
+            "gh:rusty-key/spoken-wow/quests-audio",
+            "Spoken Audio: Quests - Alliance",
+            &["SpokenQuestsAudioAlliance", "SpokenQuestsAudioGossip"],
+        );
+        let bosses = line(
+            "gh:rusty-key/spoken-wow/bosses-audio",
+            "Spoken Audio: Bosses",
+            &["SpokenBossesAudio"],
+        );
+        let squatter = claim_of(
+            "zebra/Voices",
+            "Free Voices",
+            &["SpokenQuestsAudioGossip"],
+            1,
+        );
+        let namesake = claim_of("zebra/Quests", "Spoken Audio: Quests", &["ZebraQuests"], 1);
+        let (published, _dir) = w.build(vec![spoken, quests, bosses, squatter, namesake]);
+
+        for id in [
+            "gh:rusty-key/spoken-wow/quests-audio",
+            "gh:rusty-key/spoken-wow/bosses-audio",
+        ] {
+            let listed = addon_of(&published, id);
+            assert!(listed.reviewed && listed.trusted, "{id}");
+            assert!(!is_held(&published, id));
+        }
+        assert_eq!(
+            addon_of(&published, "gh:rusty-key/spoken-wow/quests-audio").name,
+            "Spoken Audio: Quests"
+        );
+        let packs = &addon_of(&published, "gh:rusty-key/spoken-wow").packs;
+        assert_eq!(packs.len(), 2);
+        assert!(packs[0].needed && !packs[1].needed);
+        assert!(
+            is_held(&published, "gh:zebra/Voices"),
+            "a pack's folder is the pack's"
+        );
+        assert!(is_held(&published, "gh:zebra/Quests"), "and so is its name");
     }
 }

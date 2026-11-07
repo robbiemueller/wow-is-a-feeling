@@ -61,6 +61,24 @@ pub struct RepoState {
     /// Something failed at the last look, so it needs another.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub incomplete: bool,
+    /// For a repository in `[[split]]`: each release line's own results, by tag prefix.
+    /// Each needs its own verdicts, because pruning one line's would drop the others'.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub lines: BTreeMap<String, LineState>,
+}
+
+/// What the looks at one release line found.
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LineState {
+    /// The last good result.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry: Option<Candidate>,
+    /// Detection results by tag, without the line's prefix.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub releases: BTreeMap<String, ReleaseVerdict>,
+    /// Something failed at the last look.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub incomplete: bool,
 }
 
 fn is_zero(n: &u64) -> bool {
@@ -144,6 +162,9 @@ impl State {
         if target.releases.is_empty() {
             target.releases = moved.releases;
         }
+        if target.lines.is_empty() {
+            target.lines = moved.lines;
+        }
     }
 }
 
@@ -178,7 +199,30 @@ mod tests {
                     forever: true,
                     ..ZipScan::default()
                 }),
-                confirmed_negative: false,
+                ..ReleaseVerdict::default()
+            },
+        );
+        repo.releases.insert(
+            "pack/v2".into(),
+            ReleaseVerdict {
+                sig: "def".into(),
+                skipped_for: Some("A".into()),
+                ..ReleaseVerdict::default()
+            },
+        );
+        repo.lines.insert(
+            "quests-audio".into(),
+            LineState {
+                entry: Some(Candidate::default()),
+                releases: BTreeMap::from([(
+                    "v2.5.0".into(),
+                    ReleaseVerdict {
+                        sig: "ghi".into(),
+                        confirmed_negative: true,
+                        ..ReleaseVerdict::default()
+                    },
+                )]),
+                incomplete: true,
             },
         );
         state.wowi.insert(
@@ -256,5 +300,28 @@ mod tests {
         assert!(state.repos.contains_key("new/name"));
         state.rename_repo("not/there", "x/y");
         assert!(!state.repos.contains_key("x/y"));
+    }
+
+    #[test]
+    fn release_lines_move_with_a_renamed_repository() {
+        let mut state = State::empty();
+        let old = state.note_repo("rusty-key/spoken-wow", "seed");
+        old.lines
+            .insert("quests-audio".into(), LineState::default());
+        state.rename_repo("rusty-key/spoken-wow", "rusty-key/spoken");
+        assert!(
+            state.repos["rusty-key/spoken"]
+                .lines
+                .contains_key("quests-audio")
+        );
+
+        // A record already at the new name keeps its own lines.
+        let other = state.note_repo("rusty-key/other", "seed");
+        other
+            .lines
+            .insert("bosses-audio".into(), LineState::default());
+        state.rename_repo("rusty-key/other", "rusty-key/spoken");
+        let lines: Vec<&String> = state.repos["rusty-key/spoken"].lines.keys().collect();
+        assert_eq!(lines, ["quests-audio"]);
     }
 }

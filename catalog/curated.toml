@@ -1,9 +1,19 @@
 # Hand-picked parts of the catalog. See docs/DESIGN.md.
-# Ids look like gh:owner/repo, wowi:1234 or direct:name. The builder drops any
-# reference that isn't in the catalog and warns about it.
+# Ids look like gh:owner/repo, wowi:1234 or direct:name, and a release line from [[split]]
+# below is gh:owner/repo/<line>. The builder drops any reference that isn't in the catalog
+# and warns about it.
 #
 # Everything named in this file or in seeds.toml counts as hand-picked: it always keeps
 # its name and folders against anything found by search, and the app may pick it by itself.
+# allow_new_main is the one exception, since it only lifts a check.
+#
+# Every GitHub entry is pinned to the main folder the last catalog listed it with: a new
+# build that doesn't ship that folder any more is taken for another addon from the same
+# repository, a module or a voice pack, and skipped. When nothing newer qualifies, the entry
+# keeps its last build and the build summary names it. When an addon really did rename its
+# main folder, put its id in allow_new_main, and take it out again once the catalog with the
+# new folder is out, or the entry stays unpinned.
+allow_new_main = []
 
 # Shown first, in this order. Roughly what a new player sets up first.
 featured = [
@@ -33,7 +43,8 @@ featured = [
 # name before the real addon arrives. Anything not hand-picked that lists one of these,
 # or is named like one, is held out of the catalog. Gaps have their own lists below.
 # Taken from each repository's own tree. WeakAuras's folders are also what the hand-picked
-# Musca Auras installs into, see seeds.toml.
+# Musca Auras installs into, see seeds.toml. The Spoken folders are its voice packs' from
+# [[split]] below, taken from the zips themselves.
 reserved = [
   "ArkInventory",
   "Cell",
@@ -49,6 +60,13 @@ reserved = [
   "OmniCC",
   "OmniCC_Config",
   "pfQuest",
+  "SpokenBossesAudio",
+  "SpokenPlacesAudio",
+  "SpokenQuestsAudioAlliance",
+  "SpokenQuestsAudioGossip",
+  "SpokenQuestsAudioHorde",
+  "SpokenQuestsAudioShared",
+  "SpokenReadablesAudio",
   "WeakAuras",
   "WeakAurasArchive",
   "WeakAurasModelPaths",
@@ -224,6 +242,45 @@ author = "ForeverDB"
 website = "https://foreverdb.net"
 changes_often = true
 
+# Repositories that publish several addons, each under its own tag prefix, as tags like
+# <prefix>/v1.2.3. The repository's own entry, gh:owner/repo, reads only main's tags. Each
+# line is an entry of its own, gh:owner/repo/<line> in lower case, and reads only its tags.
+# Tags under any other prefix are never read. The repository must be in seeds.toml too, and
+# each line needs a name and summary under [overrides], because a pack's TOC only describes
+# one of its folders. A line's prefix takes letters, digits and dashes.
+#
+# Spoken's other prefixes are its desktop app (manager, launcher), retired packs and
+# languages nobody has checked against Spoken 3.8 yet.
+[[split]]
+repo = "rusty-key/spoken-wow"
+main = "spoken"
+lines = ["quests-audio", "places-audio", "readables-audio", "bosses-audio"]
+
+# Addons that go with another, written down because neither side's TOC says so. Each group
+# has a name, whether the addon does nothing useful without it (needed), and the ids that
+# will do, in the order to offer them: any one of them meets it. The app shows them on the
+# addon's page and asks before installing any. Naming an id here hand-picks it.
+[[packs]]
+addon = "gh:rusty-key/spoken-wow"
+name = "Quest voices"
+needed = true
+ids = ["gh:rusty-key/spoken-wow/quests-audio"]
+
+[[packs]]
+addon = "gh:rusty-key/spoken-wow"
+name = "Place voices"
+ids = ["gh:rusty-key/spoken-wow/places-audio"]
+
+[[packs]]
+addon = "gh:rusty-key/spoken-wow"
+name = "Readable voices"
+ids = ["gh:rusty-key/spoken-wow/readables-audio"]
+
+[[packs]]
+addon = "gh:rusty-key/spoken-wow"
+name = "Boss voices"
+ids = ["gh:rusty-key/spoken-wow/bosses-audio"]
+
 [exclude]
 # These accounts mirror other people's addons. Authors have filed DMCA notices
 # against mirrors, and we never want to send players to one.
@@ -289,6 +346,28 @@ name = "Raider.IO"
 
 [overrides."direct:foreverdb"]
 category = "misc"
+
+# Spoken's voice packs, from [[split]]. The quests pack's own title names only its Alliance
+# folder, though it holds the Horde, shared and gossip ones too.
+[overrides."gh:rusty-key/spoken-wow/quests-audio"]
+name = "Spoken Audio: Quests"
+summary = "English voices for Spoken: quest dialogue and gossip, for Alliance, Horde and both."
+category = "quests"
+
+[overrides."gh:rusty-key/spoken-wow/places-audio"]
+name = "Spoken Audio: Places"
+summary = "English voices for Spoken: the lore of the zones and places you visit, read aloud."
+category = "quests"
+
+[overrides."gh:rusty-key/spoken-wow/readables-audio"]
+name = "Spoken Audio: Readables"
+summary = "English voices for Spoken: books, letters, notes and plaques, read aloud."
+category = "quests"
+
+[overrides."gh:rusty-key/spoken-wow/bosses-audio"]
+name = "Spoken Audio: Bosses"
+summary = "English voices for Spoken: the stories of the bosses you face, read aloud."
+category = "quests"
 
 # WoWInterface listings that are the same addon as a GitHub repository, as listing id
 # and repository. Their counts add up and the listing stops being its own entry. This
