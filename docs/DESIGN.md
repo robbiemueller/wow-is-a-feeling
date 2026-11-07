@@ -91,7 +91,7 @@ Staging lives in `<_forever_>/Interface/.wiaf/`, which is on the same volume as 
 
 Nothing is deleted until the journal says, durably, which way the transaction went. Staged addon files aren't synced one by one, because that's slow on big addons: a process crash is fully safe, while a power cut just after a commit can leave a new addon incomplete, which a reinstall fixes.
 
-Folders we own are recorded in `state`. Removal deletes only folders no other managed addon claims. Unmanaged folders are never touched, except when a new install contains a folder of the same name, which goes through the same backup-and-swap and is logged. Two addons may claim one folder (shared libraries).
+Folders we own are recorded in `state`. Removal deletes only folders no other managed addon claims. A catalog install replaces only its record's folders and ones the player agreed to, and anything else in its zip that's already on disk stops it. A zip the player dropped or a rollback replaces same-named folders through the same backup-and-swap and says so. Two addons may claim one folder (shared libraries). `UI-SPEC.md` has the details under Replacing folders.
 
 ### Safe extraction
 
