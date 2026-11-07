@@ -279,7 +279,6 @@ impl App {
         }
         if forgot {
             self.save_state();
-            self.local_dirty = true;
         }
         self.rescan();
         let listed = self
