@@ -74,10 +74,16 @@ impl std::fmt::Display for ScanError {
 }
 
 /// Scan a zip. `hints` are names the main folder is likely to match, such as the
-/// repository and the zip's own name. Fails only when the zip can't be read at
-/// all: a zip with no usable folders is a successful scan with an empty list, and so
-/// is one an install would refuse, because it won't get better by being read again.
-pub fn scan_zip<R: Read + Seek>(mut reader: R, hints: &[&str]) -> Result<ZipScan, ScanError> {
+/// repository and the zip's own name. `pin` is the folder the entry is pinned to: when the
+/// zip has it, it's the main folder, whatever the hints say, and its TOC gives the details.
+/// Fails only when the zip can't be read at all: a zip with no usable folders is a
+/// successful scan with an empty list, and so is one an install would refuse, because it
+/// won't get better by being read again.
+pub fn scan_zip<R: Read + Seek>(
+    mut reader: R,
+    hints: &[&str],
+    pin: Option<&str>,
+) -> Result<ZipScan, ScanError> {
     // Known(0) stops the zip crate from scanning the whole file for a prefix, which over
     // HTTP would mean downloading it. A zip that only opens that way is refused below.
     let config = Config {
@@ -129,11 +135,18 @@ pub fn scan_zip<R: Read + Seek>(mut reader: R, hints: &[&str]) -> Result<ZipScan
         .map(|h| normalize(h))
         .filter(|h| !h.is_empty())
         .collect();
-    // A folder the game wouldn't load still gets installed, so it's listed, but it can't
-    // be what the addon is named after.
+    // The pinned folder comes first, so its TOC is always read. Otherwise a folder the game
+    // wouldn't load still gets installed, so it's listed, but it can't be what the addon is
+    // named after.
+    let is_pin = |folder: &str| pin.is_some_and(|pin| folder.eq_ignore_ascii_case(pin));
     picked.sort_by_key(|(folder, toc)| {
-        (toc.is_none(), std::cmp::Reverse(best_match(folder, &hints)))
+        (
+            !is_pin(folder),
+            toc.is_none(),
+            std::cmp::Reverse(best_match(folder, &hints)),
+        )
     });
+    let pinned = picked.first().is_some_and(|(folder, _)| is_pin(folder));
 
     let mut folders = Vec::with_capacity(picked.len());
     for (position, (folder, index)) in picked.iter().enumerate() {
@@ -145,7 +158,7 @@ pub fn scan_zip<R: Read + Seek>(mut reader: R, hints: &[&str]) -> Result<ZipScan
             toc: parsed,
         });
     }
-    Ok(summarize(folders, &hints))
+    Ok(summarize(folders, &hints, pinned))
 }
 
 /// Every entry's name and whether it's a directory, read the way the installer reads
@@ -332,7 +345,8 @@ pub struct ForeverToc {
     pub targets_forever: bool,
 }
 
-fn summarize(mut folders: Vec<Folder>, hints: &[String]) -> ZipScan {
+/// `pinned`: the first folder is the one the entry is pinned to, and stays the main folder.
+fn summarize(mut folders: Vec<Folder>, hints: &[String], pinned: bool) -> ZipScan {
     let forever = folders
         .iter()
         .any(|f| f.toc.as_ref().is_some_and(|t| t.targets_forever));
@@ -345,7 +359,7 @@ fn summarize(mut folders: Vec<Folder>, hints: &[String]) -> ZipScan {
                 && f.toc.as_ref().is_some_and(|t| t.targets_forever)
         })
         .unwrap_or(0);
-    if main != 0 {
+    if main != 0 && !pinned {
         folders.swap(0, main);
     }
     let names = folders.iter().map(|f| f.name.clone()).collect();
@@ -512,7 +526,7 @@ mod tests {
     }
 
     fn scan(files: &[(&str, &str)], hints: &[&str]) -> ZipScan {
-        scan_zip(Cursor::new(make_zip(files)), hints).unwrap()
+        scan_zip(Cursor::new(make_zip(files)), hints, None).unwrap()
     }
 
     #[test]
@@ -712,7 +726,7 @@ mod tests {
         ];
         for files in cases {
             let bytes = make_zip(files);
-            let scanned = scan_zip(Cursor::new(&bytes), &["Harmless"]).unwrap();
+            let scanned = scan_zip(Cursor::new(&bytes), &["Harmless"], None).unwrap();
             assert_eq!(
                 sorted(scanned.folders),
                 installed_folders(&bytes),
@@ -803,7 +817,7 @@ mod tests {
             "DBM-Core/DBM-Core.toc"
         );
 
-        let scan = scan_zip(Cursor::new(&both), &["Harmless"]).unwrap();
+        let scan = scan_zip(Cursor::new(&both), &["Harmless"], None).unwrap();
         assert!(scan.folders.is_empty(), "{scan:?}");
         assert!(!scan.forever);
     }
@@ -822,13 +836,14 @@ mod tests {
 
     #[test]
     fn a_zip_with_too_many_folders_is_an_empty_scan_not_a_failure() {
-        let allowed = scan_zip(Cursor::new(folders_zip(MAX_FOLDERS)), &["Pack0"]).unwrap();
+        let allowed = scan_zip(Cursor::new(folders_zip(MAX_FOLDERS)), &["Pack0"], None).unwrap();
         assert_eq!(allowed.folders.len(), MAX_FOLDERS);
         assert!(allowed.forever);
 
         // Empty rather than invalid: an error would never be remembered, and the whole
         // zip would be downloaded again on every run.
-        let too_many = scan_zip(Cursor::new(folders_zip(MAX_FOLDERS + 1)), &["Pack0"]).unwrap();
+        let too_many =
+            scan_zip(Cursor::new(folders_zip(MAX_FOLDERS + 1)), &["Pack0"], None).unwrap();
         assert_eq!(too_many, ZipScan::default());
     }
 
@@ -838,7 +853,7 @@ mod tests {
         let path = format!("{long}/{long}.toc");
         let bytes = make_zip(&[(path.as_str(), "## Interface: 16001\n")]);
         assert_eq!(
-            scan_zip(Cursor::new(bytes), &["x"]).unwrap(),
+            scan_zip(Cursor::new(bytes), &["x"], None).unwrap(),
             ZipScan::default()
         );
     }
@@ -1097,6 +1112,61 @@ mod tests {
     }
 
     #[test]
+    fn the_pinned_folder_is_the_main_one_with_its_own_details_whatever_the_hints_say() {
+        // Ready2Quest's repository bundles both its addons in one zip.
+        let files = [
+            (
+                "Ready2Quest/Ready2Quest.toc",
+                "## Interface: 16001\n## Title: Ready2Quest\n## Notes: Quest prep\n",
+            ),
+            (
+                "QuestCompanion/QuestCompanion.toc",
+                "## Interface: 11508\n## Title: Quest Companion\n## Author: Alexis\n## Dependencies: Ace3\n",
+            ),
+        ];
+        let bytes = make_zip(&files);
+        let hints = ["Ready2Quest", "Ready2Quest-2.0"];
+        let free = scan_zip(Cursor::new(&bytes), &hints, None).unwrap();
+        assert_eq!(free.folders, ["Ready2Quest", "QuestCompanion"]);
+
+        let pinned = scan_zip(Cursor::new(&bytes), &hints, Some("questcompanion")).unwrap();
+        assert_eq!(pinned.folders, ["QuestCompanion", "Ready2Quest"]);
+        assert_eq!(pinned.title.as_deref(), Some("Quest Companion"));
+        assert_eq!(pinned.author.as_deref(), Some("Alexis"));
+        assert_eq!(pinned.deps, ["Ace3"]);
+        assert!(
+            pinned.forever,
+            "the pin stays first even when another folder is the one for Forever"
+        );
+
+        let elsewhere = scan_zip(Cursor::new(&bytes), &hints, Some("Wayfarer")).unwrap();
+        assert_eq!(
+            elsewhere, free,
+            "a pin the zip doesn't have changes nothing"
+        );
+    }
+
+    #[test]
+    fn the_pinned_folders_toc_is_read_however_many_folders_come_before_it() {
+        let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+        let options = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+        for at in 0..MAX_FOLDERS_READ + 10 {
+            writer
+                .start_file(format!("Pack{at:03}/Pack{at:03}.toc"), options)
+                .unwrap();
+            writer.write_all(b"## Interface: 16001\n").unwrap();
+        }
+        writer.start_file("Zed/Zed.toc", options).unwrap();
+        writer
+            .write_all(b"## Interface: 16001\n## Title: Zed Itself\n")
+            .unwrap();
+        let bytes = writer.finish().unwrap().into_inner();
+        let scan = scan_zip(Cursor::new(bytes), &["Pack000"], Some("Zed")).unwrap();
+        assert_eq!(scan.folders[0], "Zed");
+        assert_eq!(scan.title.as_deref(), Some("Zed Itself"));
+    }
+
+    #[test]
     fn a_best_name_that_skips_forever_loses_only_to_an_equal_match() {
         let scan = scan(
             &[
@@ -1144,7 +1214,7 @@ mod tests {
     fn broken_input_is_an_error_not_a_panic() {
         let invalid = |bytes: Vec<u8>| {
             matches!(
-                scan_zip(Cursor::new(bytes), &["x"]),
+                scan_zip(Cursor::new(bytes), &["x"], None),
                 Err(ScanError::Invalid(_))
             )
         };
@@ -1168,7 +1238,10 @@ mod tests {
                 Ok(1000)
             }
         }
-        assert!(matches!(scan_zip(Broken, &["x"]), Err(ScanError::Io(_))));
+        assert!(matches!(
+            scan_zip(Broken, &["x"], None),
+            Err(ScanError::Io(_))
+        ));
     }
 
     #[test]
@@ -1192,7 +1265,7 @@ mod tests {
             .write_all(b"## Interface: 16001\n## Title: Caf\xe9\n")
             .unwrap();
         let bytes = writer.finish().unwrap().into_inner();
-        let scan = scan_zip(Cursor::new(bytes), &["Foo"]).unwrap();
+        let scan = scan_zip(Cursor::new(bytes), &["Foo"], None).unwrap();
         assert!(scan.forever);
         assert!(scan.title.unwrap().starts_with("Caf"));
     }
@@ -1201,7 +1274,7 @@ mod tests {
     fn an_empty_zip_is_a_scan_with_nothing_in_it() {
         let writer = ZipWriter::new(Cursor::new(Vec::new()));
         let bytes = writer.finish().unwrap().into_inner();
-        let scan = scan_zip(Cursor::new(bytes), &["Foo"]).unwrap();
+        let scan = scan_zip(Cursor::new(bytes), &["Foo"], None).unwrap();
         assert!(scan.folders.is_empty());
     }
 }

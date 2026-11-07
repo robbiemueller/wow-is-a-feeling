@@ -223,7 +223,14 @@ fn run(
         }
     }
     edit(&mut input);
-    let settled = settle(input, &real.curated, &picks, Some(previous), NOW);
+    let settled = settle(
+        input,
+        &real.curated,
+        &picks,
+        Some(previous),
+        &real.state.remembered,
+        NOW,
+    );
     let dir = tempfile::tempdir().unwrap();
     let published = publish(
         settled.candidates,
@@ -384,13 +391,32 @@ fn replay_real_data_with_nobody_attacking() {
         "all of today is established"
     );
     assert!(
-        new.addons
-            .iter()
-            .all(|a| a.reviewed == outcome.picks.contains(&a.id)),
-        "reviewed means hand-picked"
+        new.addons.iter().all(|a| {
+            a.reviewed == (outcome.picks.contains(&a.id) && !is_big_pack(a, &real.curated))
+        }),
+        "reviewed means hand-picked, and not a pack over 100 MB"
     );
     let wrong_tiers = changes.get("tier").map_or(0, Vec::len);
     assert!(wrong_tiers < 10, "tiers moved: {wrong_tiers}");
+}
+
+/// A release line, or an id `[[packs]]` names, whose download is over 100 MB. These go out
+/// unreviewed, so apps up to 0.1.2 never install one by itself.
+fn is_big_pack(addon: &Addon, curated: &Curated) -> bool {
+    let pack = curated::is_line_id(&addon.id)
+        || curated
+            .packs
+            .iter()
+            .flat_map(|group| group.ids.iter())
+            .any(|id| id.eq_ignore_ascii_case(&addon.id));
+    let size = addon
+        .stable
+        .iter()
+        .chain(addon.beta.iter())
+        .map(|release| release.size)
+        .max()
+        .unwrap_or(0);
+    pack && size > feeling_core::deps::BIGGEST_UNASKED_DOWNLOAD
 }
 
 /// One attack: what goes in, and what must be true of what comes out.
@@ -846,6 +872,7 @@ fn replay_real_data_with_each_attack() {
             &real.curated,
             &picks,
             Some(&doubled),
+            &real.state.remembered,
             NOW,
         );
         let dir = tempfile::tempdir().unwrap();
@@ -1092,7 +1119,9 @@ fn replay_real_data_with_spokens_voice_packs() {
                 let addon = o
                     .listed(id)
                     .unwrap_or_else(|| panic!("{id} isn't listed: {:?}", o.reason(id)));
-                assert!(addon.reviewed && addon.trusted, "{id}");
+                // Every pack is over 100 MB, so none is reviewed: apps up to 0.1.2 would
+                // install it by itself for any addon that requires one of its folders.
+                assert!(addon.trusted && !addon.reviewed, "{id}");
                 let wanted = real.curated.overrides[&addon.id].name.as_deref();
                 assert_eq!(Some(addon.name.as_str()), wanted, "{id}");
                 assert_eq!(addon.category, "quests", "{id}");
@@ -1112,7 +1141,7 @@ fn replay_real_data_with_spokens_voice_packs() {
             );
             assert!(o.published.raw < 8 * 1024 * 1024);
             format!(
-                "{} lines listed, reviewed and named by hand, {} groups on Spoken's page, catalog {} bytes",
+                "{} lines listed, trusted, unreviewed and named by hand, {} groups on Spoken's page, catalog {} bytes",
                 lines.len(),
                 spoken.packs.len(),
                 o.published.raw
@@ -1142,6 +1171,18 @@ fn replay_real_data_with_spokens_voice_packs() {
             1,
         )]),
         |o| held_because(o, "gh:zebra/Voices"),
+    );
+    check(
+        &real,
+        &baseline,
+        "A stranger titled Spoken Audio: Quests",
+        with_lines(vec![repo(
+            "zebra/Quests",
+            "Spoken Audio: Quests",
+            &["ZebraQuests"],
+            1,
+        )]),
+        |o| held_because(o, "gh:zebra/Quests"),
     );
     check(
         &real,

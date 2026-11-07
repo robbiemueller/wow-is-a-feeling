@@ -6,6 +6,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 
+use feeling_core::catalog::Catalog;
 use serde::{Deserialize, Serialize};
 
 use crate::curated::{DirectState, SourceState};
@@ -34,6 +35,60 @@ pub struct State {
     pub sources: BTreeMap<String, SourceState>,
     #[serde(default)]
     pub direct: BTreeMap<String, DirectState>,
+    /// What each entry was last published as. An entry a catalog leaves out keeps it, so one
+    /// missing build loses neither which addon the entry is nor what the catalog vouched for.
+    #[serde(default, skip_serializing_if = "Remembered::is_empty")]
+    pub remembered: Remembered,
+}
+
+/// The main folder an entry was last published with, and the former ones the catalog vouched
+/// for then.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LastPublished {
+    pub main: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub formerly: Vec<String>,
+}
+
+/// What each entry was last published as, by lowercased id. Nothing is ever taken out: it's a
+/// short line for each entry ever listed, a few hundred kilobytes at most.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Remembered(BTreeMap<String, LastPublished>);
+
+impl Remembered {
+    /// Notes what each entry of a catalog that went out was published as. Entries it left out
+    /// keep what was noted before.
+    pub fn note(&mut self, catalog: &Catalog) {
+        for addon in &catalog.addons {
+            let Some(main) = addon.folders.first() else {
+                continue;
+            };
+            self.0.insert(
+                addon.id.to_ascii_lowercase(),
+                LastPublished {
+                    main: main.clone(),
+                    formerly: addon.formerly.clone(),
+                },
+            );
+        }
+    }
+
+    /// What the entry with this id was last published as. Case doesn't matter.
+    pub fn get(&self, id: &str) -> Option<&LastPublished> {
+        self.0.get(&id.to_ascii_lowercase())
+    }
+
+    /// Each entry's main folder, by lowercased id.
+    pub fn mains(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.0
+            .iter()
+            .map(|(id, last)| (id.as_str(), last.main.as_str()))
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
@@ -264,6 +319,59 @@ mod tests {
 
         fs::write(&path, b"[1,2,3]").unwrap();
         assert!(State::load(&path).repos.is_empty());
+    }
+
+    fn catalog_of(entries: &[(&str, &[&str], &[&str])]) -> Catalog {
+        Catalog {
+            addons: entries
+                .iter()
+                .map(|(id, folders, formerly)| feeling_core::catalog::Addon {
+                    id: (*id).to_string(),
+                    folders: folders.iter().map(|f| f.to_string()).collect(),
+                    formerly: formerly.iter().map(|f| f.to_string()).collect(),
+                    ..feeling_core::catalog::Addon::default()
+                })
+                .collect(),
+            ..Catalog::default()
+        }
+    }
+
+    #[test]
+    fn what_each_entry_was_published_as_outlasts_a_catalog_that_leaves_it_out() {
+        let mut state = State::empty();
+        state.remembered.note(&catalog_of(&[
+            ("wowi:7032", &["TomTomForever"], &["TomTom"]),
+            ("gh:A/Addon", &["Addon", "Addon_Options"], &[]),
+        ]));
+        // The next catalog leaves the listing out and moves the repository's main folder.
+        state
+            .remembered
+            .note(&catalog_of(&[("gh:a/addon", &["AddonCore", "Addon"], &[])]));
+        let tomtom = state.remembered.get("WOWI:7032").unwrap();
+        assert_eq!(tomtom.main, "TomTomForever");
+        assert_eq!(tomtom.formerly, ["TomTom"]);
+        assert_eq!(
+            state.remembered.get("gh:A/Addon").unwrap().main,
+            "AddonCore"
+        );
+        assert_eq!(state.remembered.get("gh:a/other"), None);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("catalog-state.json");
+        state.save(&path).unwrap();
+        assert_eq!(State::load(&path).remembered, state.remembered);
+
+        // A scan cache from before this was kept still loads, with nothing remembered.
+        fs::write(&path, br#"{"schema":1,"repos":{"A/a":{}}}"#).unwrap();
+        let old = State::load(&path);
+        assert!(old.repos.contains_key("A/a"));
+        assert!(old.remembered.is_empty());
+        assert!(
+            !String::from_utf8(serde_json::to_vec(&old).unwrap())
+                .unwrap()
+                .contains("remembered"),
+            "nothing written while there's nothing to remember"
+        );
     }
 
     #[test]

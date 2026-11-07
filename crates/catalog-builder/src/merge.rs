@@ -7,12 +7,14 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use feeling_core::catalog::{Addon, Catalog, Source};
+use feeling_core::deps::BIGGEST_UNASKED_DOWNLOAD;
 
-use crate::curated::{Curated, HandPicked};
-use crate::detect::{FOREVER_EPOCH, ships};
+use crate::curated::{Curated, HandPicked, is_line_id};
+use crate::detect::FOREVER_EPOCH;
 use crate::gate::is_safe_folder;
 use crate::github::RepoInfo;
 use crate::model::{Candidate, Held, MAX_FORMERLY};
+use crate::state::Remembered;
 use crate::text::{fold_folder, fold_name, normalize, tokens};
 use crate::tier::popularity;
 
@@ -299,6 +301,10 @@ pub struct ClaimRules<'a> {
     pub picks: &'a HandPicked,
     pub reserved: &'a Reserved,
     pub previous: Option<&'a Catalog>,
+    /// What the scan cache remembers of entries the last catalog left out.
+    pub remembered: &'a Remembered,
+    /// For `[pins]` and the names `[overrides]` gives.
+    pub curated: &'a Curated,
 }
 
 fn is_baseline(candidate: &Candidate) -> bool {
@@ -329,10 +335,16 @@ struct Ledger {
 }
 
 impl Ledger {
-    fn keep(&mut self, candidate: Candidate, picks: &HandPicked) {
+    /// Claims what `candidate` has, and `also_named` too, a name that would pass for it.
+    fn keep(&mut self, candidate: Candidate, picks: &HandPicked, also_named: Option<&str>) {
         let at = self.kept.len();
-        let name = fold_name(&candidate.addon.name);
-        if !name.is_empty() {
+        let mut names: Vec<String> = std::iter::once(candidate.addon.name.as_str())
+            .chain(also_named)
+            .map(fold_name)
+            .filter(|name| !name.is_empty())
+            .collect();
+        names.dedup();
+        for name in names {
             self.names.entry(name).or_default().push(at);
         }
         for folder in &candidate.addon.folders {
@@ -427,16 +439,20 @@ pub struct Pin {
     pub written: bool,
 }
 
-/// Where each GitHub entry's pin comes from: `[pins]` in `curated.toml`, or else the main
-/// folder the last catalog listed it with, or, when there's no last catalog to read, the scan
-/// cache's. An entry neither lists has nothing to stay, so it takes its newest build.
+/// Where each GitHub entry's pin comes from: the `main` of `[pins]` in `curated.toml`, or else
+/// the main folder the last catalog listed it with, or for an entry that catalog left out, the
+/// one the scan cache remembers it was last published with. With no last catalog to read, the
+/// scan cache's last result says. An entry none of them knows has nothing to stay, so it takes
+/// its newest build.
 #[derive(Debug, Default)]
 pub struct Pins<'a> {
-    /// `[pins]`, by lowercased id.
+    /// `[pins]` that name a main folder, by lowercased id.
     written: HashMap<String, String>,
     /// The last catalog's GitHub entries' main folders, by lowercased id, or `None` without a
     /// last catalog to read.
     listed: Option<HashMap<String, &'a str>>,
+    /// Every entry's main folder when it was last published, by lowercased id.
+    remembered: HashMap<String, String>,
 }
 
 impl<'a> Pins<'a> {
@@ -444,7 +460,7 @@ impl<'a> Pins<'a> {
         let written = curated
             .pins
             .iter()
-            .map(|(id, pin)| (id.to_ascii_lowercase(), pin.main.clone()))
+            .filter_map(|(id, pin)| Some((id.to_ascii_lowercase(), pin.main.clone()?)))
             .collect();
         let listed = previous.map(|catalog| {
             catalog
@@ -457,12 +473,26 @@ impl<'a> Pins<'a> {
                 })
                 .collect()
         });
-        Self { written, listed }
+        Self {
+            written,
+            listed,
+            remembered: HashMap::new(),
+        }
     }
 
-    /// The pin of the entry that goes by any of `ids`: after GitHub renames a repository, the
-    /// name it was asked for is the one `curated.toml` and the last catalog still use.
-    /// `cached` is the scan cache's last result for it.
+    /// The same, knowing what the scan cache remembers each entry was last published as, so an
+    /// entry one catalog left out is still pinned in the next build.
+    pub fn remembering(mut self, remembered: &Remembered) -> Self {
+        self.remembered = remembered
+            .mains()
+            .map(|(id, main)| (id.to_string(), main.to_string()))
+            .collect();
+        self
+    }
+
+    /// The pin of the entry that goes by any of `ids`: its own, and after GitHub renames a
+    /// repository, the one the last catalog and `curated.toml` still use, which the scan cache's
+    /// last result keeps. `cached` is that last result.
     pub fn get(&self, ids: &[&str], cached: Option<&Candidate>) -> Option<Pin> {
         let ids: Vec<String> = ids.iter().map(|id| id.to_ascii_lowercase()).collect();
         if let Some(main) = ids.iter().find_map(|id| self.written.get(id)) {
@@ -471,15 +501,18 @@ impl<'a> Pins<'a> {
                 written: true,
             });
         }
-        let main = match &self.listed {
-            Some(listed) => ids
-                .iter()
-                .find_map(|id| listed.get(id))
-                .map(|main| (*main).to_string()),
-            None => cached
-                .and_then(|entry| entry.addon.folders.first())
-                .cloned(),
-        };
+        let listed = self
+            .listed
+            .as_ref()
+            .and_then(|listed| ids.iter().find_map(|id| listed.get(id)))
+            .map(|main| (*main).to_string());
+        let main = listed
+            .or_else(|| ids.iter().find_map(|id| self.remembered.get(id)).cloned())
+            .or_else(|| {
+                let unread = self.listed.is_none();
+                let cached = cached.and_then(|entry| entry.addon.folders.first());
+                cached.filter(|_| unread).cloned()
+            });
         main.map(|main| Pin {
             main,
             written: false,
@@ -487,72 +520,200 @@ impl<'a> Pins<'a> {
     }
 }
 
-/// Fills in each entry's `formerly`, from the last catalog and `[pins]`, and returns a line for
-/// each folder it newly vouches for. See "What it used to be" in `docs/DESIGN.md`.
-pub fn stamp_formerly(
-    candidates: &mut [Candidate],
-    previous: Option<&Catalog>,
-    curated: &Curated,
-) -> Vec<String> {
-    let listed: HashMap<String, &Addon> = previous
-        .map_or(&[][..], |catalog| catalog.addons.as_slice())
-        .iter()
-        .map(|addon| (addon.id.to_ascii_lowercase(), addon))
-        .collect();
-    let mut vouched = Vec::new();
-    for candidate in candidates.iter_mut() {
-        let addon = &mut candidate.addon;
-        let last = listed.get(&addon.id.to_ascii_lowercase()).copied();
-        let was = curated
-            .pin_of(&addon.id)
-            .map_or(&[][..], |pin| &pin.was[..]);
-        addon.formerly = former_mains(last, was, addon);
+/// What decides the former main folders the catalog vouches for: what each entry was when it
+/// was last published, and `[pins]`. See "What it used to be" in `docs/DESIGN.md`.
+struct Vouches<'a> {
+    /// The last catalog's entries, by lowercased id.
+    listed: HashMap<String, &'a Addon>,
+    /// What the scan cache remembers of entries the last catalog left out.
+    remembered: &'a Remembered,
+    curated: &'a Curated,
+}
+
+impl<'a> Vouches<'a> {
+    fn new(
+        previous: Option<&'a Catalog>,
+        remembered: &'a Remembered,
+        curated: &'a Curated,
+    ) -> Self {
+        let listed = previous
+            .map_or(&[][..], |catalog| catalog.addons.as_slice())
+            .iter()
+            .map(|addon| (addon.id.to_ascii_lowercase(), addon))
+            .collect();
+        Self {
+            listed,
+            remembered,
+            curated,
+        }
     }
-    // Only after every entry has its folders: what another one ships now is never vouched for.
-    let refused = crate::gate::drop_formerly_others_ship(
-        candidates.iter_mut().map(|candidate| &mut candidate.addon),
-    );
-    for candidate in candidates.iter() {
-        let addon = &candidate.addon;
-        let last = listed.get(&addon.id.to_ascii_lowercase()).copied();
-        let carried = last.map_or(&[][..], |last| &last.formerly[..]);
-        for folder in &addon.formerly {
-            if !carried.iter().any(|old| old.eq_ignore_ascii_case(folder)) {
-                vouched.push(format!("{} was {folder}", addon.id));
+
+    /// The main folder an entry was last published with, and the former ones vouched for then:
+    /// from the last catalog, or for an entry it left out, from the scan cache's memory.
+    fn last(&self, id: &str) -> Option<(&'a str, &'a [String])> {
+        match self.listed.get(&id.to_ascii_lowercase()) {
+            Some(addon) => {
+                let main = addon.folders.first().map_or("", String::as_str);
+                Some((main, addon.formerly.as_slice()))
+            }
+            None => {
+                let last = self.remembered.get(id)?;
+                Some((last.main.as_str(), last.formerly.as_slice()))
             }
         }
     }
-    vouched.extend(refused);
-    vouched
+
+    /// The former main folders vouched for `addon` in this build, before dropping any that an
+    /// entry with a better claim ships.
+    fn of(&self, addon: &Addon) -> Vec<String> {
+        let was = self
+            .curated
+            .pin_of(&addon.id)
+            .map_or(&[][..], |pin| &pin.was[..]);
+        former_mains(self.last(&addon.id), was, addon)
+    }
+
+    /// A summary line for a GitHub entry whose main folder moved since it was last published,
+    /// with nothing vouching for the old one: a pinned build keeps its main folder first, so
+    /// this is an entry with no pin, such as a `[[split]]` repository's own. Only a person can
+    /// tell whether the old folder was this addon or another of the repository's.
+    fn moved(&self, addon: &Addon) -> Option<String> {
+        if holds_one_addon(addon) || self.curated.main_pin_of(&addon.id).is_some() {
+            return None;
+        }
+        let main = addon.folders.first()?;
+        let (old, _) = self.last(&addon.id)?;
+        let unchanged = old.is_empty() || old.eq_ignore_ascii_case(main);
+        if unchanged || addon.formerly.iter().any(|f| f.eq_ignore_ascii_case(old)) {
+            return None;
+        }
+        let id = &addon.id;
+        Some(format!(
+            "{id} lists {main} first now, not {old}. If they're the same addon, write was = [\"{old}\"] under [pins.\"{id}\"] in curated.toml"
+        ))
+    }
 }
 
-/// One entry's former main folders, the most recent first. What the last catalog vouched for
-/// stays, and in front of it go its last main folder, when this build has another one first,
-/// and the folders `[pins]` says the addon was. A GitHub build only vouches for a last main
-/// folder it still ships, since its repository can hold other addons, and a release of one of
-/// those never ships it. A WoWInterface listing or a direct entry holds one addon, so a new
-/// main folder there is always a rename. The current main folder is never a former one.
-fn former_mains(last: Option<&Addon>, was: &[String], addon: &Addon) -> Vec<String> {
+/// A source that only ever holds one addon, so a new main folder there is a rename: a
+/// WoWInterface listing, a direct entry, or a release line, whose tag prefix decides its addon.
+/// A GitHub repository's own entry can be any of the addons the repository publishes.
+fn holds_one_addon(addon: &Addon) -> bool {
+    !matches!(addon.source, Source::Github { .. }) || is_line_id(&addon.id)
+}
+
+/// One entry's former main folders, the most recent first. What it was vouched for when it was
+/// last published stays, and in front of it go the folders `[pins]` says it was, and for a
+/// source that holds one addon, its last main folder when this build has another one first.
+/// A GitHub repository can hold several addons, so a move there is never vouched for by itself.
+/// The current main folder is never a former one.
+fn former_mains(last: Option<(&str, &[String])>, was: &[String], addon: &Addon) -> Vec<String> {
     let Some(main) = addon.folders.first() else {
         return Vec::new();
     };
-    let carried = last.map_or(&[][..], |last| &last.formerly[..]);
-    let one_addon = !matches!(addon.source, Source::Github { .. });
-    let moved_from = last.and_then(|last| last.folders.first()).filter(|old| {
-        !old.eq_ignore_ascii_case(main) && (one_addon || ships(&addon.folders, Some(old)))
-    });
+    let (last_main, carried) = last.unwrap_or(("", &[]));
+    let moved_from =
+        (holds_one_addon(addon) && !last_main.is_empty() && !last_main.eq_ignore_ascii_case(main))
+            .then_some(last_main);
     // Already vouched for stays where it is, so the list doesn't churn from build to build.
     let new = moved_from
         .into_iter()
-        .chain(was)
+        .chain(was.iter().map(String::as_str))
         .filter(|folder| !carried.iter().any(|old| old.eq_ignore_ascii_case(folder)));
     let mut seen = HashSet::new();
-    new.chain(carried)
+    new.chain(carried.iter().map(String::as_str))
         .filter(|folder| is_safe_folder(folder) && !folder.eq_ignore_ascii_case(main))
         .filter(|folder| seen.insert(folder.to_ascii_lowercase()))
         .take(MAX_FORMERLY)
-        .cloned()
+        .map(str::to_string)
         .collect()
+}
+
+/// What stamping `formerly` found, one summary line each.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Stamped {
+    /// Former main folders the catalog vouches for from this build on.
+    pub vouched: Vec<String>,
+    /// Ones it stops vouching for, because an entry with a better claim ships them.
+    pub unvouched: Vec<String>,
+    /// GitHub main folders that moved with nothing vouching for the old one.
+    pub moved: Vec<String>,
+}
+
+/// Fills in each entry's `formerly`, from what it was last published as and `[pins]`, and
+/// returns the summary's lines about it. See "What it used to be" in `docs/DESIGN.md`.
+pub fn stamp_formerly(
+    candidates: &mut [Candidate],
+    previous: Option<&Catalog>,
+    remembered: &Remembered,
+    curated: &Curated,
+    picks: &HandPicked,
+) -> Stamped {
+    let vouches = Vouches::new(previous, remembered, curated);
+    for candidate in candidates.iter_mut() {
+        candidate.addon.formerly = vouches.of(&candidate.addon);
+    }
+    // Only after every entry has its folders.
+    let mut stamped = Stamped {
+        unvouched: drop_formerly_others_ship(candidates, picks, &LastCatalog::new(previous)),
+        ..Stamped::default()
+    };
+    for candidate in candidates.iter() {
+        let addon = &candidate.addon;
+        let carried = vouches.last(&addon.id).map_or(&[][..], |(_, was)| was);
+        for folder in &addon.formerly {
+            if !carried.iter().any(|old| old.eq_ignore_ascii_case(folder)) {
+                stamped.vouched.push(format!("{} was {folder}", addon.id));
+            }
+        }
+        stamped.moved.extend(vouches.moved(addon));
+    }
+    stamped
+}
+
+/// A former main folder vouches that an installed copy with it is this addon, and the collision
+/// pass held every newcomer that ships one. What still ships one has a better claim to it:
+/// something hand-picked, or an entry the last catalog already listed with that folder. The
+/// folder is that entry's, so the vouch goes, and the line says which entry ships it.
+fn drop_formerly_others_ship(
+    candidates: &mut [Candidate],
+    picks: &HandPicked,
+    last: &LastCatalog<'_>,
+) -> Vec<String> {
+    let ids: Vec<String> = candidates.iter().map(|c| c.addon.id.clone()).collect();
+    let mut shipped_by: HashMap<String, Vec<usize>> = HashMap::new();
+    for (at, candidate) in candidates.iter().enumerate() {
+        for folder in &candidate.addon.folders {
+            shipped_by
+                .entry(folder.to_lowercase())
+                .or_default()
+                .push(at);
+        }
+    }
+    let mut dropped = Vec::new();
+    for (at, candidate) in candidates.iter_mut().enumerate() {
+        candidate.addon.formerly.retain(|folder| {
+            let better = shipped_by
+                .get(&folder.to_lowercase())
+                .into_iter()
+                .flatten()
+                .find(|&&owner| {
+                    owner != at
+                        && (picks.contains(&ids[owner])
+                            || last.had_folder(&ids[owner], &fold_folder(folder)))
+                });
+            match better {
+                Some(&owner) => {
+                    dropped.push(format!(
+                        "{} no longer vouches for {folder}, which {} ships",
+                        ids[at], ids[owner]
+                    ));
+                    false
+                }
+                None => true,
+            }
+        });
+    }
+    dropped
 }
 
 /// Which folders the last catalog listed, and for whom.
@@ -652,11 +813,73 @@ fn squats_a_dependency(candidate: &Candidate, open: &HashSet<String>) -> Option<
     })
 }
 
+/// The former main folders each present entry is vouched for, folded, with the entries that
+/// are. Worked out before the pass, so its order can't decide it.
+fn vouched_folders(
+    candidates: &[Candidate],
+    vouches: &Vouches<'_>,
+) -> HashMap<String, Vec<String>> {
+    let mut claims: HashMap<String, Vec<String>> = HashMap::new();
+    for candidate in candidates {
+        for folder in vouches.of(&candidate.addon) {
+            claims
+                .entry(fold_folder(&folder))
+                .or_default()
+                .push(candidate.addon.id.clone());
+        }
+    }
+    claims
+}
+
+/// A former main folder says an installed copy with it is that entry's addon, so it's that
+/// entry's claim. Anything new shipping it is held, so it can't take the copies the vouch is
+/// for, or strip the vouch. An entry the last catalog already listed with the folder has had it
+/// all along.
+fn ships_a_vouched_folder(
+    candidate: &Candidate,
+    vouched: &HashMap<String, Vec<String>>,
+    last: &LastCatalog<'_>,
+) -> Option<String> {
+    let id = &candidate.addon.id;
+    candidate.addon.folders.iter().find_map(|folder| {
+        let folded = fold_folder(folder);
+        let owner = vouched
+            .get(&folded)?
+            .iter()
+            .find(|owner| !owner.eq_ignore_ascii_case(id))?;
+        (!last.had_folder(id, &folded))
+            .then(|| format!("its folder {folder} was {owner}'s main folder"))
+    })
+}
+
+/// Hand-given names that end in a parenthetical, such as "Spoken Audio: Quests (English)", with
+/// that part cut off, by the lowercased id of the hand-picked entry they're for. A stranger's
+/// "Spoken Audio: Quests" would pass for the pack, so the pack claims that name too.
+fn names_without_parentheses(curated: &Curated, picks: &HandPicked) -> HashMap<String, String> {
+    curated
+        .overrides
+        .iter()
+        .filter(|(id, _)| picks.contains(id))
+        .filter_map(|(id, edit)| {
+            let bare = without_parenthetical(edit.name.as_deref()?)?;
+            Some((id.to_ascii_lowercase(), bare.to_string()))
+        })
+        .collect()
+}
+
+/// A name without the parenthetical it ends in, or `None` when it doesn't end in one.
+fn without_parenthetical(name: &str) -> Option<&str> {
+    let open = name.trim_end().strip_suffix(')')?.rfind(" (")?;
+    let bare = name[..open].trim_end();
+    (!bare.is_empty()).then_some(bare)
+}
+
 /// Settle who gets what. Candidates go in order, hand-picked first and then oldest, each
 /// claiming its name and folders. One whose name or main folder is already taken is held
 /// out of the catalog, and so is one with a side folder taken by something strictly ahead
-/// of it, or a reserved name or folder, or too many siblings from one owner. What was already
-/// listed together stays that way, so this only ever affects newcomers and changes.
+/// of it, or a reserved name or folder, or a folder another entry is vouched for, or too many
+/// siblings from one owner. What was already listed together stays that way, so this only ever
+/// affects newcomers and changes.
 pub fn hold_collisions(
     candidates: Vec<Candidate>,
     rules: &ClaimRules<'_>,
@@ -684,13 +907,19 @@ pub fn hold_collisions(
 
     let last = LastCatalog::new(rules.previous);
     let open = last.open_dependencies(&ordered);
+    let vouches = Vouches::new(rules.previous, rules.remembered, rules.curated);
+    let vouched = vouched_folders(&ordered, &vouches);
+    let bare_names = names_without_parentheses(rules.curated, picks);
     let mut ledger = Ledger::default();
     let mut held = Vec::new();
     for candidate in ordered {
         let problem = (!picks.contains(&candidate.addon.id))
             .then(|| {
-                let reserved = rules.reserved.problem(&candidate);
-                reserved.or_else(|| last.added_a_taken_folder(&candidate, &present))
+                rules
+                    .reserved
+                    .problem(&candidate)
+                    .or_else(|| ships_a_vouched_folder(&candidate, &vouched, &last))
+                    .or_else(|| last.added_a_taken_folder(&candidate, &present))
             })
             .flatten()
             .or_else(|| ledger.conflict(&candidate, picks))
@@ -701,7 +930,10 @@ pub fn hold_collisions(
             });
         match problem {
             Some(reason) => held.push(Held::new(&candidate.addon, reason)),
-            None => ledger.keep(candidate, picks),
+            None => {
+                let also = bare_names.get(&candidate.addon.id.to_ascii_lowercase());
+                ledger.keep(candidate, picks, also.map(String::as_str));
+            }
         }
     }
     held.sort_by(|a, b| a.id.cmp(&b.id));
@@ -714,6 +946,7 @@ pub fn hold_collisions(
 /// claims, so they go. Among what's left, an id belongs to whoever got there first.
 /// Only what a person chose is reviewed, which is what it takes to be installed as another
 /// addon's dependency: any addon can ship a library's folder long before anything needs it.
+/// [`unreview_big_packs`] then takes it back from packs too big for that.
 /// `candidates` must be in the collision pass's order.
 pub fn settle_trust(
     candidates: &mut [Candidate],
@@ -763,6 +996,37 @@ pub fn settle_trust(
         keep(&mut curse_owner, &mut addon.ids.curse);
         keep(&mut wago_owner, &mut addon.ids.wago);
     }
+}
+
+/// Release lines, and the packs `[[packs]]` names, whose download is over 100 MB go out trusted
+/// but not reviewed. Apps up to 0.1.2 install any reviewed entry another addon requires by
+/// itself, whatever its size, and a voice pack can be 1.5 GB. Later apps never install anything
+/// that big without asking, and offer packs by their groups, which only needs them trusted.
+/// Returns a line for each, after [`settle_trust`].
+pub fn unreview_big_packs(candidates: &mut [Candidate], curated: &Curated) -> Vec<String> {
+    let packs: HashSet<String> = curated
+        .packs
+        .iter()
+        .flat_map(|group| group.ids.iter())
+        .map(|id| id.to_ascii_lowercase())
+        .collect();
+    let mut lines = Vec::new();
+    for candidate in candidates {
+        let addon = &mut candidate.addon;
+        let is_pack = is_line_id(&addon.id) || packs.contains(&addon.id.to_ascii_lowercase());
+        let size = addon
+            .stable
+            .iter()
+            .chain(addon.beta.iter())
+            .map(|release| release.size)
+            .max()
+            .unwrap_or(0);
+        if is_pack && addon.reviewed && size > BIGGEST_UNASKED_DOWNLOAD {
+            addon.reviewed = false;
+            lines.push(format!("{}, a {size}-byte download", addon.id));
+        }
+    }
+    lines
 }
 
 #[cfg(test)]
@@ -866,6 +1130,8 @@ mod tests {
             picks: chosen,
             reserved,
             previous,
+            remembered: &Remembered::default(),
+            curated: &Curated::default(),
         };
         hold_collisions(std::mem::take(list), &rules)
     }
@@ -1566,7 +1832,7 @@ mod tests {
             pins: BTreeMap::from([(
                 id.to_string(),
                 crate::curated::PinSpec {
-                    main: main.into(),
+                    main: (!main.is_empty()).then(|| main.into()),
                     was: was.iter().map(|f| f.to_string()).collect(),
                 },
             )]),
@@ -1624,18 +1890,65 @@ mod tests {
             unread.get(&["gh:b/data"], Some(&cached)).unwrap().main,
             "TheAddon"
         );
+        // A pin with only was names no main folder, so the last catalog's stands.
+        let was_only = pinned_by_hand("gh:a/addon", "", &["AddonOld"]);
+        let pins = Pins::new(Some(&previous), &was_only);
+        let pin = pins.get(&["gh:a/addon"], None).unwrap();
+        assert_eq!((pin.main.as_str(), pin.written), ("Addon", false));
+    }
+
+    #[test]
+    fn an_entry_a_catalog_left_out_is_still_pinned_to_what_it_was_last_published_as() {
+        let mut remembered = Remembered::default();
+        remembered.note(&Catalog {
+            addons: vec![
+                listed_as("gh:a/Addon", &["Addon"]),
+                listed_as("gh:b/Other", &["Other"]),
+            ],
+            ..Catalog::default()
+        });
+        // The next catalog lists the other one under a new main folder, and leaves this out.
+        let previous = Catalog {
+            addons: vec![listed_as("gh:b/Other", &["OtherCore"])],
+            ..Catalog::default()
+        };
+        let cached = gh("x/Cached", &["Cached"]);
+        for last in [Some(&previous), None] {
+            let pins = Pins::new(last, &Curated::default()).remembering(&remembered);
+            let main = |id: &str| pins.get(&[id], Some(&cached)).map(|pin| pin.main);
+            assert_eq!(main("GH:A/ADDON").as_deref(), Some("Addon"), "{last:?}");
+            assert_eq!(
+                main("gh:new/one").as_deref(),
+                last.map_or(Some("Cached"), |_| None)
+            );
+        }
+        let pins = Pins::new(Some(&previous), &Curated::default()).remembering(&remembered);
+        assert_eq!(
+            pins.get(&["gh:b/other"], None).unwrap().main,
+            "OtherCore",
+            "the last catalog says first"
+        );
+        let written = pinned_by_hand("gh:a/Addon", "AddonCore", &[]);
+        let pins = Pins::new(Some(&previous), &written).remembering(&remembered);
+        assert_eq!(pins.get(&["gh:a/addon"], None).unwrap().main, "AddonCore");
     }
 
     fn formerly_of(last: Option<&Addon>, was: &[&str], now: &Addon) -> Vec<String> {
         let was: Vec<String> = was.iter().map(|f| f.to_string()).collect();
+        let last = last.map(|last| {
+            let main = last.folders.first().map_or("", String::as_str);
+            (main, last.formerly.as_slice())
+        });
         former_mains(last, &was, now)
     }
 
     #[test]
-    fn a_github_build_only_vouches_for_a_main_folder_it_still_ships() {
+    fn a_github_build_never_vouches_for_a_main_folder_by_itself() {
+        // A repository can hold several addons, so a move there is only a rename when a
+        // person says so: the next build could be its other addon.
         let last = listed_as("gh:a/Addon", &["HogHeals", "HogHeals_Frames"]);
         let moved = gh("a/Addon", &["HogTronUI", "HogHeals", "HogHeals_Frames"]).addon;
-        assert_eq!(formerly_of(Some(&last), &[], &moved), ["HogHeals"]);
+        assert!(formerly_of(Some(&last), &[], &moved).is_empty());
         assert!(
             formerly_of(Some(&last), &[], &gh("a/Addon", &["HogTronUI"]).addon).is_empty(),
             "the old folder is gone, which another product of the repository would do too"
@@ -1649,11 +1962,6 @@ mod tests {
             ["HogHeals"],
             "unless a person wrote it in was"
         );
-        let same = gh("a/Addon", &["hogheals", "Extra"]).addon;
-        assert!(
-            formerly_of(Some(&last), &[], &same).is_empty(),
-            "case isn't a move"
-        );
         assert!(
             formerly_of(None, &[], &moved).is_empty(),
             "nothing to move from"
@@ -1661,7 +1969,7 @@ mod tests {
     }
 
     #[test]
-    fn a_listing_or_direct_entry_vouches_for_any_main_folder_it_moves_away_from() {
+    fn a_listing_direct_entry_or_release_line_vouches_for_any_main_folder_it_moves_away_from() {
         let last = listed_as("wowi:424242", &["ShortKings"]);
         let renamed = wowi(424_242, "Short Royalty", &["ShortRoyalty"]);
         assert_eq!(
@@ -1673,6 +1981,72 @@ mod tests {
             url: "https://foreverdb.net".into(),
         };
         assert_eq!(formerly_of(Some(&last), &[], &direct), ["ShortKings"]);
+        let same = wowi(424_242, "Short Kings", &["shortkings", "Extra"]).addon;
+        assert!(
+            formerly_of(Some(&last), &[], &same).is_empty(),
+            "case isn't a move"
+        );
+
+        // A release line's tag prefix fixes its addon, the way Spoken's packs have renamed
+        // their folders before: a new main folder there is a rename, shipped or not.
+        const LINE: &str = "gh:rusty-key/spoken-wow/bosses-audio";
+        let last = listed_as(LINE, &["SpokenBossesAudio"]);
+        let mut split = gh(
+            "rusty-key/spoken-wow",
+            &["SpokenBossesAudioAlliance", "SpokenBossesAudioHorde"],
+        );
+        split.addon.id = LINE.into();
+        assert_eq!(
+            formerly_of(Some(&last), &[], &split.addon),
+            ["SpokenBossesAudio"]
+        );
+        let mut moved = gh(
+            "rusty-key/spoken-wow",
+            &["SpokenBossesAudioHorde", "SpokenBossesAudio"],
+        );
+        moved.addon.id = LINE.into();
+        assert_eq!(
+            formerly_of(Some(&last), &[], &moved.addon),
+            ["SpokenBossesAudio"]
+        );
+    }
+
+    #[test]
+    fn a_split_repositorys_own_entry_never_vouches_for_what_a_catalog_listed_in_its_place() {
+        // Before [[split]], the builder could list a pack under Spoken's own id, so the last
+        // catalog's main folder there may be a pack's. Vouching for it would let an update
+        // turn that 1.3 GB pack into Spoken and delete it.
+        let curated = Curated {
+            split: vec![crate::curated::SplitSpec {
+                repo: "rusty-key/spoken-wow".into(),
+                main: "spoken".into(),
+                lines: vec!["quests-audio".into()],
+            }],
+            ..Curated::default()
+        };
+        let previous = Catalog {
+            addons: vec![listed_as(
+                "gh:rusty-key/spoken-wow",
+                &["SpokenQuestsAudio_esES"],
+            )],
+            ..Catalog::default()
+        };
+        let mut candidates = vec![gh("rusty-key/spoken-wow", &["Spoken", "Spoken_Quests"])];
+        let stamped = stamp_formerly(
+            &mut candidates,
+            Some(&previous),
+            &Remembered::default(),
+            &curated,
+            &HandPicked::default(),
+        );
+        assert!(candidates[0].addon.formerly.is_empty());
+        assert_eq!(
+            stamped.moved,
+            [
+                "gh:rusty-key/spoken-wow lists Spoken first now, not SpokenQuestsAudio_esES. If they're the same addon, write was = [\"SpokenQuestsAudio_esES\"] under [pins.\"gh:rusty-key/spoken-wow\"] in curated.toml"
+            ],
+            "named, for a person to decide"
+        );
     }
 
     #[test]
@@ -1714,10 +2088,123 @@ mod tests {
         };
         let mut candidates = vec![wowi(1, "New", &["New"]), gh("a/Addon", &["Addon"])];
         let curated = pinned_by_hand("gh:a/addon", "Addon", &["AddonClassic"]);
-        let vouched = stamp_formerly(&mut candidates, Some(&previous), &curated);
+        let stamped = stamp_formerly(
+            &mut candidates,
+            Some(&previous),
+            &Remembered::default(),
+            &curated,
+            &HandPicked::default(),
+        );
         assert_eq!(candidates[0].addon.formerly, ["Old", "Older"]);
         assert_eq!(candidates[1].addon.formerly, ["AddonClassic"]);
-        assert_eq!(vouched, ["wowi:1 was Old", "gh:a/Addon was AddonClassic"]);
+        assert_eq!(
+            stamped,
+            Stamped {
+                vouched: vec![
+                    "wowi:1 was Old".into(),
+                    "gh:a/Addon was AddonClassic".into()
+                ],
+                ..Stamped::default()
+            }
+        );
+    }
+
+    #[test]
+    fn what_an_entry_was_comes_back_after_a_catalog_that_left_it_out() {
+        let mut remembered = Remembered::default();
+        let mut gone = listed_as("wowi:1", &["New"]);
+        gone.formerly = vec!["Old".into()];
+        remembered.note(&Catalog {
+            addons: vec![gone],
+            ..Catalog::default()
+        });
+        let mut candidates = vec![wowi(1, "Newer", &["Newer"])];
+        let stamped = stamp_formerly(
+            &mut candidates,
+            Some(&Catalog::default()),
+            &remembered,
+            &Curated::default(),
+            &HandPicked::default(),
+        );
+        assert_eq!(candidates[0].addon.formerly, ["New", "Old"]);
+        assert_eq!(
+            stamped.vouched,
+            ["wowi:1 was New"],
+            "Old was vouched for already"
+        );
+    }
+
+    #[test]
+    fn a_vouch_goes_only_for_a_hand_picked_entry_or_one_listed_with_the_folder() {
+        let renamed = wowi(1, "New Name", &["NewName"]);
+        let previous = Catalog {
+            addons: vec![
+                listed_as("wowi:1", &["Questie"]),
+                listed_as("gh:b/Pins", &["Pins", "Questie"]),
+            ],
+            ..Catalog::default()
+        };
+        let stamp = |others: Vec<Candidate>, picks: &HandPicked| {
+            let mut candidates = vec![renamed.clone()];
+            candidates.extend(others);
+            let stamped = stamp_formerly(
+                &mut candidates,
+                Some(&previous),
+                &Remembered::default(),
+                &Curated::default(),
+                picks,
+            );
+            (candidates[0].addon.formerly.clone(), stamped.unvouched)
+        };
+        // Something hand-picked shipping it, or an entry listed with it before, wins it.
+        let (formerly, unvouched) = stamp(
+            vec![gh("questie/questie", &["Questie"])],
+            &picks(&["questie/questie"]),
+        );
+        assert!(formerly.is_empty());
+        assert_eq!(
+            unvouched,
+            ["wowi:1 no longer vouches for Questie, which gh:questie/questie ships"]
+        );
+        let (formerly, _) = stamp(vec![gh("b/Pins", &["Pins", "Questie"])], &picks(&[]));
+        assert!(formerly.is_empty());
+
+        // Anything else the collision pass held, so it's never there to strip the vouch.
+        let (formerly, unvouched) = stamp(vec![gh("zebra/New", &["Questie"])], &picks(&[]));
+        assert_eq!(formerly, ["Questie"]);
+        assert!(unvouched.is_empty());
+    }
+
+    #[test]
+    fn a_folder_another_entry_is_vouched_for_holds_a_newcomer_but_not_what_had_it() {
+        let previous = published(&[
+            (&wowi(7032, "TomTom", &["TomTom"]), 0),
+            (&gh("old/MapPins", &["MapPins", "TomTom"]), 0),
+        ]);
+        let list = vec![
+            wowi(7032, "TomTom", &["TomTomForever"]),
+            gh("old/MapPins", &["MapPins", "TomTom"]),
+            gh("zebra/Waypoints", &["Waypoints", "tomtom"]),
+        ];
+        let (kept, held) = pass(list, &picks(&[]), Some(&previous));
+        assert_eq!(held_ids(&held), ["gh:zebra/Waypoints"]);
+        assert_eq!(
+            held[0].reason,
+            "its folder tomtom was wowi:7032's main folder"
+        );
+        assert_eq!(ids(&kept), ["gh:old/MapPins", "wowi:7032"]);
+    }
+
+    #[test]
+    fn a_name_ending_in_a_parenthetical_claims_the_name_without_it_too() {
+        assert_eq!(
+            without_parenthetical("Spoken Audio: Quests (English)"),
+            Some("Spoken Audio: Quests")
+        );
+        assert_eq!(without_parenthetical("Prat (3.0) Extras"), None);
+        assert_eq!(without_parenthetical("(English)"), None);
+        assert_eq!(without_parenthetical("Spoken Audio"), None);
+        assert_eq!(without_parenthetical("A (b) (c)"), Some("A (b)"));
     }
 
     fn trust(

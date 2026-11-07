@@ -59,8 +59,9 @@ pub struct Curated {
     /// else merges a listing, whatever a repository's own files claim.
     #[serde(default)]
     pub merges: BTreeMap<String, String>,
-    /// Which addon a GitHub entry is, by id, written down where the last catalog can't be
-    /// trusted to say: a rename, or another addon of the repository already in its place.
+    /// Which addon an entry is and what it was, by id, written down where the last catalog
+    /// can't be trusted to say: a rename, another addon of the repository already in its place,
+    /// or a former main folder the catalog lost or never vouched for.
     #[serde(default)]
     pub pins: BTreeMap<String, PinSpec>,
     /// Repositories that publish several addons, each under its own tag prefix.
@@ -104,15 +105,18 @@ pub struct PackSpec {
     pub met_by: Vec<String>,
 }
 
-/// Which addon one GitHub entry is, as `[pins."<id>"]`. See "One product per entry" in
+/// Which addon an entry is and what it was, as `[pins."<id>"]`. See "One product per entry" in
 /// `docs/DESIGN.md`.
 #[derive(Debug, Default, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PinSpec {
     /// The folder that identifies the entry's addon. A new build only counts if it ships it.
-    pub main: String,
+    /// Only a repository's own GitHub entry outside `[[split]]` takes one: every other source
+    /// already says which addon an entry is.
+    #[serde(default)]
+    pub main: Option<String>,
     /// Main folders the addon really had before. Copies installed under one of them still
-    /// get its updates, because they go into its `formerly`.
+    /// get its updates, because they go into its `formerly`. Any entry takes these.
     #[serde(default)]
     pub was: Vec<String>,
 }
@@ -186,6 +190,24 @@ fn looks_like_id(id: &str) -> bool {
 /// `gh:owner/repo`: a repository's own entry, not one of its release lines.
 fn is_repo_id(id: &str) -> bool {
     repo_of_id(id).is_some_and(|repo| valid_repo_name(repo) && id.len() == "gh:".len() + repo.len())
+}
+
+/// A release line's id, `gh:owner/repo/<line>`. Only `[[split]]` makes these, and a line only
+/// ever holds its own tag prefix's builds, so it's one addon.
+pub fn is_line_id(id: &str) -> bool {
+    is_github_id(id) && !is_repo_id(id)
+}
+
+/// An id a `[pins]` entry can be for: `gh:owner/repo`, `gh:owner/repo/<line>`, `wowi:1234` or
+/// `direct:name`.
+fn is_pinnable_id(id: &str) -> bool {
+    let listing = id
+        .strip_prefix("wowi:")
+        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+    let direct = id
+        .strip_prefix("direct:")
+        .is_some_and(|name| !name.trim().is_empty());
+    is_github_id(id) || listing || direct
 }
 
 /// The id of a GitHub entry: a repository's own, or one of its release lines'.
@@ -319,6 +341,11 @@ impl Curated {
             .iter()
             .find(|(pinned, _)| pinned.eq_ignore_ascii_case(id))
             .map(|(_, pin)| pin)
+    }
+
+    /// The main folder `[pins]` gives this entry, when it gives one.
+    pub fn main_pin_of(&self, id: &str) -> Option<&str> {
+        self.pin_of(id)?.main.as_deref()
     }
 
     /// A split repository that isn't seeded, which nothing promises to read on every run.
@@ -456,21 +483,15 @@ impl Curated {
     fn pins_mistake(&self) -> Option<String> {
         let mut pinned = BTreeSet::new();
         for (id, pin) in &self.pins {
-            if !is_github_id(id) {
-                return Some(format!("pins: {id} isn't a GitHub entry's id"));
+            if !is_pinnable_id(id) {
+                return Some(format!("pins: {id} isn't a catalog id"));
             }
-            if !is_repo_id(id) {
-                return Some(format!(
-                    "pins: {id} is a release line, and its tag prefix already says which addon it is"
-                ));
-            }
-            if repo_of_id(id)
-                .and_then(|repo| self.split_of(repo))
-                .is_some()
-            {
-                return Some(format!(
-                    "pins: {id} is in [[split]], whose tag prefixes already say which addon each entry is"
-                ));
+            if pin.main.is_some() {
+                if let Some(problem) = self.main_mistake(id) {
+                    return Some(format!("pins: {id} {problem}, so it takes only was"));
+                }
+            } else if pin.was.is_empty() {
+                return Some(format!("pins for {id}: it names neither main nor was"));
             }
             if !pinned.insert(id.to_ascii_lowercase()) {
                 return Some(format!("pins: {id} is pinned twice"));
@@ -481,12 +502,26 @@ impl Curated {
         }
         None
     }
+
+    /// Why this entry can't be given a `main` folder in `[pins]`, if it can't.
+    fn main_mistake(&self, id: &str) -> Option<&'static str> {
+        if !is_github_id(id) {
+            return Some("isn't a GitHub entry, whose source already says which addon it is");
+        }
+        if !is_repo_id(id) {
+            return Some("is a release line, and its tag prefix already says which addon it is");
+        }
+        repo_of_id(id)
+            .and_then(|repo| self.split_of(repo))
+            .map(|_| "is in [[split]], whose tag prefixes already say which addon each entry is")
+    }
 }
 
 /// What's wrong with one `[pins]` entry's folders, if anything.
 fn pin_mistake(pin: &PinSpec) -> Option<String> {
-    let main = &pin.main;
-    if let Some(folder) = std::iter::once(main)
+    if let Some(folder) = pin
+        .main
+        .iter()
         .chain(&pin.was)
         .find(|folder| !is_safe_folder(folder))
     {
@@ -499,7 +534,11 @@ fn pin_mistake(pin: &PinSpec) -> Option<String> {
     }
     let mut seen = BTreeSet::new();
     for folder in &pin.was {
-        if folder.eq_ignore_ascii_case(main) {
+        if pin
+            .main
+            .as_ref()
+            .is_some_and(|main| folder.eq_ignore_ascii_case(main))
+        {
             return Some(format!("was names {folder}, which is its main folder now"));
         }
         if !seen.insert(folder.to_ascii_lowercase()) {
@@ -536,7 +575,7 @@ fn met_by_mistake(met_by: &[String]) -> Option<String> {
 /// Everything a person chose: `seeds.toml`, what `curated.toml` names, and both sides
 /// of an approved merge. Always beats anything found by search. Release lines exist only
 /// because someone wrote them down, so they're always in here. `[pins]` isn't: it only says
-/// which addon an entry is, and vouches for nothing else about it.
+/// which addon an entry is and what it was, and vouches for nothing else about it.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct HandPicked {
     ids: BTreeSet<String>,
@@ -1052,7 +1091,7 @@ pub fn process_direct(
                 known => known,
             };
             let source = HttpRange::new(http, Channel::Direct, &entry.url, Some(size));
-            let scan = scan_zip(RangeReader::new(source, size), &[&spec.name])
+            let scan = scan_zip(RangeReader::new(source, size), &[&spec.name], None)
                 .map_err(|e| e.to_string())?;
             DirectState {
                 version: entry.version.clone(),
@@ -1659,13 +1698,17 @@ mod tests {
             assert!(curated.reserved.contains(&folder.to_string()), "{folder}");
         }
 
-        // Every language, CurseForge's splits and the old single-folder packs meet quest
-        // voices, and the names Spoken still reads meet places and readables.
+        // Every language, CurseForge's splits, the old single-folder packs and the community
+        // packs known today meet quest voices, and the names Spoken still reads meet places and
+        // readables.
         let met_by = |name: &str| {
             let group = curated.packs.iter().find(|g| g.name == name).unwrap();
             group.met_by.clone()
         };
-        assert_eq!(met_by("Quest voices"), ["SpokenQuestsAudio"]);
+        assert_eq!(
+            met_by("Quest voices"),
+            ["SpokenQuestsAudio", "SpokenCommunity_"]
+        );
         assert_eq!(
             met_by("Place voices"),
             ["SpokenPlacesAudio", "SpokenZonesAudio"]
@@ -1687,7 +1730,7 @@ mod tests {
 
         // The data pack that had taken the addon's place.
         let pin = curated.pin_of("gh:jhunthrop/foreversixty").unwrap();
-        assert_eq!(pin.main, "ForeverSixty");
+        assert_eq!(pin.main.as_deref(), Some("ForeverSixty"));
         assert!(pin.was.is_empty());
         for id in curated.pins.keys() {
             assert!(!picks.contains(id), "{id}: a pin picks nothing");
@@ -1715,6 +1758,7 @@ mod tests {
         let pin = |id: &str, main: &str, was: &str| {
             format!("[pins.\"{id}\"]\nmain = \"{main}\"\nwas = [{was}]\n")
         };
+        let was_only = |id: &str, was: &str| format!("[pins.\"{id}\"]\nwas = [{was}]\n");
         let twice = split("a/b", "main", "") + &split("A/B", "other", "");
         let long_name = pack("gh:a/b", &"x".repeat(41), "\"gh:a/c\"");
         let same_group =
@@ -1768,14 +1812,29 @@ mod tests {
             pin("gh:a/b", "B", &many_was.join(", ")),
             pinned_twice,
             split_and_pinned,
-            "[pins.\"gh:a/b\"]\nwas = [\"Old\"]\n".to_string(),
             "[pins.\"gh:a/b\"]\nmain = \"B\"\nfolder = \"C\"\n".to_string(),
+            "[pins.\"wowi:12\"]\n".to_string(),
+            was_only("wowi:12", ""),
+            was_only("wowi:x", "\"Old\""),
+            was_only("nothing", "\"Old\""),
+            was_only("gh:a/b/c/d", "\"Old\""),
+            was_only("direct: ", "\"Old\""),
+            was_only("wowi:12", "\"../evil\""),
+            was_only("wowi:12", &many_was.join(", ")),
         ] {
             std::fs::write(&path, &wrong).unwrap();
             let error = load_curated(&path).unwrap_err();
             assert!(error.contains("mistake"), "{wrong}: {error}");
         }
+        std::fs::write(&path, pin("wowi:12", "B", "\"Old\"")).unwrap();
+        let error = load_curated(&path).unwrap_err();
+        assert!(
+            error.contains("wowi:12 isn't a GitHub entry") && error.contains("only was"),
+            "{error}"
+        );
 
+        // was alone writes a vouch back for any entry, a listing, a direct one, a release line
+        // or a [[split]] repository included.
         let fine = pin("gh:a/c", "C", "\"OldC\"")
             + &split("a/b", "spoken", "\"quests-audio\", \"places2\"")
             + &pack_met_by(
@@ -1783,7 +1842,12 @@ mod tests {
                 "Quest voices",
                 "\"gh:a/b/quests-audio\"",
                 "\"SpokenQuestsAudio\"",
-            );
+            )
+            + &was_only("wowi:12", "\"OldListing\"")
+            + &was_only("direct:x", "\"OldDirect\"")
+            + &was_only("gh:a/b/quests-audio", "\"SpokenQuestsAudioOld\"")
+            + &was_only("gh:a/b", "\"SpokenPlayer\"")
+            + &was_only("gh:a/d", "\"OldD\"");
         std::fs::write(&path, &fine).unwrap();
         let curated = load_curated(&path).unwrap();
         assert_eq!(
@@ -1794,10 +1858,24 @@ mod tests {
         assert_eq!(curated.packs[0].met_by, ["SpokenQuestsAudio"]);
         let pinned = curated.pin_of("GH:A/C").unwrap();
         assert_eq!(
-            (pinned.main.as_str(), &pinned.was[..]),
-            ("C", &["OldC".to_string()][..])
+            (pinned.main.as_deref(), &pinned.was[..]),
+            (Some("C"), &["OldC".to_string()][..])
         );
-        assert!(curated.pin_of("gh:a/b").is_none());
+        let listing = curated.pin_of("WOWI:12").unwrap();
+        assert_eq!(
+            (listing.main.as_deref(), &listing.was[..]),
+            (None, &["OldListing".to_string()][..])
+        );
+        assert_eq!(curated.main_pin_of("gh:a/c"), Some("C"));
+        for id in [
+            "wowi:12",
+            "gh:a/b",
+            "gh:a/b/quests-audio",
+            "gh:a/d",
+            "gh:a/e",
+        ] {
+            assert_eq!(curated.main_pin_of(id), None, "{id}");
+        }
     }
 
     #[test]
@@ -1878,7 +1956,7 @@ mod tests {
             pins: BTreeMap::from([(
                 "gh:fifth/renamed".to_string(),
                 PinSpec {
-                    main: "Renamed".into(),
+                    main: Some("Renamed".into()),
                     was: vec!["Old".into()],
                 },
             )]),

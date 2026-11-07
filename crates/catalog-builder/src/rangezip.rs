@@ -379,7 +379,7 @@ mod tests {
             },
             size,
         );
-        let scan = scan_zip(&mut reader, &["Big"]).unwrap();
+        let scan = scan_zip(&mut reader, &["Big"], None).unwrap();
         assert_eq!(scan.folders, ["Big", "Other"]);
         assert!(scan.forever);
         assert_eq!(scan.title.as_deref(), Some("Big"));
@@ -406,7 +406,7 @@ mod tests {
             },
             size,
         );
-        scan_zip(&mut reader, &["Big"]).unwrap();
+        scan_zip(&mut reader, &["Big"], None).unwrap();
         for &(start, end) in &reader.source.calls {
             assert!(start <= end, "{start}-{end}");
             assert!(end < size, "{end} is past the end of {size}");
@@ -424,7 +424,7 @@ mod tests {
         let data = big_zip(1000);
         let size = data.len() as u64;
         let mut reader = RangeReader::new(Ignores(data), size);
-        let scan = scan_zip(&mut reader, &["Big"]).unwrap();
+        let scan = scan_zip(&mut reader, &["Big"], None).unwrap();
         assert_eq!(scan.folders, ["Big", "Other"]);
         assert_eq!(reader.requests(), 1);
     }
@@ -466,7 +466,7 @@ mod tests {
             }
         }
         let reader = RangeReader::new(Down, 1_000_000);
-        assert!(scan_zip(reader, &["x"]).is_err());
+        assert!(scan_zip(reader, &["x"], None).is_err());
     }
 
     #[test]

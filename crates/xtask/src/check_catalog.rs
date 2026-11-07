@@ -7,6 +7,7 @@ use std::path::Path;
 use std::sync::atomic::AtomicBool;
 
 use feeling_core::catalog::{Addon, CATEGORIES, Catalog, Channel, PackGroup, Source};
+use feeling_core::deps::BIGGEST_UNASKED_DOWNLOAD;
 use feeling_core::install::{self, InstallRequest, Layout};
 use feeling_core::net::{self, Http};
 use feeling_core::scan;
@@ -124,7 +125,38 @@ fn static_problems(catalog: &Catalog) -> Vec<String> {
         }
     }
     problems.extend(formerly_shipped_elsewhere(catalog));
+    problems.extend(big_packs_reviewed(catalog));
     problems
+}
+
+/// Apps up to 0.1.2 install any reviewed entry another addon requires by themselves, whatever
+/// its size, so a pack over 100 MB, any id some entry's pack groups name, is never reviewed.
+fn big_packs_reviewed(catalog: &Catalog) -> Vec<String> {
+    let packs: BTreeSet<String> = catalog
+        .addons
+        .iter()
+        .flat_map(|addon| addon.packs.iter())
+        .flat_map(|group| group.ids.iter())
+        .map(|id| id.to_ascii_lowercase())
+        .collect();
+    catalog
+        .addons
+        .iter()
+        .filter(|addon| addon.reviewed && packs.contains(&addon.id.to_ascii_lowercase()))
+        .filter_map(|addon| {
+            let size = [&addon.stable, &addon.beta]
+                .into_iter()
+                .flatten()
+                .map(|release| release.size)
+                .max()?;
+            (size > BIGGEST_UNASKED_DOWNLOAD).then(|| {
+                format!(
+                    "{} is a pack of {size} bytes and reviewed, so apps up to 0.1.2 would install it by themselves",
+                    addon.id
+                )
+            })
+        })
+        .collect()
 }
 
 /// A former main folder vouches that an installed copy with it is this addon, so it can never
@@ -604,6 +636,44 @@ mod tests {
                 spoken.packs[0].met_by
             );
         }
+    }
+
+    #[test]
+    fn a_pack_over_100_mb_is_never_reviewed() {
+        let pack_of = |size: u64, reviewed: bool| {
+            let mut quests = entry("gh:rusty-key/spoken-wow/quests-audio", SPOKEN);
+            quests.folders = vec!["SpokenQuestsAudioAlliance".into()];
+            quests.stable.as_mut().unwrap().size = size;
+            quests.trusted = true;
+            quests.reviewed = reviewed;
+            quests
+        };
+        let mut spoken = entry("gh:rusty-key/spoken-wow", SPOKEN);
+        spoken.reviewed = true;
+        spoken.stable.as_mut().unwrap().size = 150_000_000;
+        spoken.packs = vec![PackGroup {
+            name: "Quest voices".into(),
+            needed: true,
+            ids: vec!["gh:rusty-key/spoken-wow/quests-audio".into()],
+            met_by: vec!["SpokenQuestsAudio".into()],
+        }];
+        let check = |pack: Addon| static_problems(&catalog(vec![spoken.clone(), pack]));
+        let problems = check(pack_of(1_479_966_451, true));
+        assert_eq!(
+            problems,
+            [
+                "gh:rusty-key/spoken-wow/quests-audio is a pack of 1479966451 bytes and reviewed, so apps up to 0.1.2 would install it by themselves"
+            ]
+        );
+        assert!(check(pack_of(1_479_966_451, false)).is_empty());
+        assert!(
+            check(pack_of(BIGGEST_UNASKED_DOWNLOAD, true)).is_empty(),
+            "100 MB is fine"
+        );
+        let mut beta = pack_of(10, true);
+        beta.beta = beta.stable.clone();
+        beta.beta.as_mut().unwrap().size = 157_070_901;
+        assert_eq!(check(beta).len(), 1, "a big beta counts too");
     }
 
     #[test]

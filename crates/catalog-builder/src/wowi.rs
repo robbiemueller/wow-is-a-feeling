@@ -276,7 +276,8 @@ pub fn examine(row: &Row, probe: &mut dyn WowiProbe) -> Result<Option<Candidate>
         return Err("WoWInterface sent a web page instead of the zip, usually because this version is waiting for approval".to_string());
     }
     let size = bytes.len() as u64;
-    let scan = scan_zip(Cursor::new(&bytes), &[&row.name]).map_err(|e| e.to_string())?;
+    // A listing holds one addon, so it's never pinned: its main folder can move with a rename.
+    let scan = scan_zip(Cursor::new(&bytes), &[&row.name], None).map_err(|e| e.to_string())?;
     if !scan.forever || scan.folders.is_empty() {
         return Ok(None);
     }
@@ -284,7 +285,7 @@ pub fn examine(row: &Row, probe: &mut dyn WowiProbe) -> Result<Option<Candidate>
     // The zip's own name can identify the main folder when the listing name doesn't.
     let scan = match file_name.as_deref().map(zip_stem) {
         Some(stem) => {
-            scan_zip(Cursor::new(&bytes), &[&row.name, &stem]).map_err(|e| e.to_string())?
+            scan_zip(Cursor::new(&bytes), &[&row.name, &stem], None).map_err(|e| e.to_string())?
         }
         None => scan,
     };

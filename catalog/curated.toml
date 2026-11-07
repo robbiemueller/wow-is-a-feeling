@@ -5,7 +5,7 @@
 #
 # Everything named in this file or in seeds.toml counts as hand-picked: it always keeps
 # its name and folders against anything found by search, and the app may pick it by itself.
-# [pins] is the one exception, since it only says which addon an entry is.
+# [pins] is the one exception, since it only says which addon an entry is and what it was.
 
 # Shown first, in this order. Roughly what a new player sets up first.
 featured = [
@@ -234,14 +234,19 @@ author = "ForeverDB"
 website = "https://foreverdb.net"
 changes_often = true
 
-# Which addon a GitHub entry is. Every GitHub entry is pinned to its addon's main folder: a
-# new build that doesn't ship it is taken for another addon from the same repository, such
-# as a module or a data pack, and passed over. The folder is the one written here, or else
-# the one the last catalog listed the entry with. The build summary names every entry that
-# passed over a newer release, so look there for a rename or an entry listing the wrong addon.
-# main is the folder that identifies the addon. was lists main folders it really had before,
-# up to 8: installed copies still under one of them keep getting its updates. Entries of a
-# [[split]] repository below aren't pinned, because their tag prefixes already decide.
+# Which addon an entry is, and what it was. Every GitHub entry is pinned to its addon's main
+# folder: a new build that doesn't ship it is taken for another addon from the same
+# repository, such as a module or a data pack, and passed over, and a build that ships it
+# lists it first. The folder is the one written here, or else the one the entry was last
+# published with. The build summary names every entry that passed over a newer release, so
+# look there for a rename or an entry listing the wrong addon.
+# main is the folder that identifies the addon, for a repository's own GitHub entry only:
+# WoWInterface and direct entries hold one addon each, and the entries of a [[split]]
+# repository below go by their tag prefixes. was lists main folders the addon really had
+# before, up to 8, and works for any entry, alone too: installed copies still under one of
+# them keep getting its updates. A GitHub repository can hold several addons, so a main
+# folder that moves there is never vouched for by itself. The summary names one that moved,
+# and a was written here vouches for it, or writes back one the catalog lost.
 #
 # foreversixty's nightly data pack, ForeverSixtyData, had taken the addon's place.
 [pins."gh:jhunthrop/foreversixty"]
@@ -267,12 +272,17 @@ lines = ["quests-audio", "places-audio", "readables-audio", "bosses-audio"]
 # name prefixes that meet it too, for packs the catalog doesn't list, such as other
 # languages or ones another tool installed, so nobody is told their own voices are missing.
 # The app shows them on the addon's page and asks before installing any. Naming an id here
-# hand-picks it.
+# hand-picks it. A pack over 100 MB, as each of Spoken's is, goes out trusted but not
+# reviewed, so an older app never installs one by itself as another addon's dependency.
 #
 # Spoken's packs, from what Spoken itself loads. SpokenQuestsAudio starts every official
 # quest pack: each language's, CurseForge's Alliance, Horde, Shared and Gossip splits, and
-# the older single-folder ones such as SpokenQuestsAudio_deDE. Community packs are all named
-# SpokenCommunity_<id> whatever they voice, so that prefix can't stand for quest voices.
+# the older single-folder ones such as SpokenQuestsAudio_deDE. Community packs are named
+# SpokenCommunity_<id>, and the ones known today are quest packs:
+# gh:renanbazinin/spoken-ivrit's SpokenCommunity_ivrit and zaxcer/spoken-polish's
+# SpokenCommunity_polski. Spoken lets a community pack be quests, zones or books, so a zones
+# or books one would read as meeting quest voices too, and Spoken's own message in the game
+# still tells that player.
 # SpokenZonesAudio and SpokenBooksAudio are the older Places and Readables packs, which
 # Spoken still reads.
 [[packs]]
@@ -280,7 +290,7 @@ addon = "gh:rusty-key/spoken-wow"
 name = "Quest voices"
 needed = true
 ids = ["gh:rusty-key/spoken-wow/quests-audio"]
-met_by = ["SpokenQuestsAudio"]
+met_by = ["SpokenQuestsAudio", "SpokenCommunity_"]
 
 [[packs]]
 addon = "gh:rusty-key/spoken-wow"
@@ -368,7 +378,9 @@ category = "misc"
 
 # Spoken's voice packs, from [[split]]. The quests pack's own title names only its Alliance
 # folder, though it holds the Horde, shared and gossip ones too. Each name says its
-# language, because Spoken has packs in several and these are the English ones.
+# language, because Spoken has packs in several and these are the English ones. A name
+# ending in a parenthetical claims the name without it too, so nobody else can list as
+# "Spoken Audio: Quests".
 [overrides."gh:rusty-key/spoken-wow/quests-audio"]
 name = "Spoken Audio: Quests (English)"
 summary = "English voices for Spoken: quest dialogue and gossip, for Alliance, Horde and both."

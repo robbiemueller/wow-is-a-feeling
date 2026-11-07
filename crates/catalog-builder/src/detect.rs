@@ -20,6 +20,10 @@ const MAX_NEGATIVE_READS: u32 = 4;
 /// Zips opened per release when nothing in the names helps. A real release can have
 /// several zips with the game in their name, such as a game client beside the addon.
 const MAX_ZIPS_PER_RELEASE: usize = 5;
+/// Zips opened per release in all while every one read is another addon's. A release of
+/// several addons can put the pinned one's own zip behind bigger ones, so reading goes on past
+/// the usual few, but a release of a hundred zips can't cost a hundred reads.
+const MAX_ZIPS_PASSED_OVER: usize = 20;
 /// A newer release this far past the Forever one means support really was dropped,
 /// rather than the author publishing per-flavor releases in close succession.
 const DROPPED_AFTER_SECS: i64 = 45 * 24 * 60 * 60;
@@ -44,7 +48,13 @@ pub struct GhRelease {
 /// Network access for detection. A trait so the logic can be tested with fakes.
 pub trait Probe {
     fn release_json(&mut self, asset: &GhAsset) -> Result<String, String>;
-    fn read_zip(&mut self, asset: &GhAsset, hints: &[&str]) -> Result<ZipScan, String>;
+    /// `pin` is the folder the entry is pinned to, which the scan lists first when the zip has it.
+    fn read_zip(
+        &mut self,
+        asset: &GhAsset,
+        hints: &[&str],
+        pin: Option<&str>,
+    ) -> Result<ZipScan, String>;
 }
 
 /// Cached outcome for one release. `sig` covers its assets, so replacing a file invalidates it.
@@ -62,13 +72,22 @@ pub struct ReleaseVerdict {
     /// it is another addon's. Read for any other addon, the same zips could be its build.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skipped_for: Option<String>,
+    /// Zips of a release taken for another addon's that were never read, because reading
+    /// stopped first. It isn't read again for them until its files or the pin change.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub unread: u32,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 impl ReleaseVerdict {
-    /// Whether this verdict still answers for an entry pinned to `pin`.
+    /// Whether this verdict still answers for an entry pinned to `pin`. A build read before the
+    /// scan put the pinned folder first is read again once, so the entry keeps its main folder.
     fn fits(&self, pin: Option<&str>) -> bool {
         match (&self.scan, &self.skipped_for) {
-            (Some(scan), _) => ships(&scan.folders, pin),
+            (Some(scan), _) => leads(&scan.folders, pin),
             (None, Some(wanted)) => pin.is_some_and(|pin| pin.eq_ignore_ascii_case(wanted)),
             (None, None) => true,
         }
@@ -84,6 +103,27 @@ pub fn ships(folders: &[String], pin: Option<&str>) -> bool {
             .iter()
             .any(|folder| folder.eq_ignore_ascii_case(main))
     })
+}
+
+/// Whether a build lists the pinned folder first, compared ignoring case, as every build of the
+/// pinned addon does. With no pin, any build does.
+pub fn leads(folders: &[String], pin: Option<&str>) -> bool {
+    pin.is_none_or(|main| {
+        folders
+            .first()
+            .is_some_and(|first| first.eq_ignore_ascii_case(main))
+    })
+}
+
+/// Moves the pinned folder to the front, keeping the others in order. A build that ships it
+/// is that addon, so it's the main folder whatever else the build holds.
+pub fn lead_with(folders: &mut [String], pin: &str) {
+    if let Some(at) = folders
+        .iter()
+        .position(|folder| folder.eq_ignore_ascii_case(pin))
+    {
+        folders[..=at].rotate_right(1);
+    }
 }
 
 /// A release with a Forever build.
@@ -105,6 +145,8 @@ pub struct Chosen {
     /// The newest release passed over because its Forever build is another addon's, when it's
     /// newer than every build chosen.
     pub skipped: Option<String>,
+    /// Releases passed over as another addon's with zips left unread, and how many.
+    pub left_unread: Vec<(String, u32)>,
 }
 
 /// What `release.json` says about a release.
@@ -264,6 +306,9 @@ pub fn assets_signature(assets: &[GhAsset]) -> String {
 /// Decide whether one release has a Forever build, and read its TOCs if so. With a `pin`,
 /// only a build that still ships that main folder counts: one release can hold several
 /// addons' zips, and another addon's is passed over, never counted against the release.
+/// While every zip read is another addon's, reading goes on past the usual few, up to
+/// [`MAX_ZIPS_PASSED_OVER`]. A release with no build of the pinned addon in what was read is
+/// settled as another addon's, with a count of the zips left unread, so it isn't read every run.
 /// `Err` means something failed along the way, and nothing should be cached.
 pub fn classify_release(
     release: &GhRelease,
@@ -323,7 +368,7 @@ pub fn classify_release(
     named.sort_by_key(best_first);
     let release_is_flavored = flavor_of(&release.tag) == Flavor::Other;
     let mut unlabeled: Vec<&GhAsset> = Vec::new();
-    if allow_toc_reads && !release_is_flavored {
+    if !release_is_flavored {
         unlabeled = zips
             .iter()
             .copied()
@@ -331,25 +376,35 @@ pub fn classify_release(
             .collect();
         unlabeled.sort_by_key(best_first);
     }
-    let past_the_caps: Vec<&str> = named
-        .iter()
-        .skip(MAX_ZIPS_PER_RELEASE)
-        .chain(unlabeled.iter().skip(MAX_ZIPS_PER_RELEASE))
-        .map(|a| a.name.as_str())
-        .collect();
+    // After a few releases with no Forever build at all, a zip's name has to say Forever before
+    // it's read, unless every zip read so far is another addon's.
+    let unlabeled_first = if allow_toc_reads {
+        MAX_ZIPS_PER_RELEASE
+    } else {
+        0
+    };
     queue.extend(named.iter().take(MAX_ZIPS_PER_RELEASE));
-    queue.extend(unlabeled.iter().take(MAX_ZIPS_PER_RELEASE));
+    queue.extend(unlabeled.iter().take(unlabeled_first));
+    let first = queue.len();
+    queue.extend(named.iter().skip(MAX_ZIPS_PER_RELEASE));
+    queue.extend(unlabeled.iter().skip(unlabeled_first));
 
     let mut seen: Vec<&str> = Vec::new();
     let mut read_something = false;
     let mut passed_over = false;
-    for asset in queue {
+    for (at, asset) in queue.iter().enumerate() {
         if seen.contains(&asset.name.as_str()) {
             continue;
         }
+        // Past the usual few, only while every zip read was another addon's: the pinned addon's
+        // own can be behind them, but a release of junk shouldn't cost more reads.
+        let all_passed_over = passed_over && !read_something;
+        if at >= first && (!all_passed_over || seen.len() >= MAX_ZIPS_PASSED_OVER) {
+            break;
+        }
         seen.push(&asset.name);
         let stem = zip_stem(&asset.name);
-        let scan = probe.read_zip(asset, &[repo_name, &stem])?;
+        let scan = probe.read_zip(asset, &[repo_name, &stem], pin)?;
         if !scan.forever || scan.folders.is_empty() {
             read_something = true;
         } else if ships(&scan.folders, pin) {
@@ -361,19 +416,18 @@ pub fn classify_release(
         }
     }
     if passed_over {
-        // While zips are left unread, the pinned addon's own could be one of them, and caching
-        // the release as another addon's would keep it from ever being read.
-        let unread = past_the_caps
-            .iter()
-            .filter(|name| !seen.contains(name))
-            .count();
-        if unread > 0 {
-            return Err(format!(
-                "every zip read is another addon's, and {unread} more weren't read, so it's tried again next run"
-            ));
-        }
         // Another addon's release, which says nothing about whether this one still has Forever.
+        // It's settled even with zips left unread, so it isn't read on every run. The summary
+        // names it, in case the pinned addon's own zip is one of those.
+        let mut unread: Vec<&str> = queue
+            .iter()
+            .map(|asset| asset.name.as_str())
+            .filter(|name| !seen.contains(name))
+            .collect();
+        unread.sort_unstable();
+        unread.dedup();
         verdict.skipped_for = pin.map(str::to_string);
+        verdict.unread = u32::try_from(unread.len()).unwrap_or(u32::MAX);
         return Ok(verdict);
     }
     verdict.confirmed_negative = read_something || (meta.lists_mainline && !release_is_flavored);
@@ -383,9 +437,9 @@ pub fn classify_release(
 /// Look through a repository's releases, newest first, for its newest stable
 /// Forever build and any pre-release newer than that. `cache` holds verdicts by
 /// tag: hits cost nothing, and tags that are gone get pruned.
-/// `pin` is the main folder the last catalog listed the entry with, when it did: a build
-/// that no longer ships it is another addon, and its release is passed over, stable or not.
-/// `out_of_time` stops new network work, leaving the rest to the next run.
+/// `pin` is the entry's main folder, when it has one: a build that no longer ships it is
+/// another addon, and its release is passed over, stable or not. A build that ships it lists
+/// it first. `out_of_time` stops new network work, leaving the rest to the next run.
 pub fn choose_builds(
     repo_name: &str,
     releases: &[GhRelease],
@@ -433,6 +487,11 @@ pub fn choose_builds(
             // look, so only a beta can have come first.
             if chosen.beta.is_none() {
                 chosen.skipped.get_or_insert_with(|| release.tag.clone());
+            }
+            if verdict.unread > 0 {
+                chosen
+                    .left_unread
+                    .push((release.tag.clone(), verdict.unread));
             }
             continue;
         }
@@ -495,12 +554,23 @@ mod tests {
                 .cloned()
                 .unwrap_or(Err("no such file".into()))
         }
-        fn read_zip(&mut self, asset: &GhAsset, _: &[&str]) -> Result<ZipScan, String> {
+        fn read_zip(
+            &mut self,
+            asset: &GhAsset,
+            _: &[&str],
+            pin: Option<&str>,
+        ) -> Result<ZipScan, String> {
             self.zip_reads.push(asset.name.clone());
-            self.zips
+            let mut scan = self
+                .zips
                 .get(&asset.name)
                 .cloned()
-                .unwrap_or(Err("no such zip".into()))
+                .unwrap_or(Err("no such zip".into()))?;
+            // As the real scan does: the pinned folder first whenever the zip has it.
+            if let Some(pin) = pin {
+                lead_with(&mut scan.folders, pin);
+            }
+            Ok(scan)
         }
     }
 
@@ -1089,36 +1159,170 @@ mod tests {
         assert_eq!(fake_unpinned.zip_reads, ["MainVoices0-1.0.zip"]);
     }
 
-    #[test]
-    fn a_release_isnt_settled_as_another_addons_while_zips_are_left_unread() {
-        let mut fake = Fake::default();
-        let mut names = Vec::new();
-        for at in 0..=MAX_ZIPS_PER_RELEASE {
-            let name = format!("Part{at}.zip");
+    /// A release of `count` zips named `Part<n>.zip`, each another addon's, the first biggest.
+    fn other_addons_parts(fake: &mut Fake, count: usize) -> GhRelease {
+        let names: Vec<String> = (0..count).map(|at| format!("Part{at}.zip")).collect();
+        for (at, name) in names.iter().enumerate() {
             fake.zips
                 .insert(name.clone(), Ok(forever_scan(&format!("Part{at}"))));
-            names.push(name);
         }
         let borrowed: Vec<&str> = names.iter().map(String::as_str).collect();
-        let releases = [release("v1", 1, &borrowed)];
-        let mut cache = BTreeMap::new();
+        let mut release = release("v1", 1, &borrowed);
+        for (at, asset) in release.assets.iter_mut().enumerate() {
+            asset.size = 10_000 - u64::try_from(at).unwrap();
+        }
+        release
+    }
 
+    #[test]
+    fn while_every_zip_read_is_another_addons_reading_goes_on_past_the_usual_few() {
+        // The pinned addon's own zip is the smallest of seven, and named like none of it.
+        let mut fake = Fake::default();
+        let mut releases = [other_addons_parts(&mut fake, MAX_ZIPS_PER_RELEASE + 1)];
+        fake.zips
+            .insert("Extras.zip".into(), Ok(forever_scan("Main")));
+        releases[0].assets.push(asset("Extras.zip"));
+        let mut cache = BTreeMap::new();
+        let chosen = pinned(&mut fake, &releases, &mut cache, "Main");
+        assert_eq!(chosen.stable.unwrap().asset.name, "Extras.zip");
+        assert_eq!(fake.zip_reads.len(), MAX_ZIPS_PER_RELEASE + 2);
+        assert!(chosen.errors.is_empty());
+
+        // With none of them the addon's, the release is settled for good, all of it read.
+        let mut fake = Fake::default();
+        let releases = [other_addons_parts(&mut fake, MAX_ZIPS_PER_RELEASE + 1)];
+        let mut cache = BTreeMap::new();
+        let chosen = pinned(&mut fake, &releases, &mut cache, "Main");
+        assert_eq!(fake.zip_reads.len(), MAX_ZIPS_PER_RELEASE + 1);
+        assert!(chosen.errors.is_empty());
+        assert_eq!(chosen.skipped.as_deref(), Some("v1"));
+        assert_eq!(cache["v1"].skipped_for.as_deref(), Some("Main"));
+        assert_eq!(cache["v1"].unread, 0);
+        assert!(chosen.left_unread.is_empty());
+        pinned(&mut fake, &releases, &mut cache, "Main");
+        assert_eq!(
+            fake.zip_reads.len(),
+            MAX_ZIPS_PER_RELEASE + 1,
+            "and not read again"
+        );
+    }
+
+    #[test]
+    fn a_release_of_many_other_addons_zips_stops_at_twenty_and_is_still_settled() {
+        let mut fake = Fake::default();
+        let releases = [other_addons_parts(&mut fake, MAX_ZIPS_PASSED_OVER + 5)];
+        let mut cache = BTreeMap::new();
+        let chosen = pinned(&mut fake, &releases, &mut cache, "Main");
+        assert_eq!(fake.zip_reads.len(), MAX_ZIPS_PASSED_OVER);
+        assert!(chosen.errors.is_empty(), "{:?}", chosen.errors);
+        assert_eq!(cache["v1"].skipped_for.as_deref(), Some("Main"));
+        assert_eq!(cache["v1"].unread, 5);
+        assert_eq!(chosen.left_unread, [("v1".to_string(), 5)]);
+
+        // The next run reads nothing, and still says what was left unread.
+        let chosen = pinned(&mut fake, &releases, &mut cache, "Main");
+        assert_eq!(fake.zip_reads.len(), MAX_ZIPS_PASSED_OVER);
+        assert_eq!(chosen.left_unread, [("v1".to_string(), 5)]);
+
+        // A new pin, or new files, gets it read again.
+        pinned(&mut fake, &releases, &mut cache, "Other");
+        assert_eq!(fake.zip_reads.len(), 2 * MAX_ZIPS_PASSED_OVER);
+    }
+
+    #[test]
+    fn reading_on_stops_once_a_zip_read_isnt_another_addons_build() {
+        // A zip with nothing for Forever among the first few: the release isn't all other
+        // addons' zips, so the usual few is all it gets, and the rest are counted as unread.
+        let mut fake = Fake::default();
+        let releases = [other_addons_parts(&mut fake, MAX_ZIPS_PER_RELEASE + 2)];
+        fake.zips
+            .insert("Part1.zip".into(), Ok(other_scan("Retail")));
+        let mut cache = BTreeMap::new();
         let chosen = pinned(&mut fake, &releases, &mut cache, "Main");
         assert_eq!(fake.zip_reads.len(), MAX_ZIPS_PER_RELEASE);
-        assert!(cache.is_empty(), "not cached as another addon's");
-        assert_eq!(chosen.skipped, None);
-        assert_eq!(chosen.errors.len(), 1);
-        assert!(
-            chosen.errors[0].contains("1 more weren't read"),
-            "{:?}",
-            chosen.errors
-        );
-
-        // Every zip read and none of them the addon's: that's settled.
-        let all_read = [release("v1", 1, &borrowed[..MAX_ZIPS_PER_RELEASE])];
-        let chosen = pinned(&mut fake, &all_read, &mut cache, "Main");
-        assert!(chosen.errors.is_empty());
         assert_eq!(cache["v1"].skipped_for.as_deref(), Some("Main"));
+        assert_eq!(cache["v1"].unread, 2);
+        assert_eq!(chosen.left_unread, [("v1".to_string(), 2)]);
+        assert!(chosen.errors.is_empty(), "settled, so not read every run");
+    }
+
+    #[test]
+    fn after_four_negatives_an_unlabeled_zip_is_still_read_while_the_rest_are_another_addons() {
+        // Four releases with nothing for Forever close unlabeled zips in older releases. One of
+        // those holds another addon's zip named for Forever, and the pinned addon's own.
+        let mut fake = Fake::default();
+        let mut releases: Vec<GhRelease> = (0..4)
+            .map(|at| {
+                let name = format!("Retail-{at}.zip");
+                fake.zips.insert(name.clone(), Ok(other_scan("Main")));
+                release(&format!("v2.{at}"), at, &[name.as_str()])
+            })
+            .collect();
+        fake.zips
+            .insert("Pack-forever.zip".into(), Ok(forever_scan("Pack")));
+        fake.zips
+            .insert("Main-1.zip".into(), Ok(forever_scan("Main")));
+        releases.push(release("v1", 10, &["Pack-forever.zip", "Main-1.zip"]));
+        let mut cache = BTreeMap::new();
+        let chosen = pinned(&mut fake, &releases, &mut cache, "Main");
+        assert_eq!(chosen.stable.unwrap().asset.name, "Main-1.zip");
+
+        // When it isn't there either, the release is settled with nothing left unread.
+        let mut fake_without = Fake {
+            zips: fake.zips.clone(),
+            ..Fake::default()
+        };
+        fake_without
+            .zips
+            .insert("Main-1.zip".into(), Ok(forever_scan("Other")));
+        let mut cache = BTreeMap::new();
+        let chosen = pinned(&mut fake_without, &releases, &mut cache, "Main");
+        assert!(chosen.stable.is_none());
+        assert_eq!(cache["v1"].skipped_for.as_deref(), Some("Main"));
+        assert_eq!(cache["v1"].unread, 0);
+    }
+
+    #[test]
+    fn a_build_read_before_the_pin_came_first_is_read_again_once() {
+        // The scan cache has a bundle as the scan made it before it put the pinned folder first.
+        let mut fake = Fake::default();
+        fake.zips.insert(
+            "Bundle.zip".into(),
+            Ok(ZipScan {
+                folders: vec!["Ready2Quest".into(), "QuestCompanion".into()],
+                forever: true,
+                ..ZipScan::default()
+            }),
+        );
+        let releases = [release("v2", 1, &["Bundle.zip"])];
+        let mut cache = BTreeMap::new();
+        choose_builds("Repo", &releases, &mut cache, None, &mut fake, &|| false);
+        assert_eq!(fake.zip_reads.len(), 1);
+
+        let chosen = pinned(&mut fake, &releases, &mut cache, "questcompanion");
+        assert_eq!(
+            chosen.stable.unwrap().scan.folders,
+            ["QuestCompanion", "Ready2Quest"]
+        );
+        assert_eq!(fake.zip_reads.len(), 2, "read again for the pin");
+        pinned(&mut fake, &releases, &mut cache, "QuestCompanion");
+        assert_eq!(fake.zip_reads.len(), 2, "once");
+    }
+
+    #[test]
+    fn the_pinned_folder_goes_first_and_the_rest_keep_their_order() {
+        let mut folders: Vec<String> = ["A", "B", "Main", "C"]
+            .iter()
+            .map(|f| f.to_string())
+            .collect();
+        lead_with(&mut folders, "main");
+        assert_eq!(folders, ["Main", "A", "B", "C"]);
+        lead_with(&mut folders, "Missing");
+        assert_eq!(folders, ["Main", "A", "B", "C"]);
+        assert!(leads(&folders, Some("MAIN")));
+        assert!(!leads(&folders, Some("A")));
+        assert!(leads(&folders, None));
+        assert!(!leads(&[], Some("Main")));
     }
 
     #[test]

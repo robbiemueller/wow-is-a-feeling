@@ -333,41 +333,30 @@ fn attach_packs(catalog: &mut Catalog, specs: &[PackSpec], warnings: &mut Vec<St
 }
 
 /// A former main folder vouches that an installed copy with that main folder is this addon, so
-/// it must never be a folder another entry ships now: that folder is the other addon's. Drops
-/// any such folder from `formerly`, ignoring case, and says which entry ships it.
-pub fn drop_formerly_others_ship<'a>(
-    addons: impl IntoIterator<Item = &'a mut Addon>,
-) -> Vec<String> {
-    let mut addons: Vec<&mut Addon> = addons.into_iter().collect();
-    let ids: Vec<String> = addons.iter().map(|addon| addon.id.clone()).collect();
-    let mut shipped_by: BTreeMap<String, Vec<usize>> = BTreeMap::new();
-    for (at, addon) in addons.iter().enumerate() {
-        for folder in &addon.folders {
-            shipped_by
-                .entry(folder.to_lowercase())
-                .or_default()
-                .push(at);
+/// no other entry may ship it. The settle step makes sure of that: the collision pass holds a
+/// newcomer that ships one, and a vouch goes when an entry with a better claim ships it. Only
+/// settled candidates reach the gate, so this only says when that stops being true.
+pub(crate) fn formerly_shipped_elsewhere(addons: &[Addon]) -> Vec<String> {
+    let mut problems = Vec::new();
+    for addon in addons {
+        for folder in &addon.formerly {
+            let folder_lower = folder.to_lowercase();
+            let other = addons.iter().find(|other| {
+                other.id != addon.id
+                    && other
+                        .folders
+                        .iter()
+                        .any(|f| f.to_lowercase() == folder_lower)
+            });
+            if let Some(other) = other {
+                problems.push(format!(
+                    "{} lists {folder} as a former main folder, but {} ships it",
+                    addon.id, other.id
+                ));
+            }
         }
     }
-    let mut dropped = Vec::new();
-    for (at, addon) in addons.iter_mut().enumerate() {
-        addon.formerly.retain(|folder| {
-            let other = shipped_by
-                .get(&folder.to_lowercase())
-                .and_then(|owners| owners.iter().find(|&&owner| owner != at));
-            match other {
-                Some(&owner) => {
-                    dropped.push(format!(
-                        "{} no longer vouches for {folder}, which {} ships",
-                        ids[at], ids[owner]
-                    ));
-                    false
-                }
-                None => true,
-            }
-        });
-    }
-    dropped
+    problems
 }
 
 /// Check everything and fix what can be fixed. `Err` means don't publish.
@@ -397,8 +386,7 @@ pub fn run_gate(mut catalog: Catalog, context: &GateContext<'_>) -> Result<Passe
         true
     });
 
-    // The settle step already did this. Here it covers whatever reached the gate another way.
-    warnings.extend(drop_formerly_others_ship(&mut catalog.addons));
+    warnings.extend(formerly_shipped_elsewhere(&catalog.addons));
     let held = trim_to_size(
         &mut catalog,
         context.picks,
@@ -977,40 +965,26 @@ mod tests {
     }
 
     #[test]
-    fn a_former_main_folder_another_entry_ships_is_never_vouched_for() {
-        let mut renamed = addon("gh:a/new", "NewName");
-        renamed.formerly = vec!["Questie".into(), "NewName_Old".into()];
-        let mut both = vec![renamed, addon("gh:questie/questie", "Questie")];
-        let dropped = drop_formerly_others_ship(&mut both);
-        assert_eq!(both[0].formerly, ["NewName_Old"]);
-        assert_eq!(
-            dropped,
-            ["gh:a/new no longer vouches for Questie, which gh:questie/questie ships"]
-        );
-        // A main folder it moved away from but still ships is its own, and stays vouched for.
-        let mut moved = addon("gh:a/hog", "HogTronUI");
-        moved.folders = vec!["HogTronUI".into(), "HogHeals".into()];
-        moved.formerly = vec!["HogHeals".into()];
-        let mut alone = vec![moved];
-        assert!(drop_formerly_others_ship(&mut alone).is_empty());
-        assert_eq!(alone[0].formerly, ["HogHeals"]);
-    }
-
-    #[test]
-    fn the_gate_drops_a_former_main_folder_another_entry_ships() {
+    fn the_gate_says_when_a_former_main_folder_is_another_entrys() {
+        // Settling never lets this through, so the gate only says so and changes nothing.
         let mut renamed = addon("gh:a/new", "NewName");
         renamed.formerly = vec!["QUESTIE".into()];
         let (out, warnings) = pass(catalog(vec![
             renamed,
             addon("gh:questie/questie", "Questie"),
         ]));
-        assert!(out.addons[0].formerly.is_empty());
-        assert!(
-            warnings
-                .iter()
-                .any(|w| w.contains("no longer vouches for QUESTIE")),
-            "{warnings:?}"
+        assert_eq!(out.addons[0].formerly, ["QUESTIE"]);
+        assert_eq!(
+            warnings,
+            ["gh:a/new lists QUESTIE as a former main folder, but gh:questie/questie ships it"]
         );
+
+        // A main folder it moved away from but still ships is its own.
+        let mut moved = addon("gh:a/hog", "HogTronUI");
+        moved.folders = vec!["HogTronUI".into(), "HogHeals".into()];
+        moved.formerly = vec!["HogHeals".into()];
+        let (_, warnings) = pass(catalog(vec![moved]));
+        assert!(warnings.is_empty(), "{warnings:?}");
     }
 
     #[test]
