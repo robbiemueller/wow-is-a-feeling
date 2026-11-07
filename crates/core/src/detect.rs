@@ -568,10 +568,11 @@ fn candidates() -> Vec<Install> {
 /// Forever installs in every known Wine prefix under `home`. `lutris_system_yml` is
 /// the text of `~/.config/lutris/system.yml`, when there is one.
 pub fn scan_wine_prefixes(home: &Path, lutris_system_yml: Option<&str>) -> Vec<Install> {
-    wine_prefixes(home, lutris_system_yml)
+    let found = wine_prefixes(home, lutris_system_yml)
         .iter()
         .flat_map(|(prefix, launcher)| scan_wine_prefix(prefix, launcher))
-        .collect()
+        .collect();
+    dedupe(found)
 }
 
 /// The Wine prefixes at the fixed places each launcher uses, as `(prefix, launcher)`.
@@ -665,7 +666,7 @@ pub fn scan_wine_prefix(prefix: &Path, launcher: &str) -> Vec<Install> {
     if let Some(path) = resolve_ci(prefix, &["drive_c", "Program Files (x86)", WOW_FOLDER]) {
         push_valid(&mut found, &path, by);
     }
-    found
+    dedupe(found)
 }
 
 /// Map a Windows path from inside a prefix to the real folder, matching each segment
@@ -945,6 +946,22 @@ us|1|9006ba6948388dd0d4a0578e64b8a92e|0e139f0e95542dbe2a5462d8a6b2ebae|||tpr/wow
             paths_from_product_db(&db),
             ["C:/Program Files (x86)/World of Warcraft"]
         );
+    }
+
+    #[test]
+    fn reads_bytes_cut_from_a_real_product_db() {
+        // The `wowf` record, then the launcher block that follows it in the real file.
+        let record: &[u8] = b"\x0a\x04wowf\x12\x04wowf\x1a\x62\x0a\x28C:/Program Files (x86)/World of Warcraft\x12\x02us\x18\x02\x20\x02\x28\x03\x32\x04enUS\x3a\x04enUS\x42\x08\x0a\x04enUS\x10\x03\x4a\x00\x52\x00\x5a\x03USA\x62\x02US\x6a\x09_forever_\x22\xa0\x02\x0a\xac\x01\x08\x01\x10\x00\x18\x00\x20\x00\x28\x00\x3a\x0c1.60.1.70790\x52\x00";
+        let launcher: &[u8] = b"\x1a\x53\x0a\x30C:/Program Files (x86)/Battle.net/Battle.net.exe\x10\xe0\xd7\x01\x1a\x0d/install/wowf\x1a\x0c/update/wowf\x2a\x08\x08\x00\x10\xc0\x84\x3d\x18\x00\x30\x83\xd1\xfb\x01\x3a\x04wowf\x3a\x07hs_beta\x3a\x02s1\x3a\x02s2\x42\xf0\x02\x0a\xe7\x02\x0a\x04bdko\x12\x04bdko\x1a\x3c\x0a\x1dC:/ProgramData/Battle.net/bdk\x12\x02us\x18\x02\x20\x02\x12\x04wowf";
+
+        let mut db = record.to_vec();
+        db.extend_from_slice(launcher);
+        assert_eq!(
+            paths_from_product_db(&db),
+            ["C:/Program Files (x86)/World of Warcraft"]
+        );
+        // Without the record, the launcher block's mentions of wowf must find nothing.
+        assert!(paths_from_product_db(launcher).is_empty());
     }
 
     #[test]
@@ -1266,6 +1283,38 @@ us|1|9006ba6948388dd0d4a0578e64b8a92e|0e139f0e95542dbe2a5462d8a6b2ebae|||tpr/wow
             fs::canonicalize(&found[0].forever_dir).unwrap(),
             fs::canonicalize(forever).unwrap()
         );
+    }
+
+    #[test]
+    fn a_game_found_through_both_routes_in_a_prefix_is_listed_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let prefix = temp.path().join("prefix");
+        make_game(
+            &prefix
+                .join("drive_c")
+                .join("Program Files (x86)")
+                .join("World of Warcraft"),
+        );
+        write(
+            &prefix
+                .join("drive_c")
+                .join("ProgramData")
+                .join("Battle.net")
+                .join("Agent")
+                .join("placeholder"),
+            "",
+        );
+        fs::write(
+            prefix
+                .join("drive_c")
+                .join("ProgramData")
+                .join("Battle.net")
+                .join("Agent")
+                .join("product.db"),
+            product_db_with("C:/Program Files (x86)/World of Warcraft"),
+        )
+        .unwrap();
+        assert_eq!(scan_wine_prefix(&prefix, "Wine").len(), 1);
     }
 
     #[test]
