@@ -94,7 +94,8 @@ pub enum Stage {
 /// What to install and what it replaces.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct InstallRequest {
-    /// Catalog id such as `gh:owner/repo`. Empty for a loose zip, which keeps no copy.
+    /// Catalog id such as `gh:owner/repo`, `gh:owner/repo/<line>` or `wowi:1234`. Empty for a
+    /// loose zip, which keeps no copy.
     pub addon_id: String,
     pub version: String,
     /// Ignored by [`install_from_zip`].
@@ -1290,7 +1291,8 @@ fn targets_forever(folder_dir: &Path, folder: &str) -> bool {
     toc::parse(&String::from_utf8_lossy(&bytes)).targets_forever()
 }
 
-/// `gh:owner/repo` as a folder name. The hash keeps `a/b_c` and `a_b/c` apart.
+/// An addon id such as `gh:owner/repo/<line>` as a folder name. The hash keeps `a/b_c`, `a_b/c`
+/// and `a/b/c` apart.
 fn safe_id(addon_id: &str) -> String {
     let readable: String = addon_id
         .chars()
@@ -1359,6 +1361,12 @@ fn list_zips(dir: &Path) -> Vec<KeptZip> {
         .collect()
 }
 
+/// The biggest zip kept for rollback: a quarter of the whole cache, so one voice pack of a
+/// few hundred MB can't push out every other addon's previous version on its own.
+fn biggest_kept_zip(max_total: u64) -> u64 {
+    max_total / 4
+}
+
 /// Copy the installed zip into the cache, where the next install's "previous version"
 /// will find it, then trim the cache. The cache may be on another drive, so it's a copy.
 fn keep_zip(
@@ -1368,7 +1376,7 @@ fn keep_zip(
     zip: &Path,
     max_total: u64,
 ) -> io::Result<Option<PathBuf>> {
-    if addon_id.is_empty() || fs::metadata(zip)?.len() > max_total {
+    if addon_id.is_empty() || fs::metadata(zip)?.len() > biggest_kept_zip(max_total) {
         return Ok(None);
     }
     let cache_dir = long_path(cache_dir);
@@ -3086,7 +3094,8 @@ mod tests {
     fn the_kept_zip_cache_evicts_the_oldest_first_and_spares_the_new_one() {
         let cache = tempfile::tempdir().unwrap();
         let source = cache.path().join("source.zip");
-        fs::write(&source, vec![0u8; 400]).unwrap();
+        // A quarter of the cache, the most one zip may take.
+        fs::write(&source, vec![0u8; 250]).unwrap();
         let cancel_free_keep = |id: &str, version: &str| {
             let kept = keep_zip(cache.path(), id, version, &source, 1000).unwrap();
             thread::sleep(Duration::from_millis(20));
@@ -3094,29 +3103,57 @@ mod tests {
         };
         let first = cancel_free_keep("gh:a/one", "1").unwrap();
         let second = cancel_free_keep("gh:a/two", "1").unwrap();
-        assert!(first.exists() && second.exists());
-
         let third = cancel_free_keep("gh:a/three", "1").unwrap();
+        let fourth = cancel_free_keep("gh:a/four", "1").unwrap();
+        assert!(first.exists() && second.exists() && third.exists() && fourth.exists());
+
+        let fifth = cancel_free_keep("gh:a/five", "1").unwrap();
         assert!(!first.exists(), "oldest should go past the cap");
-        assert!(second.exists() && third.exists());
+        assert!(second.exists() && third.exists() && fourth.exists() && fifth.exists());
         assert!(
             !first.parent().unwrap().exists(),
             "its emptied folder goes too"
         );
+    }
 
-        // Too big for the cache at all: nothing kept, and nothing else evicted for it.
-        fs::write(&source, vec![0u8; 2000]).unwrap();
-        assert_eq!(
-            keep_zip(cache.path(), "gh:a/four", "1", &source, 1000).unwrap(),
-            None
-        );
-        assert!(second.exists() && third.exists());
+    #[test]
+    fn a_zip_bigger_than_a_quarter_of_the_cache_is_not_kept_and_evicts_nothing() {
+        let cache = tempfile::tempdir().unwrap();
+        let small = cache.path().join("small.zip");
+        fs::write(&small, vec![0u8; 200]).unwrap();
+        let others: Vec<PathBuf> = ["gh:a/one", "gh:a/two"]
+            .into_iter()
+            .map(|id| {
+                let kept = keep_zip(cache.path(), id, "1", &small, 1000).unwrap();
+                thread::sleep(Duration::from_millis(20));
+                kept.unwrap()
+            })
+            .collect();
+
+        // A voice pack, from just over a quarter of the cache, which would only fit by pushing
+        // other addons' copies out, to more than all of it.
+        let pack = cache.path().join("pack.zip");
+        for size in [251, 900, 1000, 2000] {
+            fs::write(&pack, vec![0u8; size]).unwrap();
+            assert_eq!(
+                keep_zip(cache.path(), "gh:a/b/quests-audio", "v2.5.0", &pack, 1000).unwrap(),
+                None,
+                "{size} bytes"
+            );
+            assert!(others.iter().all(|zip| zip.exists()), "{size} bytes");
+        }
+        assert!(!zip_dir(cache.path(), "gh:a/b/quests-audio").exists());
     }
 
     #[test]
     fn safe_names_for_ids_and_versions() {
         assert!(safe_id("gh:owner/repo").starts_with("gh_owner_repo-"));
         assert_ne!(safe_id("gh:a/b_c"), safe_id("gh:a_b/c"));
+        let line = safe_id("gh:rusty-key/spoken-wow/quests-audio");
+        assert!(line.starts_with("gh_rusty-key_spoken-wow_quests-audio-"));
+        assert!(is_safe_folder_name(&line));
+        assert_ne!(line, safe_id("gh:rusty-key/spoken-wow"));
+        assert_ne!(safe_id("gh:a/b/c"), safe_id("gh:a/b_c"));
         for id in [
             "direct:con",
             "gh:../../evil",

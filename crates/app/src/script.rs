@@ -3,8 +3,10 @@
 //!
 //! ```text
 //! wait              # until the game, catalog and every operation have settled
-//! install <id>      # the Install button, whatever it says today
+//! install <id>      # the page's Install button, whatever it says today
 //! replace           # Replace them, on the popup that can open next
+//! packs both        # Install both (or Install all), on the packs popup that can open next
+//! packs just        # Just <addon>, on that popup: the addon without its packs
 //! rollback <id>
 //! remove <id>
 //! adopt <id>
@@ -94,12 +96,24 @@ impl Script {
         self.lines.pop_front();
         self.log(&format!("> {line}"));
         match command {
-            "install" => app.actions.push(Action::Install(vec![rest.to_owned()])),
+            "install" => app.actions.push(Action::InstallFromPage(rest.to_owned())),
             "replace" => {
                 if let Some(crate::dialogs::Popup::Replace(plan)) = app.popup.take() {
                     app.actions.push(plan.confirmed());
                 }
             }
+            "packs" => match (rest, app.popup.take()) {
+                ("both", Some(crate::dialogs::Popup::Packs(plan))) => {
+                    app.actions.push(plan.with_packs());
+                }
+                ("just", Some(crate::dialogs::Popup::Packs(plan))) => {
+                    app.actions.push(plan.without_packs());
+                }
+                (_, other) => {
+                    app.popup = other;
+                    self.log("no packs are being offered, or no answer to give");
+                }
+            },
             "rollback" => app.actions.push(Action::Rollback(rest.to_owned())),
             "remove" => {
                 app.ask_remove(&Selection::Addon(rest.to_owned()));

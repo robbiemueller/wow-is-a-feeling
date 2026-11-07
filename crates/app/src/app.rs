@@ -307,6 +307,15 @@ impl App {
         self.managed_map()?.get(id)
     }
 
+    /// The channel an addon installs from: its record's, its page's checkbox, or the default.
+    pub fn channel_of(&self, id: &str) -> Channel {
+        model::channel_for(
+            self.managed(id),
+            self.channel_choice.get(id).copied(),
+            self.state.settings.default_channel,
+        )
+    }
+
     pub fn selection(&self) -> Option<&Selection> {
         match self.tab {
             Tab::MyAddons => self.sel_my.as_ref(),
@@ -457,7 +466,7 @@ impl App {
     pub fn main_action_for(&self, id: &str, main: model::MainButton) -> Action {
         match main {
             model::MainButton::Manage => Action::Adopt(id.to_owned()),
-            _ => Action::Install(vec![id.to_owned()]),
+            _ => Action::InstallFromPage(id.to_owned()),
         }
     }
 
@@ -467,16 +476,12 @@ impl App {
         match self.page_kind() {
             PageKind::Addon(id) => {
                 let bundle = self.bundle.as_deref()?;
-                let addon = bundle.addon(&id)?;
                 let record = self.managed(&id);
+                // One whose entry has become another addon has only Remove, which asks first.
+                let addon = model::entry_for(bundle, &id, record)?;
                 let main = model::main_button(addon, record, self.adoption_for(&id).is_some());
-                let channel = model::channel_for(
-                    record,
-                    self.channel_choice.get(&id).copied(),
-                    self.state.settings.default_channel,
-                );
-                let installable =
-                    addon.release(channel).is_some() || main == model::MainButton::Manage;
+                let installable = addon.release(self.channel_of(&id)).is_some()
+                    || main == model::MainButton::Manage;
                 let blocked = busy_all
                     || self.queue.busy_with(&id)
                     || main == model::MainButton::Pinned
@@ -582,7 +587,7 @@ impl App {
         let in_catalog = id.as_deref().is_some_and(|id| {
             self.bundle
                 .as_deref()
-                .is_some_and(|b| b.addon(id).is_some())
+                .is_some_and(|b| model::entry_for(b, id, self.managed(id)).is_some())
         });
         match id {
             Some(id) if in_catalog => {
@@ -818,10 +823,14 @@ impl App {
                 .flat_map(|m| m.folders.iter().map(String::as_str))
                 .collect();
             let groups = scan::group_unmanaged(&self.folders, owned.iter().copied());
-            let adoptions = bundle
+            let mut adoptions = bundle
                 .as_deref()
                 .map(|b| scan::match_to_catalog(&self.folders, &b.catalog, owned.iter().copied()))
                 .unwrap_or_default();
+            // An addon with a record keeps it. Adopting over it would swap its folders for
+            // these, which is how an entry that has become another addon, such as a voice pack
+            // the player got elsewhere, would take the installed addon's place.
+            adoptions.retain(|adoption| !managed.contains_key(&adoption.addon_id));
             let updates = model::updates_available(managed, bundle.as_deref());
             self.groups = groups;
             self.adoptions = adoptions;

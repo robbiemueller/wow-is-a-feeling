@@ -8,12 +8,12 @@ use crate::args::{Launch, Scene};
 use crate::demo;
 use crate::dialogs::Popup;
 use crate::easter;
-use crate::model::{CatalogStatus, GameState, Section, Selection, Tab};
+use crate::model::{CatalogStatus, GameState, Section, Selection, Tab, size_text};
 use crate::worker::{Dirs, Event};
 use eframe::egui::{self, Key, Modifiers, OutputCommand, ViewportId};
 use egui_kittest::Harness;
 use egui_kittest::kittest::{NodeT as _, Queryable as _};
-use feeling_core::catalog::{Addon, Catalog, Channel, Gap, Kit, Release, Source};
+use feeling_core::catalog::{Addon, Catalog, Channel, Gap, Kit, PackGroup, Release, Source};
 use feeling_core::state::{Origin, State};
 use std::collections::HashMap;
 use std::fs;
@@ -1468,7 +1468,11 @@ fn a_removal_waiting_behind_a_sharing_install_leaves_the_shared_folder() {
     };
     assert_eq!(plan.folders, ["Masque_Dominos"]);
     let agreed = vec!["Masque_Dominos".to_owned()];
-    app_mut(&mut h).apply(Action::ReplaceAndInstall(DOMINOS.to_owned(), agreed));
+    app_mut(&mut h).apply(Action::ReplaceAndInstall {
+        id: DOMINOS.to_owned(),
+        folders: agreed,
+        packs: Vec::new(),
+    });
     app_mut(&mut h).apply(Action::ConfirmRemove(plan));
     finish_ops(&mut h);
     assert!(managed(&h, MASQUE).is_none());
@@ -3193,4 +3197,524 @@ fn a_catalog_full_of_hostile_text_cannot_hurt_anything() {
         "the website is refused and only the checked source remains"
     );
     h.run();
+}
+
+const SPOKEN: &str = "gh:rusty-key/spoken-wow";
+const QUEST_VOICES: &str = "gh:rusty-key/spoken-wow/quests-audio";
+const QUEST_VOICE_FOLDERS: [&str; 4] = [
+    "SpokenQuestsAudioAlliance",
+    "SpokenQuestsAudioGossip",
+    "SpokenQuestsAudioHorde",
+    "SpokenQuestsAudioShared",
+];
+const NEEDS_A_PACK: &str = "Spoken needs one of these to work.";
+
+/// Spoken as the catalog lists it once a person has written down the voices it plays.
+fn spoken(site: &Site, version: &str) -> Addon {
+    let folders = ["Spoken", "Spoken_Quests"];
+    let mut spoken = publish_bundle(site, SPOKEN, &folders, &folders, version);
+    spoken.name = "Spoken".to_owned();
+    spoken.summary = "Reads quests aloud.".to_owned();
+    spoken.packs = vec![PackGroup {
+        name: "Quest voices".to_owned(),
+        needed: true,
+        ids: vec![QUEST_VOICES.to_owned()],
+    }];
+    spoken
+}
+
+/// Its English quest voices: a release line of the same repository, with a zip of its own.
+fn quest_voices(site: &Site, version: &str) -> Addon {
+    let folders = QUEST_VOICE_FOLDERS;
+    let mut pack = publish_bundle(site, QUEST_VOICES, &folders, &folders, version);
+    pack.name = "Spoken Audio: Quests".to_owned();
+    pack.summary = "English voices for Spoken Quests.".to_owned();
+    // The repository's readme is about Spoken, so this page never goes looking for it.
+    pack.source = Source::Github {
+        repo: "rusty-key/spoken-wow".to_owned(),
+    };
+    pack
+}
+
+#[test]
+fn installing_an_addon_that_needs_a_pack_asks_once_and_install_both_brings_both() {
+    let rig = Rig::new();
+    let pack = quest_voices(&rig.site, "v2.5.0");
+    let size = size_text(pack.stable.as_ref().unwrap().size);
+    rig.site
+        .publish(&catalog_of(vec![spoken(&rig.site, "v3.8.3"), pack]));
+    let mut h = rig.launch_settled();
+    click(&mut h, "Spoken, v3.8.3");
+
+    // The page says what it needs before anything is installed.
+    assert!(has_label(&h, "Quest voices:"));
+    assert!(has_label(&h, "Spoken Audio: Quests"));
+    assert!(has_label(&h, &format!("({size})")));
+    assert!(has_label(&h, NEEDS_A_PACK));
+    let key = h.get_by_label("Quest voices:").rect();
+    let version = h.get_by_label("Version:").rect();
+    assert!(
+        (key.height() - version.height()).abs() < 1.0,
+        "a long key stays on one line: {key:?}"
+    );
+    assert!(h.get_by_label("Spoken Audio: Quests").rect().min.x > key.max.x);
+
+    click(&mut h, "Install");
+    assert!(matches!(app(&h).popup, Some(Popup::Packs(_))));
+    assert!(app(&h).queue.is_idle(), "nothing has started");
+    assert!(has_label(&h, "Spoken needs quest voices to work."));
+    assert!(has_label(
+        &h,
+        &format!("Spoken Audio: Quests is a {size} download. Install it too?")
+    ));
+    assert!(has_label(&h, "Just Spoken"));
+    click(&mut h, "Install both");
+    assert!(app(&h).popup.is_none(), "asked once");
+    finish_ops(&mut h);
+
+    for folder in ["Spoken", "Spoken_Quests"] {
+        assert_eq!(rig.version_on_disk(folder).as_deref(), Some("v3.8.3"));
+    }
+    for folder in QUEST_VOICE_FOLDERS {
+        assert_eq!(rig.version_on_disk(folder).as_deref(), Some("v2.5.0"));
+    }
+    // Two ordinary installs, each with its own record.
+    assert_eq!(
+        managed(&h, SPOKEN).unwrap().folders,
+        ["Spoken", "Spoken_Quests"]
+    );
+    assert_eq!(
+        managed(&h, QUEST_VOICES).unwrap().folders,
+        QUEST_VOICE_FOLDERS
+    );
+    assert_eq!(app(&h).page_kind(), PageKind::Addon(SPOKEN.to_owned()));
+    assert!(has_label(&h, "Quest voices:"));
+    assert!(has_label(&h, "(installed)"));
+    assert!(!has_label(&h, NEEDS_A_PACK));
+
+    click(&mut h, "Reinstall");
+    assert!(app(&h).popup.is_none(), "only a first install asks");
+    finish_ops(&mut h);
+}
+
+#[test]
+fn just_the_addon_installs_it_alone_and_its_page_points_to_the_pack() {
+    let rig = Rig::new();
+    rig.site.publish(&catalog_of(vec![
+        spoken(&rig.site, "v3.8.3"),
+        quest_voices(&rig.site, "v2.5.0"),
+    ]));
+    let mut h = rig.launch_settled();
+    click(&mut h, "Spoken, v3.8.3");
+    click(&mut h, "Install");
+    click(&mut h, "Just Spoken");
+    assert!(app(&h).popup.is_none());
+    finish_ops(&mut h);
+    assert_eq!(rig.version_on_disk("Spoken").as_deref(), Some("v3.8.3"));
+    assert!(
+        QUEST_VOICE_FOLDERS
+            .iter()
+            .all(|folder| !rig.addons().join(folder).exists())
+    );
+    assert!(managed(&h, QUEST_VOICES).is_none());
+
+    // The page keeps saying what's missing, in red, and nothing asks again.
+    assert!(has_label(&h, NEEDS_A_PACK));
+    click(&mut h, "Reinstall");
+    assert!(app(&h).popup.is_none());
+    finish_ops(&mut h);
+
+    // The pack is one click away, on a page of its own, where installing it is up to them.
+    click(&mut h, "Spoken Audio: Quests");
+    assert_eq!(
+        app(&h).page_kind(),
+        PageKind::Addon(QUEST_VOICES.to_owned())
+    );
+    assert!(has_label(&h, "GitHub: rusty-key/spoken-wow"));
+    assert!(has_label(&h, "English voices for Spoken Quests."));
+    click(&mut h, "Install");
+    assert!(app(&h).popup.is_none());
+    finish_ops(&mut h);
+    for folder in QUEST_VOICE_FOLDERS {
+        assert_eq!(rig.version_on_disk(folder).as_deref(), Some("v2.5.0"));
+    }
+    click(&mut h, "Spoken, installed");
+    assert!(has_label(&h, "(installed)"));
+    assert!(!has_label(&h, NEEDS_A_PACK));
+}
+
+#[test]
+fn a_pack_already_in_addons_from_elsewhere_means_no_question() {
+    let rig = Rig::new();
+    rig.plant("SpokenQuestsAudioGossip", "elsewhere");
+    rig.site.publish(&catalog_of(vec![
+        spoken(&rig.site, "v3.8.3"),
+        quest_voices(&rig.site, "v2.5.0"),
+    ]));
+    let mut h = rig.launch_settled();
+    click(&mut h, "Browse");
+    click(&mut h, "Spoken, v3.8.3");
+    assert!(
+        has_label(&h, "(installed)"),
+        "any folder of the pack will do"
+    );
+    assert!(!has_label(&h, NEEDS_A_PACK));
+
+    click(&mut h, "Install");
+    assert!(app(&h).popup.is_none());
+    finish_ops(&mut h);
+    assert_eq!(rig.version_on_disk("Spoken").as_deref(), Some("v3.8.3"));
+    assert_eq!(
+        rig.version_on_disk("SpokenQuestsAudioGossip").as_deref(),
+        Some("elsewhere")
+    );
+    assert!(managed(&h, QUEST_VOICES).is_none());
+}
+
+#[test]
+fn a_pack_already_on_its_way_means_no_question() {
+    let rig = Rig::new();
+    rig.site.publish(&catalog_of(vec![
+        spoken(&rig.site, "v3.8.3"),
+        quest_voices(&rig.site, "v2.5.0"),
+    ]));
+    let mut h = rig.launch_settled();
+    // Both before another frame, so the pack is still in the queue however quick it is.
+    app_mut(&mut h).apply(Action::InstallFromPage(QUEST_VOICES.to_owned()));
+    app_mut(&mut h).apply(Action::InstallFromPage(SPOKEN.to_owned()));
+    assert!(app(&h).popup.is_none());
+    finish_ops(&mut h);
+    assert!(managed(&h, SPOKEN).is_some() && managed(&h, QUEST_VOICES).is_some());
+}
+
+#[test]
+fn a_pack_the_addon_itself_requires_comes_along_without_a_question() {
+    let rig = Rig::new();
+    let mut spoken = spoken(&rig.site, "v3.8.3");
+    spoken.deps = vec!["SpokenQuestsAudioAlliance".to_owned()];
+    rig.site
+        .publish(&catalog_of(vec![spoken, quest_voices(&rig.site, "v2.5.0")]));
+    let mut h = rig.launch_settled();
+    click(&mut h, "Spoken, v3.8.3");
+    click(&mut h, "Install");
+    assert!(app(&h).popup.is_none(), "it's in the same batch");
+    assert!(said(
+        &h,
+        "Spoken requires Spoken Audio: Quests, so that installs first."
+    ));
+    finish_ops(&mut h);
+    assert!(managed(&h, SPOKEN).is_some() && managed(&h, QUEST_VOICES).is_some());
+}
+
+#[test]
+fn a_big_pack_is_offered_in_gb_and_escape_installs_nothing() {
+    let rig = Rig::new();
+    let mut pack = quest_voices(&rig.site, "v2.5.0");
+    // Never downloaded here, so it can be as big as the real one.
+    pack.stable.as_mut().unwrap().size = 1_479_966_451;
+    rig.site
+        .publish(&catalog_of(vec![spoken(&rig.site, "v3.8.3"), pack]));
+    let mut h = rig.launch_settled();
+    click(&mut h, "Spoken, v3.8.3");
+    assert!(has_label(&h, "(1.5 GB)"));
+
+    click(&mut h, "Install");
+    assert!(has_label(&h, "Spoken needs quest voices to work."));
+    assert!(has_label(
+        &h,
+        "Spoken Audio: Quests is a 1.5 GB download. Install it too?"
+    ));
+    press(&mut h, Key::Escape);
+    assert!(app(&h).popup.is_none(), "Escape is Cancel");
+    assert!(app(&h).queue.is_idle(), "so nothing at all is installed");
+    assert!(managed(&h, SPOKEN).is_none());
+
+    // Enter is the same button, so it's the same question.
+    press(&mut h, Key::Enter);
+    h.step();
+    assert!(matches!(app(&h).popup, Some(Popup::Packs(_))));
+    press(&mut h, Key::Escape);
+
+    click(&mut h, "Spoken Audio: Quests");
+    assert!(has_label(&h, "1.5 GB"));
+}
+
+#[test]
+fn a_long_pack_line_wraps_and_stays_on_the_page() {
+    let rig = Rig::new();
+    let languages = [
+        "German", "French", "Spanish", "Italian", "Korean", "Russian",
+    ];
+    let packs: Vec<Addon> = languages
+        .iter()
+        .map(|language| {
+            let id = format!("{QUEST_VOICES}-{}", language.to_lowercase());
+            let folder = format!("SpokenQuestsAudio{language}");
+            let mut pack = publish_addon(&rig.site, &id, &folder, "v1.0.0");
+            pack.name = format!("Spoken Audio: Quests in {language}");
+            pack
+        })
+        .collect();
+    let mut spoken = spoken(&rig.site, "v3.8.3");
+    spoken.packs[0].name = "Quest voices, in every language anyone has recorded".to_owned();
+    spoken.packs[0].ids = packs.iter().map(|pack| pack.id.clone()).collect();
+    let mut addons = vec![spoken];
+    addons.extend(packs);
+    rig.site.publish(&catalog_of(addons));
+    let mut h = rig.launch_settled();
+    click(&mut h, "Spoken, v3.8.3");
+    // Where the page's text ends: the parchment's edge, less its margin and scrollbar.
+    let text_right = h.ctx.content_rect().max.x - 20.0 - 26.0;
+    let mut placed: Vec<egui::Rect> = languages
+        .iter()
+        .map(|language| {
+            h.get_by_label(&format!("Spoken Audio: Quests in {language}"))
+                .rect()
+        })
+        .collect();
+    placed.extend(h.get_all_by_label("(1 KB)").map(|size| size.rect()));
+    assert_eq!(placed.len(), 2 * languages.len());
+    for rect in placed {
+        assert!(
+            rect.max.x <= text_right,
+            "{rect:?} runs off past {text_right}"
+        );
+    }
+    assert!(has_label(&h, NEEDS_A_PACK));
+}
+
+#[test]
+fn a_packs_size_goes_to_the_next_line_whole_rather_than_breaking() {
+    const GERMAN: &str = "gh:rusty-key/spoken-wow/quests-audio-dede";
+    let rig = Rig::new();
+    let mut english = quest_voices(&rig.site, "v2.5.0");
+    // Never downloaded here, so they can be as big as the real ones.
+    english.stable.as_mut().unwrap().size = 1_479_966_451;
+    let mut german = publish_addon(&rig.site, GERMAN, "SpokenQuestsAudio_deDE", "v1.0.1");
+    german.name = "Spoken Audio: Quests (German)".to_owned();
+    german.stable.as_mut().unwrap().size = 1_646_390_683;
+    let mut spoken = spoken(&rig.site, "v3.8.3");
+    spoken.packs[0].ids.push(GERMAN.to_owned());
+    rig.site.publish(&catalog_of(vec![spoken, english, german]));
+    let mut h = rig.launch_settled();
+    click(&mut h, "Spoken, v3.8.3");
+    let one_line = h.get_by_label("(1.5 GB)").rect().height();
+    let german = h.get_by_label("(1.6 GB)").rect();
+    assert!(
+        german.height() < one_line * 1.5,
+        "{german:?} broke over two lines"
+    );
+}
+
+#[test]
+fn the_folder_question_comes_after_the_packs_one_and_keeps_its_answer() {
+    let rig = Rig::new();
+    rig.plant("Spoken_Quests", "mine");
+    rig.site.publish(&catalog_of(vec![
+        spoken(&rig.site, "v3.8.3"),
+        quest_voices(&rig.site, "v2.5.0"),
+    ]));
+    let mut h = rig.launch_settled();
+    click(&mut h, "Browse");
+    click(&mut h, "Spoken, v3.8.3");
+    const REPLACING: &str = "Installing Spoken would replace these folders already in your AddOns:";
+
+    // Cancel on the second question cancels the lot.
+    click(&mut h, "Install");
+    click(&mut h, "Install both");
+    assert!(has_label(&h, REPLACING));
+    click_last(&mut h, "Cancel");
+    assert!(app(&h).popup.is_none());
+    assert!(app(&h).queue.is_idle());
+
+    // A new click asks both again, once each.
+    click(&mut h, "Install");
+    assert!(matches!(app(&h).popup, Some(Popup::Packs(_))));
+    click(&mut h, "Install both");
+    click(&mut h, "Replace them");
+    assert!(app(&h).popup.is_none());
+    finish_ops(&mut h);
+    assert_eq!(
+        rig.version_on_disk("Spoken_Quests").as_deref(),
+        Some("v3.8.3")
+    );
+    for folder in QUEST_VOICE_FOLDERS {
+        assert_eq!(rig.version_on_disk(folder).as_deref(), Some("v2.5.0"));
+    }
+    assert!(managed(&h, QUEST_VOICES).is_some());
+}
+
+#[test]
+fn a_kit_installs_an_addon_that_needs_a_pack_without_asking() {
+    let rig = Rig::new();
+    let mut catalog = catalog_of(vec![
+        publish_addon(&rig.site, FOO, "Foo", "1.0"),
+        spoken(&rig.site, "v3.8.3"),
+        quest_voices(&rig.site, "v2.5.0"),
+    ]);
+    catalog.kits = vec![Kit {
+        name: "Voiced Kit".to_owned(),
+        description: "Quests, read aloud.".to_owned(),
+        addons: vec![FOO.to_owned(), SPOKEN.to_owned()],
+    }];
+    rig.site.publish(&catalog);
+    let mut h = rig.launch_settled();
+    app_mut(&mut h).apply(Action::Install(vec![FOO.to_owned()]));
+    finish_ops(&mut h);
+
+    // Only Spoken is left, and still the kit doesn't ask: only its own page does.
+    click(&mut h, "Voiced Kit, 2 addons");
+    click(&mut h, "Install all (1)");
+    assert!(app(&h).popup.is_none());
+    finish_ops(&mut h);
+    assert!(managed(&h, SPOKEN).is_some());
+    assert!(managed(&h, QUEST_VOICES).is_none());
+}
+
+#[test]
+fn a_script_can_answer_the_packs_question() {
+    let rig = Rig::new();
+    rig.site.publish(&catalog_of(vec![
+        spoken(&rig.site, "v3.8.3"),
+        quest_voices(&rig.site, "v2.5.0"),
+    ]));
+    let script = rig.home.path().join("packs.txt");
+    fs::write(
+        &script,
+        format!("wait\ninstall {SPOKEN}\npacks both\nwait\n"),
+    )
+    .unwrap();
+    let launch = Launch {
+        game: Some(rig.game.clone()),
+        test_rig: true,
+        catalog_url: Some(format!("{}/catalog.json", rig.site.base)),
+        script: Some(script.clone()),
+        ..Launch::default()
+    };
+    let mut h = harness(launch, rig.dirs.clone(), rig.saved_state());
+    pump(&mut h, "the script to install both", |a| {
+        a.managed(QUEST_VOICES).is_some() && a.is_settled()
+    });
+    assert!(managed(&h, SPOKEN).is_some());
+    let log = fs::read_to_string(script.with_extension("log")).unwrap();
+    assert!(log.contains("> packs both"), "{log}");
+    assert!(!log.contains("no packs are being offered"), "{log}");
+}
+
+#[test]
+fn an_entry_that_turned_into_another_addon_is_never_updated_into_it() {
+    let rig = Rig::new();
+    let mut before = spoken(&rig.site, "v3.8.3");
+    before.packs.clear();
+    rig.site.publish(&catalog_of(vec![
+        before,
+        publish_addon(&rig.site, FOO, "Foo", "1.0"),
+    ]));
+    let mut h = rig.launch_settled();
+    app_mut(&mut h).apply(Action::Install(vec![SPOKEN.to_owned(), FOO.to_owned()]));
+    finish_ops(&mut h);
+    close(h);
+
+    // A voice pack released after Spoken, taken as the repository's newest build under
+    // Spoken's own id: what a catalog that doesn't pin an entry to its addon would publish.
+    let mut hijacked = publish_bundle(
+        &rig.site,
+        SPOKEN,
+        &QUEST_VOICE_FOLDERS,
+        &QUEST_VOICE_FOLDERS,
+        "v2.5.0",
+    );
+    hijacked.name = "Spoken".to_owned();
+    rig.site.publish(&catalog_of(vec![
+        hijacked,
+        publish_addon(&rig.site, FOO, "Foo", "2.0"),
+    ]));
+    let mut h = rig.launch_settled();
+    assert_eq!(app(&h).tab, Tab::MyAddons);
+    assert_eq!(app(&h).updates, [FOO], "no update is offered for Spoken");
+    assert!(
+        has_label(&h, "Spoken, v3.8.3"),
+        "and its row doesn't say update"
+    );
+
+    click(&mut h, "Update all (1)");
+    finish_ops(&mut h);
+    assert_eq!(rig.version_on_disk("Foo").as_deref(), Some("2.0"));
+    // Even asked for directly, it isn't turned into the pack.
+    app_mut(&mut h).apply(Action::Install(vec![SPOKEN.to_owned()]));
+    assert!(app(&h).queue.is_idle());
+    assert!(said(
+        &h,
+        "Spoken isn't in the catalog anymore, so it doesn't get updates."
+    ));
+    finish_ops(&mut h);
+    for folder in ["Spoken", "Spoken_Quests"] {
+        assert_eq!(rig.version_on_disk(folder).as_deref(), Some("v3.8.3"));
+    }
+    assert!(
+        QUEST_VOICE_FOLDERS
+            .iter()
+            .all(|folder| !rig.addons().join(folder).exists())
+    );
+    assert_eq!(managed(&h, SPOKEN).unwrap().version, "v3.8.3");
+    assert!(app(&h).updates.is_empty());
+
+    // Its page is the one an addon gets when it has left the catalog.
+    click(&mut h, "Spoken, v3.8.3");
+    const LEFT: &str = "This addon isn't in the catalog anymore, so it doesn't get updates.";
+    assert!(has_label(&h, LEFT));
+    for label in ["Install", "Update", "Reinstall"] {
+        assert!(!has_label(&h, label), "{label} is offered");
+    }
+    press(&mut h, Key::Enter);
+    assert!(app(&h).queue.is_idle() && app(&h).popup.is_none());
+
+    // Browse still lists the entry, as installed, and it opens the same page.
+    click(&mut h, "Browse");
+    click(&mut h, "Spoken, installed");
+    assert!(has_label(&h, LEFT));
+    close(h);
+    assert_eq!(
+        rig.saved_state()
+            .installs
+            .values()
+            .find_map(|i| i.managed.get(SPOKEN))
+            .unwrap()
+            .folders,
+        ["Spoken", "Spoken_Quests"]
+    );
+}
+
+#[test]
+fn a_pack_from_elsewhere_that_an_installed_addons_entry_now_lists_is_not_adopted_over_it() {
+    let rig = Rig::new();
+    let mut before = spoken(&rig.site, "v3.8.3");
+    before.packs.clear();
+    rig.site.publish(&catalog_of(vec![before]));
+    let mut h = rig.launch_settled();
+    click(&mut h, "Install");
+    finish_ops(&mut h);
+    close(h);
+
+    // The voices, from Spoken's own manager, and an entry that has turned into them.
+    for folder in QUEST_VOICE_FOLDERS {
+        rig.plant(folder, "2.5.0");
+    }
+    let mut hijacked = publish_bundle(
+        &rig.site,
+        SPOKEN,
+        &QUEST_VOICE_FOLDERS,
+        &QUEST_VOICE_FOLDERS,
+        "v2.5.0",
+    );
+    hijacked.name = "Spoken".to_owned();
+    rig.site.publish(&catalog_of(vec![hijacked]));
+    let mut h = rig.launch_settled();
+    assert!(app(&h).adoptions.is_empty());
+    app_mut(&mut h).apply(Action::Adopt(SPOKEN.to_owned()));
+    assert_eq!(
+        managed(&h, SPOKEN).unwrap().folders,
+        ["Spoken", "Spoken_Quests"],
+        "Spoken keeps its record"
+    );
 }

@@ -205,6 +205,9 @@ fn sanitize(catalog: &mut Catalog) {
         for release in [&mut addon.stable, &mut addon.beta].into_iter().flatten() {
             release.version = clean_line(&release.version, 40);
         }
+        for group in &mut addon.packs {
+            group.name = clean_line(&group.name, 60);
+        }
     }
     for kit in &mut catalog.kits {
         kit.name = clean_line(&kit.name, 80);
@@ -228,9 +231,34 @@ pub fn same_version(a: &str, b: &str) -> bool {
     bare(a).eq_ignore_ascii_case(bare(b))
 }
 
+/// Is this catalog entry still the addon the record installed? One that no longer lists the
+/// record's main folder has become another addon, such as one of its repository's voice
+/// packs, and updating to it would swap this addon's folders for that one's.
+pub fn same_addon(record: &ManagedAddon, addon: &Addon) -> bool {
+    record.folders.first().is_none_or(|main| {
+        addon
+            .folders
+            .iter()
+            .any(|folder| crate::ops::same_folder(folder, main))
+    })
+}
+
+/// The catalog entry an addon's page, row and updates go by. An installed addon whose entry
+/// has become another addon has none: it's as good as gone from the catalog.
+pub fn entry_for<'a>(
+    bundle: &'a CatalogBundle,
+    id: &str,
+    record: Option<&ManagedAddon>,
+) -> Option<&'a Addon> {
+    let addon = bundle.addon(id)?;
+    record
+        .is_none_or(|record| same_addon(record, addon))
+        .then_some(addon)
+}
+
 /// The release a managed addon would move to, if it isn't on it already.
 pub fn update_for<'a>(managed: &ManagedAddon, addon: &'a Addon) -> Option<&'a Release> {
-    if managed.origin == Origin::LocalZip {
+    if managed.origin == Origin::LocalZip || !same_addon(managed, addon) {
         return None;
     }
     let release = addon.release(managed.channel)?;
@@ -524,13 +552,13 @@ pub fn browse_tag<'a>(addon: &'a Addon, managed: Option<&ManagedAddon>) -> Tag<'
         .map_or(Tag::Nothing, |release| Tag::Version(&release.version))
 }
 
-/// A row in My Addons.
+/// A row in My Addons. An entry that has become another addon says nothing about this one.
 pub fn managed_tag<'a>(
     managed: &'a ManagedAddon,
     addon: Option<&Addon>,
     targets_forever: bool,
 ) -> Tag<'a> {
-    if let Some(addon) = addon {
+    if let Some(addon) = addon.filter(|addon| same_addon(managed, addon)) {
         if !managed.pinned && update_for(managed, addon).is_some() {
             return Tag::Update;
         }
@@ -639,6 +667,87 @@ pub fn gap_alternatives<'a>(gap: &'a Gap, bundle: &'a CatalogBundle) -> Vec<&'a 
     gap.alternatives
         .iter()
         .filter_map(|id| bundle.addon(id))
+        .collect()
+}
+
+/// What a group of packs is called when its catalog entry left the name out.
+const UNNAMED_PACKS: &str = "Packs";
+
+/// One pack an addon's page offers, such as a voice pack.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct PackChoice {
+    pub id: String,
+    pub name: String,
+    /// The download, in bytes, of the build it would install. 0 when unknown.
+    pub size: u64,
+    /// Some folder of it is in AddOns or in a record, whoever put it there.
+    pub installed: bool,
+}
+
+/// One group of packs as an addon's page shows it: any one of `choices` will do.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct PackLine {
+    pub name: String,
+    pub needed: bool,
+    /// In the order to offer them. The first is the one offered by default.
+    pub choices: Vec<PackChoice>,
+}
+
+impl PackLine {
+    pub fn met(&self) -> bool {
+        self.choices.iter().any(|choice| choice.installed)
+    }
+}
+
+/// An addon's pack groups, as its page shows them. Only a reviewed entry's count, because a
+/// person wrote them down, and only trusted packs the catalog has, since a page that offers
+/// one invites installing it. A pack that isn't here and has no build to install is left out,
+/// and so is a group left with nothing to show. `installed` is every folder in AddOns or in a
+/// record, lowercased, and `channel` says which build each pack would install.
+pub fn pack_lines(
+    addon: &Addon,
+    bundle: &CatalogBundle,
+    installed: &HashSet<String>,
+    channel: impl Fn(&str) -> Channel,
+) -> Vec<PackLine> {
+    if !addon.reviewed {
+        return Vec::new();
+    }
+    addon
+        .packs
+        .iter()
+        .filter_map(|group| {
+            let mut seen = HashSet::new();
+            let choices: Vec<PackChoice> = group
+                .ids
+                .iter()
+                .filter(|id| **id != addon.id && seen.insert(id.as_str()))
+                .filter_map(|id| bundle.addon(id))
+                .filter(|pack| pack.trusted)
+                .filter_map(|pack| {
+                    let installed = pack
+                        .folders
+                        .iter()
+                        .any(|folder| installed.contains(&folder.to_lowercase()));
+                    let release = pack.release(channel(&pack.id));
+                    (installed || release.is_some()).then(|| PackChoice {
+                        id: pack.id.clone(),
+                        name: pack.name.clone(),
+                        size: release.map_or(0, |release| release.size),
+                        installed,
+                    })
+                })
+                .collect();
+            (!choices.is_empty()).then(|| PackLine {
+                name: if group.name.is_empty() {
+                    UNNAMED_PACKS.to_owned()
+                } else {
+                    group.name.clone()
+                },
+                needed: group.needed,
+                choices,
+            })
+        })
         .collect()
 }
 
@@ -787,13 +896,19 @@ pub fn date_text(unix: i64) -> String {
     format!("{} {day}, {year}", MONTHS[(month - 1) as usize])
 }
 
-/// `93.6 MB`, or `412 KB`. An unknown size says nothing at all.
+/// `412 KB`, `93.6 MB`, or from 1,000 MB up `1.5 GB`. An unknown size says nothing at all.
 pub fn size_text(bytes: u64) -> String {
-    if bytes >= 1_000_000 {
-        format!("{:.1} MB", bytes as f64 / 1_000_000.0)
-    } else {
-        format!("{} KB", (bytes / 1000).max(1))
+    // Rounded in whole numbers, so 999.96 MB can't come out as "1000.0 MB".
+    let tenths = |unit: u64| bytes / unit + u64::from(bytes % unit >= unit / 2);
+    if bytes < 1_000_000 {
+        return format!("{} KB", (bytes / 1000).max(1));
     }
+    let megabytes = tenths(100_000);
+    if megabytes < 10_000 {
+        return format!("{}.{} MB", megabytes / 10, megabytes % 10);
+    }
+    let gigabytes = tenths(100_000_000);
+    format!("{}.{} GB", gigabytes / 10, gigabytes % 10)
 }
 
 /// What "Look again" actually looks at, so the no-game page can say.
@@ -821,6 +936,7 @@ pub fn places_checked() -> &'static [&'static str] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use feeling_core::catalog::PackGroup;
 
     fn addon(id: &str, name: &str, category: &str, downloads: u64) -> Addon {
         Addon {
@@ -1228,6 +1344,290 @@ mod tests {
         for (i, row) in rows.iter().enumerate() {
             let selection = row_selection(row, Some(&b), &groups).unwrap();
             assert_eq!(row_of(&rows, &selection, Some(&b), &groups), Some(i));
+        }
+    }
+
+    #[test]
+    fn sizes_read_in_kb_mb_and_from_a_thousand_mb_in_gb() {
+        assert_eq!(size_text(1), "1 KB");
+        assert_eq!(size_text(820_400), "820 KB");
+        assert_eq!(size_text(999_999), "999 KB");
+        assert_eq!(size_text(1_000_000), "1.0 MB");
+        assert_eq!(size_text(93_600_000), "93.6 MB");
+        assert_eq!(size_text(456_216_109), "456.2 MB");
+        assert_eq!(size_text(999_949_999), "999.9 MB");
+        assert_eq!(size_text(999_950_000), "1.0 GB", "never 1000.0 MB");
+        assert_eq!(size_text(1_479_966_451), "1.5 GB");
+        assert_eq!(size_text(1_646_390_683), "1.6 GB");
+        assert_eq!(size_text(12_000_000_000), "12.0 GB");
+        assert!(
+            size_text(u64::MAX).ends_with(" GB"),
+            "a silly size can't overflow"
+        );
+    }
+
+    const SPOKEN: &str = "gh:rusty-key/spoken-wow";
+    const QUESTS: &str = "gh:rusty-key/spoken-wow/quests-audio";
+    const GERMAN: &str = "gh:rusty-key/spoken-wow/quests-audio-dede";
+    const PLACES: &str = "gh:rusty-key/spoken-wow/places-audio";
+
+    fn pack(id: &str, name: &str, folders: &[&str], size: u64) -> Addon {
+        let mut pack = addon(id, name, "quests", 10);
+        pack.folders = folders.iter().map(|f| (*f).to_owned()).collect();
+        pack.stable.as_mut().unwrap().size = size;
+        pack.trusted = true;
+        pack.reviewed = true;
+        pack
+    }
+
+    fn spoken_catalog(packs: Vec<PackGroup>, more: Vec<Addon>) -> CatalogBundle {
+        let mut spoken = addon(SPOKEN, "Spoken", "quests", 500);
+        spoken.folders = vec!["Spoken".to_owned(), "Spoken_Quests".to_owned()];
+        spoken.trusted = true;
+        spoken.reviewed = true;
+        spoken.packs = packs;
+        let mut addons = vec![
+            spoken,
+            pack(
+                QUESTS,
+                "Spoken Audio: Quests",
+                &["SpokenQuestsAudioAlliance", "SpokenQuestsAudioHorde"],
+                1_479_966_451,
+            ),
+            pack(
+                GERMAN,
+                "Spoken Audio: Quests (German)",
+                &["SpokenQuestsAudio_deDE"],
+                1_646_390_683,
+            ),
+            pack(
+                PLACES,
+                "Spoken Audio: Places",
+                &["SpokenPlacesAudio"],
+                456_216_109,
+            ),
+        ];
+        addons.extend(more);
+        CatalogBundle::new(Catalog {
+            addons,
+            ..Default::default()
+        })
+    }
+
+    fn group(name: &str, needed: bool, ids: &[&str]) -> PackGroup {
+        PackGroup {
+            name: name.to_owned(),
+            needed,
+            ids: ids.iter().map(|id| (*id).to_owned()).collect(),
+        }
+    }
+
+    fn lines_for(bundle: &CatalogBundle, installed: &[&str]) -> Vec<PackLine> {
+        let installed: HashSet<String> = installed.iter().map(|f| f.to_lowercase()).collect();
+        pack_lines(bundle.addon(SPOKEN).unwrap(), bundle, &installed, |_| {
+            Channel::Stable
+        })
+    }
+
+    #[test]
+    fn pack_lines_name_each_pack_with_its_size_in_the_order_given() {
+        let b = spoken_catalog(
+            vec![
+                group("Quest voices", true, &[QUESTS, GERMAN]),
+                group("Place voices", false, &[PLACES]),
+            ],
+            Vec::new(),
+        );
+        let lines = lines_for(&b, &[]);
+        assert_eq!(
+            lines,
+            vec![
+                PackLine {
+                    name: "Quest voices".to_owned(),
+                    needed: true,
+                    choices: vec![
+                        PackChoice {
+                            id: QUESTS.to_owned(),
+                            name: "Spoken Audio: Quests".to_owned(),
+                            size: 1_479_966_451,
+                            installed: false,
+                        },
+                        PackChoice {
+                            id: GERMAN.to_owned(),
+                            name: "Spoken Audio: Quests (German)".to_owned(),
+                            size: 1_646_390_683,
+                            installed: false,
+                        },
+                    ],
+                },
+                PackLine {
+                    name: "Place voices".to_owned(),
+                    needed: false,
+                    choices: vec![PackChoice {
+                        id: PLACES.to_owned(),
+                        name: "Spoken Audio: Places".to_owned(),
+                        size: 456_216_109,
+                        installed: false,
+                    }],
+                },
+            ]
+        );
+        assert!(!lines[0].met() && !lines[1].met());
+    }
+
+    #[test]
+    fn a_pack_group_is_met_by_any_folder_of_any_of_its_packs_whoever_put_it_there() {
+        let b = spoken_catalog(
+            vec![group("Quest voices", true, &[QUESTS, GERMAN])],
+            Vec::new(),
+        );
+        let lines = lines_for(&b, &["spokenquestsaudiohorde"]);
+        assert!(
+            lines[0].met(),
+            "one of the quests pack's folders, in any case"
+        );
+        assert!(lines[0].choices[0].installed && !lines[0].choices[1].installed);
+        assert!(lines_for(&b, &["SpokenQuestsAudio_deDE"])[0].met());
+        assert!(!lines_for(&b, &["Spoken", "Spoken_Quests", "SpokenPlacesAudio"])[0].met());
+    }
+
+    #[test]
+    fn only_a_reviewed_entrys_groups_and_only_trusted_packs_the_catalog_has_show() {
+        let groups = vec![group(
+            "Quest voices",
+            true,
+            &[QUESTS, "gh:someone/not-listed", GERMAN, QUESTS, SPOKEN],
+        )];
+        let mut b = spoken_catalog(groups.clone(), Vec::new());
+        let choices: Vec<String> = lines_for(&b, &[])[0]
+            .choices
+            .iter()
+            .map(|c| c.id.clone())
+            .collect();
+        assert_eq!(
+            choices,
+            vec![QUESTS.to_owned(), GERMAN.to_owned()],
+            "unknown ids, repeats and the addon itself are left out"
+        );
+
+        let stranger = b.position(GERMAN).unwrap() as usize;
+        b.catalog.addons[stranger].trusted = false;
+        assert_eq!(lines_for(&b, &[])[0].choices.len(), 1);
+        let quests = b.position(QUESTS).unwrap() as usize;
+        b.catalog.addons[quests].trusted = false;
+        assert!(lines_for(&b, &[]).is_empty(), "nothing left to show");
+
+        let mut unreviewed = spoken_catalog(groups, Vec::new());
+        let spoken = unreviewed.position(SPOKEN).unwrap() as usize;
+        unreviewed.catalog.addons[spoken].reviewed = false;
+        assert!(lines_for(&unreviewed, &[]).is_empty());
+    }
+
+    #[test]
+    fn a_pack_with_no_build_is_only_shown_once_it_is_installed() {
+        let mut b = spoken_catalog(
+            vec![group("Quest voices", true, &[QUESTS, GERMAN])],
+            Vec::new(),
+        );
+        let german = b.position(GERMAN).unwrap() as usize;
+        b.catalog.addons[german].stable = None;
+        assert_eq!(lines_for(&b, &[])[0].choices.len(), 1);
+        let lines = lines_for(&b, &["SpokenQuestsAudio_deDE"]);
+        assert_eq!(lines[0].choices.len(), 2);
+        assert_eq!(lines[0].choices[1].size, 0);
+        assert!(lines[0].met());
+    }
+
+    #[test]
+    fn a_pack_size_is_the_build_its_channel_would_install() {
+        let mut b = spoken_catalog(vec![group("Quest voices", true, &[QUESTS])], Vec::new());
+        let quests = b.position(QUESTS).unwrap() as usize;
+        b.catalog.addons[quests].beta = Some(Release {
+            version: "2.6.0-beta".to_owned(),
+            size: 1_600_000_000,
+            date: 200,
+            ..Default::default()
+        });
+        let spoken = b.addon(SPOKEN).unwrap();
+        let beta = |id: &str| {
+            if id == QUESTS {
+                Channel::Beta
+            } else {
+                Channel::Stable
+            }
+        };
+        let lines = pack_lines(spoken, &b, &HashSet::new(), beta);
+        assert_eq!(lines[0].choices[0].size, 1_600_000_000);
+    }
+
+    #[test]
+    fn a_group_name_is_cleaned_and_never_left_blank() {
+        let b = spoken_catalog(
+            vec![
+                group("Quest\nvoices\u{202e}", true, &[QUESTS]),
+                group(" \u{200b} ", false, &[PLACES]),
+            ],
+            Vec::new(),
+        );
+        let names: Vec<String> = lines_for(&b, &[]).into_iter().map(|l| l.name).collect();
+        assert_eq!(names, ["Quest voices", "Packs"]);
+    }
+
+    #[test]
+    fn an_entry_that_no_longer_lists_the_main_folder_is_another_addon() {
+        let mut hijacked = addon(SPOKEN, "Spoken", "quests", 500);
+        hijacked.folders = vec![
+            "SpokenQuestsAudioAlliance".to_owned(),
+            "SpokenQuestsAudioHorde".to_owned(),
+        ];
+        hijacked.stable.as_mut().unwrap().version = "v2.5.0".to_owned();
+        let mut record = managed(SPOKEN, "Spoken", "v3.8.3");
+        record.folders = vec!["Spoken".to_owned(), "Spoken_Quests".to_owned()];
+        assert!(!same_addon(&record, &hijacked));
+        assert_eq!(update_for(&record, &hijacked), None);
+        assert_eq!(browse_tag(&hijacked, Some(&record)), Tag::Installed);
+        assert_eq!(
+            managed_tag(&record, Some(&hijacked), true),
+            Tag::Version("v3.8.3")
+        );
+        hijacked.tier = 0;
+        assert_eq!(
+            managed_tag(&record, Some(&hijacked), true),
+            Tag::Version("v3.8.3"),
+            "that addon falling behind says nothing about this one"
+        );
+
+        let b = CatalogBundle::new(Catalog {
+            addons: vec![hijacked.clone()],
+            ..Default::default()
+        });
+        assert_eq!(entry_for(&b, SPOKEN, Some(&record)), None);
+        assert!(
+            entry_for(&b, SPOKEN, None).is_some(),
+            "it's still there to browse"
+        );
+        let list = map(vec![record.clone()]);
+        assert!(updates_available(&list, Some(&b)).is_empty());
+
+        // Still listing the main folder, in any case and anywhere, it's the same addon.
+        hijacked.folders.push("SPOKEN".to_owned());
+        assert!(same_addon(&record, &hijacked));
+        assert!(update_for(&record, &hijacked).is_some());
+        // A record with no folders has nothing to tell it by.
+        record.folders.clear();
+        assert!(same_addon(&record, &hijacked));
+    }
+
+    #[test]
+    fn every_demo_addon_is_still_the_addon_its_entry_lists() {
+        let bundle = CatalogBundle::new(crate::demo::catalog());
+        let state = crate::demo::state(crate::args::Scene::Normal);
+        let records = &state.current().unwrap().managed;
+        assert!(!records.is_empty());
+        for record in records.values() {
+            if let Some(entry) = bundle.addon(&record.id) {
+                assert!(same_addon(record, entry), "{}", record.id);
+            }
         }
     }
 

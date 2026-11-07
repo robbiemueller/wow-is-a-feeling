@@ -169,7 +169,7 @@ impl Queue {
 
     /// The op about to put this folder in place, other than this addon's own. It may not be
     /// on disk yet, but it will be by the time anything queued now gets its turn.
-    fn incoming(&self, lower_folder: &str, addon_id: &str) -> Option<&Op> {
+    pub fn incoming(&self, lower_folder: &str, addon_id: &str) -> Option<&Op> {
         self.running
             .iter()
             .map(|run| &run.op)

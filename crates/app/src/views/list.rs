@@ -13,6 +13,7 @@ use eframe::egui::{
     UiBuilder, pos2, vec2,
 };
 use feeling_core::catalog::Addon;
+use feeling_core::state::Origin;
 
 pub const ROW_HEIGHT: f32 = 23.0;
 const INDENT: f32 = 26.0;
@@ -195,7 +196,7 @@ fn row_view(app: &App, row: &Row) -> RowView {
             let Some(record) = app.managed(id) else {
                 return tagged(id, theme::TEXT, Tag::Nothing);
             };
-            let addon = bundle.and_then(|b| b.addon(id));
+            let addon = bundle.and_then(|b| model::entry_for(b, id, Some(record)));
             let color = addon.map_or(theme::tier_color(1), |a| theme::tier_color(a.tier));
             tagged(
                 &record.name,
@@ -305,15 +306,25 @@ fn tooltip(app: &App, ui: &mut Ui, row: &Row) {
                 addon_tooltip(ui, addon);
             }
         }
-        Row::Managed(id) => match bundle.and_then(|b| b.addon(id)) {
-            Some(addon) => addon_tooltip(ui, addon),
-            None => {
-                if let Some(record) = app.managed(id) {
-                    widgets::tooltip_title(ui, &record.name, theme::tier_color(1));
-                    widgets::tooltip_line(ui, "Installed from a zip file");
+        Row::Managed(id) => {
+            let record = app.managed(id);
+            match bundle.and_then(|b| model::entry_for(b, id, record)) {
+                Some(addon) => addon_tooltip(ui, addon),
+                None => {
+                    if let Some(record) = record {
+                        widgets::tooltip_title(ui, &record.name, theme::tier_color(1));
+                        widgets::tooltip_line(
+                            ui,
+                            if record.origin == Origin::LocalZip {
+                                "Installed from a zip file"
+                            } else {
+                                "Not in the catalog anymore"
+                            },
+                        );
+                    }
                 }
             }
-        },
+        }
         Row::Other(i) => {
             if let Some(group) = app.groups.get(*i as usize) {
                 let color = theme::tier_color(u8::from(group.targets_forever));

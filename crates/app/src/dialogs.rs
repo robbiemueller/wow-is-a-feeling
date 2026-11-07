@@ -3,7 +3,8 @@
 
 use crate::actions::Action;
 use crate::app::App;
-use crate::ops::{FolderConflict, Verb};
+use crate::model::size_text;
+use crate::ops::{self, FolderConflict, Verb};
 use crate::theme;
 use crate::widgets::{self, ButtonKind};
 use crate::worker::{DirListing, FoundGame};
@@ -35,16 +36,104 @@ pub struct ReplacePlan {
     pub source: String,
     pub verb: Verb,
     pub conflicts: Vec<FolderConflict>,
+    /// Packs the player already chose to install with it, which follow it into the queue.
+    pub packs: Vec<String>,
 }
 
 impl ReplacePlan {
     /// Saying yes to this.
     pub fn confirmed(&self) -> Action {
-        Action::ReplaceAndInstall(
-            self.addon_id.clone(),
-            self.conflicts.iter().map(|c| c.folder.clone()).collect(),
-        )
+        Action::ReplaceAndInstall {
+            id: self.addon_id.clone(),
+            folders: self.conflicts.iter().map(|c| c.folder.clone()).collect(),
+            packs: self.packs.clone(),
+        }
     }
+}
+
+/// What a first install would leave without, worked out when the popup opens: the packs an
+/// addon needs, such as Spoken's quest voices, when nothing here or on its way provides one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PackPlan {
+    pub addon_id: String,
+    pub name: String,
+    /// Each needed group that nothing meets, by its name, such as "Quest voices".
+    pub needs: Vec<String>,
+    /// The first pack of each of those groups, as `(id, name)`, without repeats.
+    pub packs: Vec<(String, String)>,
+    /// Their downloads together, in bytes, or `None` when one of them doesn't say.
+    pub size: Option<u64>,
+}
+
+impl PackPlan {
+    /// "Spoken needs quest voices to work."
+    pub fn title(&self) -> String {
+        let needs: Vec<String> = self.needs.iter().map(|need| in_sentence(need)).collect();
+        format!("{} needs {} to work.", self.name, ops::short_list(&needs))
+    }
+
+    /// "Spoken Audio: Quests is a 1.5 GB download. Install it too?"
+    pub fn question(&self) -> String {
+        let names: Vec<&str> = self.packs.iter().map(|(_, name)| name.as_str()).collect();
+        let packs = ops::short_list(&names);
+        match (names.len() > 1, self.size) {
+            (false, Some(size)) => {
+                format!("{packs} is a {} download. Install it too?", size_text(size))
+            }
+            (false, None) => format!("{packs} is a separate download. Install it too?"),
+            (true, Some(size)) => {
+                format!(
+                    "{packs} are a {} download. Install them too?",
+                    size_text(size)
+                )
+            }
+            (true, None) => format!("{packs} are separate downloads. Install them too?"),
+        }
+    }
+
+    /// The main button, which installs the addon and every pack offered.
+    pub fn yes_label(&self) -> &'static str {
+        if self.packs.len() > 1 {
+            "Install all"
+        } else {
+            "Install both"
+        }
+    }
+
+    /// "Just Spoken"
+    pub fn no_label(&self) -> String {
+        format!("Just {}", self.name)
+    }
+
+    pub fn with_packs(&self) -> Action {
+        Action::InstallWithPacks {
+            id: self.addon_id.clone(),
+            packs: self.packs.iter().map(|(id, _)| id.clone()).collect(),
+        }
+    }
+
+    pub fn without_packs(&self) -> Action {
+        Action::InstallWithPacks {
+            id: self.addon_id.clone(),
+            packs: Vec::new(),
+        }
+    }
+}
+
+/// A group's name as it reads inside a sentence: "Quest voices" becomes "quest voices". One
+/// that starts with an acronym, such as "UI skins", keeps it.
+fn in_sentence(name: &str) -> String {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return String::new();
+    };
+    if chars.next().is_some_and(char::is_uppercase) {
+        return name.to_owned();
+    }
+    first
+        .to_lowercase()
+        .chain(name[first.len_utf8()..].chars())
+        .collect()
 }
 
 /// What a pasted list would do.
@@ -60,6 +149,7 @@ pub enum Popup {
     AlreadyRunning,
     Remove(RemovePlan),
     Replace(ReplacePlan),
+    Packs(PackPlan),
     AppUpdate(Box<UpdateInfo>),
     Restore { zip: PathBuf, when: String },
     Folder(Box<FolderBrowser>),
@@ -91,7 +181,7 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
     let mut keep = !escape;
     let width: f32 = match &popup {
         Popup::Folder(_) => 560.0,
-        Popup::AppUpdate(_) | Popup::List(_) | Popup::Replace(_) => 460.0,
+        Popup::AppUpdate(_) | Popup::List(_) | Popup::Replace(_) | Popup::Packs(_) => 460.0,
         _ => 400.0,
     };
     let mut popup = popup;
@@ -119,6 +209,7 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
                 Popup::AlreadyRunning => already_running(ui, ctx),
                 Popup::Remove(plan) => remove(ui, app, plan, &mut keep),
                 Popup::Replace(plan) => replace(ui, app, plan, &mut keep),
+                Popup::Packs(plan) => packs(ui, app, plan, &mut keep),
                 Popup::AppUpdate(info) => app_update(ui, app, info, &mut keep),
                 Popup::Restore { zip, when } => restore(ui, app, zip, when, &mut keep),
                 Popup::Folder(browser) => folder(ui, app, browser, &mut keep),
@@ -274,6 +365,24 @@ fn replace(ui: &mut Ui, app: &mut App, plan: &ReplacePlan, keep: &mut bool) {
             *keep = false;
         }
         if widgets::button(ui, "Cancel", ButtonKind::Quiet, true).clicked() {
+            *keep = false;
+        }
+    });
+}
+
+/// Asked once per click, before a first install of an addon that needs a pack. Escape is
+/// Cancel, as on every popup, so nothing at all gets installed.
+fn packs(ui: &mut Ui, app: &mut App, plan: &PackPlan, keep: &mut bool) {
+    yellow(ui, &plan.title());
+    ui.add_space(4.0);
+    plain(ui, &plan.question());
+    button_row(ui, |ui| {
+        if widgets::button(ui, plan.yes_label(), ButtonKind::Main, true).clicked() {
+            app.actions.push(plan.with_packs());
+            *keep = false;
+        }
+        if widgets::button(ui, &plan.no_label(), ButtonKind::Quiet, true).clicked() {
+            app.actions.push(plan.without_packs());
             *keep = false;
         }
     });
@@ -543,4 +652,99 @@ fn list(ui: &mut Ui, app: &mut App, preview: &ListPreview, keep: &mut bool) {
             *keep = false;
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn plan(needs: &[&str], packs: &[(&str, &str)], size: Option<u64>) -> PackPlan {
+        PackPlan {
+            addon_id: "gh:rusty-key/spoken-wow".to_owned(),
+            name: "Spoken".to_owned(),
+            needs: needs.iter().map(|n| (*n).to_owned()).collect(),
+            packs: packs
+                .iter()
+                .map(|(id, name)| ((*id).to_owned(), (*name).to_owned()))
+                .collect(),
+            size,
+        }
+    }
+
+    const QUESTS: (&str, &str) = (
+        "gh:rusty-key/spoken-wow/quests-audio",
+        "Spoken Audio: Quests",
+    );
+    const BOSSES: (&str, &str) = (
+        "gh:rusty-key/spoken-wow/bosses-audio",
+        "Spoken Audio: Bosses",
+    );
+
+    #[test]
+    fn one_missing_pack_is_asked_about_by_name_and_size() {
+        let one = plan(&["Quest voices"], &[QUESTS], Some(1_479_966_451));
+        assert_eq!(one.title(), "Spoken needs quest voices to work.");
+        assert_eq!(
+            one.question(),
+            "Spoken Audio: Quests is a 1.5 GB download. Install it too?"
+        );
+        assert_eq!(one.yes_label(), "Install both");
+        assert_eq!(one.no_label(), "Just Spoken");
+        assert!(matches!(
+            one.with_packs(),
+            Action::InstallWithPacks { id, packs }
+                if id == "gh:rusty-key/spoken-wow" && packs == [QUESTS.0]
+        ));
+        assert!(matches!(
+            one.without_packs(),
+            Action::InstallWithPacks { packs, .. } if packs.is_empty()
+        ));
+    }
+
+    #[test]
+    fn several_missing_packs_are_named_and_added_up() {
+        let two = plan(
+            &["Quest voices", "Boss voices"],
+            &[QUESTS, BOSSES],
+            Some(1_479_966_451 + 157_070_901),
+        );
+        assert_eq!(
+            two.title(),
+            "Spoken needs quest voices and boss voices to work."
+        );
+        assert_eq!(
+            two.question(),
+            "Spoken Audio: Quests and Spoken Audio: Bosses are a 1.6 GB download. \
+             Install them too?"
+        );
+        assert_eq!(two.yes_label(), "Install all");
+        assert!(matches!(
+            two.with_packs(),
+            Action::InstallWithPacks { packs, .. } if packs == [QUESTS.0, BOSSES.0]
+        ));
+    }
+
+    #[test]
+    fn a_pack_of_unknown_size_is_still_asked_about_honestly() {
+        let unknown = plan(&["Quest voices"], &[QUESTS], None);
+        assert_eq!(
+            unknown.question(),
+            "Spoken Audio: Quests is a separate download. Install it too?"
+        );
+        let both = plan(&["Quest voices", "Boss voices"], &[QUESTS, BOSSES], None);
+        assert_eq!(
+            both.question(),
+            "Spoken Audio: Quests and Spoken Audio: Bosses are separate downloads. \
+             Install them too?"
+        );
+    }
+
+    #[test]
+    fn a_group_name_reads_naturally_inside_a_sentence() {
+        assert_eq!(in_sentence("Quest voices"), "quest voices");
+        assert_eq!(in_sentence("UI skins"), "UI skins");
+        assert_eq!(in_sentence("Ärger"), "ärger");
+        assert_eq!(in_sentence("X"), "x");
+        assert_eq!(in_sentence(""), "");
+    }
 }

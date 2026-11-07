@@ -12,6 +12,7 @@ use crate::state::ManagedAddon;
 const HEADER: &str = "# WoW is a Feeling addon list";
 const BETA_SUFFIX: &str = " @beta";
 const MAX_NAME_LEN: usize = 100;
+const MAX_LINE_LEN: usize = 64;
 const MAX_WOWI_ID_LEN: usize = 20;
 const MAX_UNKNOWN_LINE_CHARS: usize = 200;
 
@@ -84,16 +85,22 @@ fn parse_entry(content: &str) -> Option<(&str, Channel)> {
     is_valid_id(id).then_some((id, channel))
 }
 
-/// True for `gh:owner/repo`, `wowi:1234` and `direct:name`, in a strict character
-/// set that can't spell a path, a URL or a command.
+/// True for `gh:owner/repo`, `gh:owner/repo/<line>`, `wowi:1234` and `direct:name`, in a
+/// strict character set that can't spell a path, a URL or a command.
 pub fn is_valid_id(id: &str) -> bool {
     let Some((kind, rest)) = id.split_once(':') else {
         return false;
     };
     match kind {
-        "gh" => rest
-            .split_once('/')
-            .is_some_and(|(owner, repo)| is_safe_name(owner) && is_safe_name(repo)),
+        "gh" => {
+            let mut parts = rest.split('/');
+            let (Some(owner), Some(repo), line, None) =
+                (parts.next(), parts.next(), parts.next(), parts.next())
+            else {
+                return false;
+            };
+            is_safe_name(owner) && is_safe_name(repo) && line.is_none_or(is_line_name)
+        }
         "wowi" => {
             !rest.is_empty()
                 && rest.len() <= MAX_WOWI_ID_LEN
@@ -111,6 +118,19 @@ fn is_safe_name(name: &str) -> bool {
         && name
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+
+/// The tag prefix a repository publishes one of its other addons under, such as
+/// `quests-audio`. Always lowercase, so an author changing a tag's case can't orphan the
+/// records of everyone who has it.
+fn is_line_name(line: &str) -> bool {
+    !line.is_empty()
+        && line.len() <= MAX_LINE_LEN
+        && !line.starts_with('-')
+        && !line.ends_with('-')
+        && line
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
 #[cfg(test)]
@@ -244,7 +264,8 @@ mod tests {
             "gh:owner/..",
             "gh:../repo",
             "gh:owner/repo/../../other",
-            "gh:owner/repo/extra",
+            "gh:owner/repo/..",
+            "gh:owner/repo/extra/more",
             "gh:owner\\repo",
             "gh:owner/repo;rm -rf /",
             "gh:owner/$(whoami)",
@@ -281,6 +302,54 @@ mod tests {
             );
             assert_eq!(parsed.unknown_lines, [line], "for {line:?}");
         }
+    }
+
+    #[test]
+    fn a_release_line_of_a_repository_is_an_id_of_its_own() {
+        let pack = "gh:rusty-key/spoken-wow/quests-audio";
+        assert!(is_valid_id(pack));
+        assert!(is_valid_id("gh:owner/repo/v2"));
+        assert!(is_valid_id(&format!("gh:a/b/{}", "x".repeat(MAX_LINE_LEN))));
+        assert_eq!(
+            parse(&format!("{pack}\n{pack}-de @beta\n")).entries,
+            [stable(pack), beta(&format!("{pack}-de"))]
+        );
+        let shared = export(&[managed(pack, Channel::Stable)]);
+        assert_eq!(parse(&shared).entries, [stable(pack)]);
+    }
+
+    #[test]
+    fn a_release_line_is_lowercase_letters_digits_and_inner_dashes_only() {
+        for id in [
+            "gh:owner/repo/",
+            "gh:owner/repo/Quests-Audio",
+            "gh:owner/repo/quests_audio",
+            "gh:owner/repo/quests.audio",
+            "gh:owner/repo/-quests",
+            "gh:owner/repo/quests-",
+            "gh:owner/repo/-",
+            "gh:owner/repo/.",
+            "gh:owner/repo/quests audio",
+            "gh:owner/repo/quests@beta",
+            "gh:owner/repo/quests#1",
+            "gh:owner/repo@quests-audio",
+            "gh:owner/repo#quests-audio",
+            "gh:owner//quests",
+            "gh:/repo/quests",
+            "gh:owner/repo/a/b",
+            "gh:owner/repo/a/b/c",
+            "gh:owner/repo/ünï",
+        ] {
+            assert!(!is_valid_id(id), "accepted {id:?}");
+        }
+        assert!(!is_valid_id(&format!(
+            "gh:a/b/{}",
+            "x".repeat(MAX_LINE_LEN + 1)
+        )));
+        // `@` names a channel and `#` starts a comment, so neither ever ends up inside an id.
+        let parsed = parse("gh:owner/repo@quests-audio\ngh:owner/repo/q#uests\n");
+        assert_eq!(parsed.entries, [stable("gh:owner/repo/q")]);
+        assert_eq!(parsed.unknown_lines, ["gh:owner/repo@quests-audio"]);
     }
 
     #[test]

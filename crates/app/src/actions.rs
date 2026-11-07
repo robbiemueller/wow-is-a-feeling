@@ -2,7 +2,7 @@
 //! halfway through being drawn.
 
 use crate::app::App;
-use crate::dialogs::{ListPreview, Popup, RemovePlan, ReplacePlan};
+use crate::dialogs::{ListPreview, PackPlan, Popup, RemovePlan, ReplacePlan};
 use crate::easter;
 use crate::model::{self, CatalogBundle, HeaderId, Section, Selection, Tab};
 use crate::ops::{self, FolderConflict, Op, OpKind, Verb, folder_set};
@@ -32,8 +32,22 @@ pub enum Action {
     SearchChanged,
     /// Install, update or reinstall these, whichever each one needs.
     Install(Vec<String>),
+    /// The main button on an addon's page. A first install of an addon that needs a pack
+    /// nothing here provides asks about that before anything else.
+    InstallFromPage(String),
+    /// The player answered the packs popup: on with installing this addon, and these packs
+    /// beside it, which may be none.
+    InstallWithPacks {
+        id: String,
+        packs: Vec<String>,
+    },
     /// The player said yes to the popup: go ahead, and this addon may replace these folders.
-    ReplaceAndInstall(String, Vec<String>),
+    /// The packs they chose before that go too.
+    ReplaceAndInstall {
+        id: String,
+        folders: Vec<String>,
+        packs: Vec<String>,
+    },
     UpdateAll,
     Rollback(String),
     AskRemove(Selection),
@@ -117,8 +131,10 @@ impl App {
                 self.list_to_top = true;
             }
             Action::Install(ids) => self.install_addons(ids),
-            Action::ReplaceAndInstall(id, folders) => {
-                self.queue_installs(std::slice::from_ref(&id), &folders);
+            Action::InstallFromPage(id) => self.install_from_page(id),
+            Action::InstallWithPacks { id, packs } => self.ask_about_folders(id, packs),
+            Action::ReplaceAndInstall { id, folders, packs } => {
+                self.queue_with_packs(&id, &folders, &packs);
             }
             Action::UpdateAll => self.update_all(),
             Action::Rollback(id) => self.roll_back(&id),
@@ -233,8 +249,8 @@ impl App {
         true
     }
 
-    /// The Install or Update button. One addon gets to ask first if it would replace a folder
-    /// that isn't its own. Several at once can't, so those sit out and say so.
+    /// Install, update or reinstall these. One addon gets to ask first if it would replace a
+    /// folder that isn't its own. Several at once can't, so those sit out and say so.
     pub fn install_addons(&mut self, ids: Vec<String>) {
         if ids.is_empty()
             || self.needs_a_folder(Action::Install(ids.clone()))
@@ -242,14 +258,106 @@ impl App {
         {
             return;
         }
-        if let [id] = ids.as_slice()
-            && !self.queue.busy_with(id)
-            && let Some(plan) = self.replace_plan(id)
+        match ids.as_slice() {
+            [id] => self.ask_about_folders(id.clone(), Vec::new()),
+            _ => self.queue_installs(&ids, &[]),
+        }
+    }
+
+    /// The main button on an addon's page. A first install of an addon that needs a pack
+    /// nothing here provides, such as Spoken and its quest voices, asks about that first. Once
+    /// answered it goes on as any other click would, so each question is asked once.
+    fn install_from_page(&mut self, id: String) {
+        let again = Action::InstallFromPage(id.clone());
+        if self.needs_a_folder(again.clone()) || self.needs_a_scan(again) {
+            return;
+        }
+        match self.pack_plan(&id) {
+            Some(plan) => self.show_popup(Popup::Packs(plan)),
+            None => self.ask_about_folders(id, Vec::new()),
+        }
+    }
+
+    /// Ask before an install that would replace folders that aren't this addon's, then queue
+    /// it, and the packs the player chose to go with it.
+    fn ask_about_folders(&mut self, id: String, packs: Vec<String>) {
+        if !self.queue.busy_with(&id)
+            && let Some(mut plan) = self.replace_plan(&id)
         {
+            plan.packs = packs;
             self.show_popup(Popup::Replace(plan));
             return;
         }
-        self.queue_installs(&ids, &[]);
+        self.queue_with_packs(&id, &[], &packs);
+    }
+
+    /// Queue an addon, then its packs. A pack only follows an addon that really joined the
+    /// queue: voices are no use without the addon that plays them.
+    fn queue_with_packs(&mut self, id: &str, agreed: &[String], packs: &[String]) {
+        self.queue_installs(&[id.to_owned()], agreed);
+        if !packs.is_empty() && self.queue.busy_with(id) {
+            self.queue_installs(packs, &[]);
+        }
+    }
+
+    /// The question to ask before a first install of an addon with a needed pack group that
+    /// nothing meets: nothing in AddOns or in a record, nothing this install brings with it,
+    /// and nothing already on its way. It offers each such group's first pack.
+    fn pack_plan(&self, id: &str) -> Option<PackPlan> {
+        if self.managed(id).is_some() || self.queue.busy_with(id) {
+            return None;
+        }
+        let bundle = self.bundle.as_deref()?;
+        let addon = bundle.addon(id)?;
+        let installed = self.installed_folders();
+        // The addon itself and what it requires, which join the same batch.
+        let batch =
+            deps::resolve(id, &bundle.catalog, &bundle.folders, installed.iter()).to_install;
+        let batch_folders: HashSet<String> = batch
+            .iter()
+            .filter_map(|step| bundle.addon(step))
+            .flat_map(|step| folder_set(&step.folders))
+            .collect();
+        let arrives = |choice: &model::PackChoice| {
+            batch.contains(&choice.id)
+                || bundle.addon(&choice.id).is_some_and(|pack| {
+                    pack.folders.iter().any(|folder| {
+                        let lower = folder.to_lowercase();
+                        batch_folders.contains(&lower) || self.queue.incoming(&lower, id).is_some()
+                    })
+                })
+        };
+        let lines = model::pack_lines(addon, bundle, &folder_set(&installed), |pack| {
+            self.channel_of(pack)
+        });
+        let unmet: Vec<model::PackLine> = lines
+            .into_iter()
+            .filter(|line| line.needed && !line.met() && !line.choices.iter().any(arrives))
+            .collect();
+        if unmet.is_empty() {
+            return None;
+        }
+        let mut packs: Vec<&model::PackChoice> = Vec::new();
+        for line in &unmet {
+            let first = &line.choices[0];
+            if !packs.iter().any(|pack| pack.id == first.id) {
+                packs.push(first);
+            }
+        }
+        // Sizes come from the catalog, so a silly one mustn't overflow the sum.
+        let size = packs.iter().try_fold(0u64, |total, pack| {
+            (pack.size > 0).then(|| total.saturating_add(pack.size))
+        });
+        Some(PackPlan {
+            addon_id: id.to_owned(),
+            name: addon.name.clone(),
+            needs: unmet.iter().map(|line| line.name.clone()).collect(),
+            packs: packs
+                .iter()
+                .map(|pack| (pack.id.clone(), pack.name.clone()))
+                .collect(),
+            size,
+        })
     }
 
     /// Update all never asks: it just does what it can without taking anything from anyone.
@@ -277,24 +385,29 @@ impl App {
 
     /// The question to put to the player before installing this, if there is one.
     fn replace_plan(&self, id: &str) -> Option<ReplacePlan> {
-        let addon = self.bundle.as_deref()?.addon(id)?;
+        let record = self.managed(id);
+        let addon = model::entry_for(self.bundle.as_deref()?, id, record)?;
         let conflicts = self.folder_conflicts(addon);
         if conflicts.is_empty() {
             return None;
         }
-        let record = self.managed(id);
-        let channel = model::channel_for(
-            record,
-            self.channel_choice.get(id).copied(),
-            self.state.settings.default_channel,
-        );
         Some(ReplacePlan {
             addon_id: id.to_owned(),
             name: addon.name.clone(),
             source: model::source_text(addon),
-            verb: verb_for(record, addon.release(channel)?),
+            verb: verb_for(record, addon.release(self.channel_of(id))?),
             conflicts,
+            packs: Vec::new(),
         })
+    }
+
+    /// The name of an installed addon whose catalog entry has since become another addon,
+    /// which counts as gone from the catalog: updating to it would swap this addon's folders
+    /// for that one's.
+    fn turned_into_another(&self, id: &str) -> Option<String> {
+        let record = self.managed(id)?;
+        let addon = self.bundle.as_deref()?.addon(id)?;
+        (!model::same_addon(record, addon)).then(|| record.name.clone())
     }
 
     /// Queue these and what they require. `agreed` is what the player said one of them may
@@ -310,6 +423,10 @@ impl App {
         let mut told: HashSet<String> = HashSet::new();
         for id in ids {
             if self.queue.busy_with(id) {
+                continue;
+            }
+            if let Some(name) = self.turned_into_another(id) {
+                self.yellow(gone_line(&name));
                 continue;
             }
             let name = bundle.addon(id).map_or(id.as_str(), |a| a.name.as_str());
@@ -415,13 +532,13 @@ impl App {
     /// `allowed` is what this may replace on top of its own folders.
     fn install_draft(&mut self, id: &str, allowed: Vec<String>) -> Option<Draft> {
         let bundle = self.bundle.clone()?;
+        if let Some(name) = self.turned_into_another(id) {
+            self.yellow(gone_line(&name));
+            return None;
+        }
         let addon = bundle.addon(id)?;
         let record = self.managed(id).cloned();
-        let channel = model::channel_for(
-            record.as_ref(),
-            self.channel_choice.get(id).copied(),
-            self.state.settings.default_channel,
-        );
+        let channel = self.channel_of(id);
         let Some(release) = addon.release(channel) else {
             self.red(format!("{} has no build for Forever yet.", addon.name));
             return None;
@@ -563,8 +680,12 @@ impl App {
     }
 
     /// Take over an addon another tool installed. Nothing on disk changes: from here on
-    /// it just has a record, so it gets updates.
+    /// it just has a record, so it gets updates. One already managed keeps its record, even
+    /// when its catalog entry has since become another addon whose folders are here too.
     fn adopt(&mut self, id: &str) {
+        if self.managed(id).is_some() {
+            return;
+        }
         let Some(adoption) = self.adoption_for(id).cloned() else {
             return;
         };
@@ -730,6 +851,11 @@ impl App {
             exclusive: true,
         }]);
     }
+}
+
+/// Why an addon whose entry has become another addon isn't updated, in its page's words.
+fn gone_line(name: &str) -> String {
+    format!("{name} isn't in the catalog anymore, so it doesn't get updates.")
 }
 
 fn verb_for(record: Option<&ManagedAddon>, release: &Release) -> Verb {

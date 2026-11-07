@@ -93,15 +93,28 @@ pub fn fetch(http: &Http, addon: &Addon) -> Result<Details> {
 
 fn fetch_from(http: &Http, addon: &Addon, endpoints: &Endpoints<'_>) -> Result<Details> {
     match &addon.source {
+        _ if is_release_line(&addon.id) => Ok(summary_only(addon)),
         Source::Github { repo } if is_plain_repo(repo) => {
             fetch_github(http, repo, addon, endpoints)
         }
         Source::Wowi { id } => fetch_wowi(http, *id, addon, endpoints),
-        _ => Ok(Details {
-            about: addon.summary.clone(),
-            ..Details::default()
-        }),
+        _ => Ok(summary_only(addon)),
     }
+}
+
+fn summary_only(addon: &Addon) -> Details {
+    Details {
+        about: addon.summary.clone(),
+        ..Details::default()
+    }
+}
+
+/// `gh:owner/repo/<line>`: one of the other addons a repository publishes, such as a voice
+/// pack. The repository's README and releases are about its main addon, so they'd only
+/// describe the wrong thing here, and the catalog's summary is the better account.
+fn is_release_line(id: &str) -> bool {
+    id.strip_prefix("gh:")
+        .is_some_and(|rest| rest.split('/').count() > 2)
 }
 
 /// `repo` comes from the catalog and lands inside URLs, so it has to look like `owner/name`.
@@ -1172,6 +1185,41 @@ mod tests {
         });
         let details = fetch_from(&Http::allowing_loopback(), &direct, &endpoints(&server)).unwrap();
         assert_eq!(details.about, "The catalog's summary.");
+    }
+
+    #[test]
+    fn a_release_line_shows_its_summary_not_the_repositorys_readme() {
+        let server = serve(|_, _| panic!("no request should be made"));
+        let mut pack = addon(Source::Github {
+            repo: "rusty-key/spoken-wow".into(),
+        });
+        pack.id = "gh:rusty-key/spoken-wow/quests-audio".into();
+        let details = fetch_from(&Http::allowing_loopback(), &pack, &endpoints(&server)).unwrap();
+        assert_eq!(
+            details,
+            Details {
+                about: "The catalog's summary.".into(),
+                changelog: None,
+                images: Vec::new(),
+            }
+        );
+        assert_eq!(server.hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn the_repositorys_own_entry_still_gets_its_readme() {
+        let server = serve(|request, stream| match request.path.as_str() {
+            "/rusty-key/spoken-wow/HEAD/README.md" => {
+                respond(stream, "200 OK", &[], b"Reads quests aloud.");
+            }
+            _ => respond(stream, "404 Not Found", &[], b""),
+        });
+        let mut spoken = addon(Source::Github {
+            repo: "rusty-key/spoken-wow".into(),
+        });
+        spoken.id = "gh:rusty-key/spoken-wow".into();
+        let details = fetch_from(&Http::allowing_loopback(), &spoken, &endpoints(&server)).unwrap();
+        assert_eq!(details.about, "Reads quests aloud.");
     }
 
     #[test]

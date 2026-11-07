@@ -550,16 +550,28 @@ pub fn fact(ui: &mut Ui, key: &str, value: &str) {
 pub fn fact_with(ui: &mut Ui, key: &str, value: impl FnOnce(&mut Ui)) {
     const KEY_WIDTH: f32 = 74.0;
     let width = ui.available_width();
+    let font = theme::label(14.5);
+    // Keys line up in one column. A longer one, such as a pack group's name, gets the room it
+    // needs, up to half the line, and its value the rest: otherwise the key would push its
+    // value along and off the page's right edge.
+    let key_size = ui
+        .painter()
+        .layout_no_wrap(key.to_owned(), font.clone(), theme::INK_SOFT)
+        .size();
+    let key_width = KEY_WIDTH.max((key_size.x + 4.0).min(width * 0.5));
     ui.allocate_ui_with_layout(
         vec2(width, 0.0),
         egui::Layout::left_to_right(egui::Align::TOP),
         |ui| {
-            ui.allocate_ui(vec2(KEY_WIDTH, 18.0), |ui| {
-                ui.set_width(KEY_WIDTH);
-                ink(ui, key, theme::label(14.5), theme::INK_SOFT);
+            ui.allocate_ui(vec2(key_width, 18.0), |ui| {
+                ui.set_width(key_width);
+                ui.add(
+                    egui::Label::new(egui::RichText::new(key).font(font).color(theme::INK_SOFT))
+                        .wrap(),
+                );
             });
             ui.vertical(|ui| {
-                ui.set_max_width((width - KEY_WIDTH - 8.0).max(40.0));
+                ui.set_max_width((width - key_width - 8.0).max(40.0));
                 value(ui);
             });
         },

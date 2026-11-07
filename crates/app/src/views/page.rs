@@ -5,6 +5,7 @@ use crate::actions::Action;
 use crate::app::{App, PageKind};
 use crate::details_cache::Fetch;
 use crate::model::{self, CatalogStatus, GameState, MainButton, Selection, Tag, clean_line};
+use crate::ops::folder_set;
 use crate::theme;
 use crate::widgets::{self, ButtonKind};
 use eframe::egui::{
@@ -291,8 +292,12 @@ fn tier_ink(tier: u8) -> Color32 {
 
 fn addon_page(app: &mut App, ui: &mut Ui, rect: Rect, id: &str) {
     let bundle = app.bundle.clone();
-    let addon = bundle.as_deref().and_then(|b| b.addon(id));
     let record = app.managed(id).cloned();
+    // An installed addon whose entry has become another addon gets the page of one that left
+    // the catalog, with no Install, Update or Reinstall that would turn it into that addon.
+    let addon = bundle
+        .as_deref()
+        .and_then(|b| model::entry_for(b, id, record.as_ref()));
     let Some(addon) = addon else {
         match record {
             Some(record) => managed_only_page(app, ui, rect, &record),
@@ -438,6 +443,7 @@ fn addon_body(
         widgets::fact(ui, "Folders:", &clean_line(&addon.folders.join(", "), 600));
     }
     requires(app, ui, addon);
+    packs(app, ui, addon);
     ui.add_space(10.0);
     details_sections(app, ui, addon);
 }
@@ -491,6 +497,69 @@ fn requires(app: &mut App, ui: &mut Ui, addon: &Addon) {
             }
         });
     });
+}
+
+/// Packs that go with this addon, such as voice packs, one line per group. Each is a link to
+/// its own page, where installing it is a deliberate press with its size and source in view.
+/// A needed group with nothing installed says so in red, because the addon does nothing
+/// useful until it's met.
+fn packs(app: &mut App, ui: &mut Ui, addon: &Addon) {
+    // Most addons have none, so they don't pay for a look at every folder each frame.
+    if !addon.reviewed || addon.packs.is_empty() {
+        return;
+    }
+    let Some(bundle) = app.bundle.clone() else {
+        return;
+    };
+    let installed = folder_set(&app.installed_folders());
+    let lines = model::pack_lines(addon, &bundle, &installed, |id| app.channel_of(id));
+    for line in &lines {
+        widgets::fact_with(ui, &format!("{}:", line.name), |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                for (i, choice) in line.choices.iter().enumerate() {
+                    if i > 0 {
+                        aside(ui, "or", theme::INK_SOFT);
+                    }
+                    let link = widgets::ink_link(ui, &choice.name, theme::strong(15.0));
+                    if link.clicked() {
+                        app.actions
+                            .push(Action::Select(Selection::Addon(choice.id.clone())));
+                    }
+                    if choice.installed {
+                        aside(ui, "(installed)", theme::INK_GOOD);
+                    } else if choice.size > 0 {
+                        aside(
+                            ui,
+                            format!("({})", model::size_text(choice.size)),
+                            theme::INK_SOFT,
+                        );
+                    }
+                }
+            });
+            if line.needed && !line.met() {
+                widgets::ink(
+                    ui,
+                    format!("{} needs one of these to work.", addon.name),
+                    theme::body(14.5),
+                    theme::INK_BAD,
+                );
+            }
+        });
+    }
+}
+
+/// A few words beside a link, such as "(1.5 GB)". Like the link, they go to the next line
+/// whole rather than break in two.
+fn aside(ui: &mut Ui, text: impl Into<String>, color: Color32) {
+    ui.add(
+        egui::Label::new(
+            RichText::new(text.into())
+                .font(theme::body(14.0))
+                .color(color),
+        )
+        .extend(),
+    );
 }
 
 /// Screenshots, About and Changelog, whatever has arrived so far. A readme can run long,
