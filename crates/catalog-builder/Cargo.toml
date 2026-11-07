@@ -10,3 +10,12 @@ publish = false
 
 [dependencies]
 feeling-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ureq.workspace = true
+zip.workspace = true
+flate2.workspace = true
+toml = "1"
+
+[dev-dependencies]
+tempfile = "3"

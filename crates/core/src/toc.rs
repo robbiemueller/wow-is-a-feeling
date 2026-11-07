@@ -175,6 +175,19 @@ pub fn strip_ui_escapes(input: &str) -> String {
         match chars.peek().copied() {
             Some('c') | Some('C') => {
                 chars.next();
+                // `|cnGLOBAL_COLOR_NAME:` names a color instead of spelling it out.
+                if chars.peek() == Some(&'n') {
+                    let mut ahead = chars.clone();
+                    ahead.next();
+                    let name_length = ahead
+                        .clone()
+                        .take_while(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || *c == '_')
+                        .count();
+                    if name_length > 0 && ahead.nth(name_length) == Some(':') {
+                        chars = ahead;
+                        continue;
+                    }
+                }
                 for _ in 0..8 {
                     if chars.peek().is_some_and(char::is_ascii_hexdigit) {
                         chars.next();
@@ -383,6 +396,8 @@ mod tests {
     #[test]
     fn strips_ui_escapes() {
         assert_eq!(strip_ui_escapes("|cFFFF0000Red|r Text"), "Red Text");
+        assert_eq!(strip_ui_escapes("|cnCONTEXT_FEEDBACK_COLOR:Sippy Cup|r"), "Sippy Cup");
+        assert_eq!(strip_ui_escapes("|cnot a color"), "not a color");
         assert_eq!(strip_ui_escapes("|TInterface\\Foo:16|t Icon"), "Icon");
         assert_eq!(strip_ui_escapes("|Aatlas:16:16|a Atlas"), "Atlas");
         assert_eq!(strip_ui_escapes("One|nTwo"), "One Two");

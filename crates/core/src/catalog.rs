@@ -118,6 +118,8 @@ pub struct Move {
     /// Path prefix inside the zip, with `/` separators and no trailing slash.
     /// A leading `*/` matches any single first segment, because the wrapper
     /// folder of a GitHub source archive is derived from the tag name.
+    /// `*/` on its own matches everything inside that wrapper folder, for addons
+    /// whose repository root is the addon folder (Details).
     /// When several moves match a path, the longest `from` wins.
     pub from: String,
     /// Folder name directly under `Interface/AddOns`.
