@@ -280,7 +280,7 @@ fn replace(ui: &mut Ui, app: &mut App, plan: &ReplacePlan, keep: &mut bool) {
 }
 
 fn app_update(ui: &mut Ui, app: &mut App, info: &UpdateInfo, keep: &mut bool) {
-    yellow(ui, &format!("Version {} is ready.", info.version));
+    yellow(ui, &format!("Version {} is available.", info.version));
     plain(
         ui,
         &format!("(You have {}.)", crate::views::settings::VERSION),

@@ -2397,7 +2397,7 @@ fn the_update_prompt_offers_exactly_what_the_spec_says() {
         h.step();
     };
     show(&mut h);
-    assert!(has_label(&h, "Version 0.2.0 is ready."));
+    assert!(has_label(&h, "Version 0.2.0 is available."));
     assert!(has_label(&h, "(You have 0.1.0.)"));
     assert!(has_label(&h, "Update now") && has_label(&h, "Later"));
     click(&mut h, "Later");

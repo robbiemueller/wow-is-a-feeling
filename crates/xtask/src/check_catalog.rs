@@ -76,6 +76,11 @@ fn static_problems(catalog: &Catalog) -> Vec<String> {
                     "{} has a link the app refuses: {}",
                     addon.id, release.url
                 ));
+            } else if !is_listed_download_host(&release.url) {
+                problems.push(format!(
+                    "{} downloads from a site the README doesn't list: {}",
+                    addon.id, release.url
+                ));
             }
         }
     }
@@ -98,6 +103,31 @@ fn static_problems(catalog: &Catalog) -> Vec<String> {
         }
     }
     problems
+}
+
+/// The download sites README.md lists under "What it connects to". A catalog that sends
+/// players anywhere else would make that list untrue, so it fails this check.
+const LISTED_DOWNLOAD_HOSTS: [&str; 5] = [
+    "github.com",
+    "githubusercontent.com",
+    "wowinterface.com",
+    "mmoui.com",
+    "foreverdb.net",
+];
+
+fn is_listed_download_host(url: &str) -> bool {
+    let rest = url.strip_prefix("https://").unwrap_or(url);
+    let host = rest
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or("")
+        .split(':')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    LISTED_DOWNLOAD_HOSTS
+        .iter()
+        .any(|listed| host == *listed || host.ends_with(&format!(".{listed}")))
 }
 
 /// The entries most likely to break or matter first, then an even spread of the rest.
@@ -190,4 +220,30 @@ fn try_install(http: &Http, addon: &Addon) -> Result<String, String> {
         outcome.forever_folders.len(),
         outcome.skipped_files.len()
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_the_download_sites_the_readme_lists_pass() {
+        for url in [
+            "https://github.com/a/b/releases/download/v1/a.zip",
+            "https://codeload.github.com/a/b/zip/refs/tags/v1",
+            "https://cdn.wowinterface.com/downloads/getfile.php?id=1",
+            "https://cdn-wow.mmoui.com/x.zip",
+            "https://foreverdb.net/downloads/ForeverDB.zip",
+        ] {
+            assert!(is_listed_download_host(url), "{url}");
+        }
+        for url in [
+            "https://example.com/a.zip",
+            "https://github.com.evil.example/a.zip",
+            "https://notgithub.com/a.zip",
+            "https://foreverdb.net.example/a.zip",
+        ] {
+            assert!(!is_listed_download_host(url), "{url}");
+        }
+    }
 }

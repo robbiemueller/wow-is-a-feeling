@@ -97,7 +97,7 @@ Which folders a removal deletes, and which old folders an update or rollback dro
 
 Vanilla-style static popups via `egui::Modal`: dark fill, gold border, centered near the top, yellow text, red buttons. One at a time; Escape cancels. The update prompt is one of these:
 
-> **Version 0.2.0 is ready.** (You have 0.1.0.) What changed, scrollable. **Update now**, **Later**, **Skip this version**.
+> **Version 0.2.0 is available.** (You have 0.1.0.) What changed, scrollable. **Update now**, **Later**, **Skip this version**.
 
 Update now shows progress on the casting bar, then relaunches. Failure is a red message and the app keeps running on the old version.
 

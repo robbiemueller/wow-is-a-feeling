@@ -203,7 +203,7 @@ footer p { margin: 0 0 8px; max-width: 80ch; }
       <h2>Objectives</h2>
       <ul class="objectives">
         <li>Browse Forever addons you don't have yet, right in the app</li>
-        <li>Install, update and remove with one click</li>
+        <li>Install and update with one click, and remove with two</li>
         <li>Pick up addons you already installed with another tool</li>
         <li>Update the app itself, after it asks you first</li>
       </ul>
@@ -242,17 +242,17 @@ footer p { margin: 0 0 8px; max-width: 80ch; }
     <h2>The first time you open it</h2>
     <p>This app is free and isn't paying for code signing yet, so your system will warn you once.</p>
     <ul>
-      <li><strong>Windows:</strong> if SmartScreen appears, choose More info, then Run anyway.</li>
-      <li><strong>macOS:</strong> open it once, then go to System Settings, Privacy &amp; Security, and choose Open Anyway.</li>
-      <li><strong>Linux:</strong> make the AppImage executable, then run it. It finds Wine, Lutris, Bottles, Proton and Faugus installs.</li>
+      <li><strong>Windows:</strong> if SmartScreen appears, choose More info, then Run anyway. If Smart App Control is on, Windows blocks unsigned apps like this one and offers no Run anyway.</li>
+      <li><strong>macOS:</strong> drag the app to Applications and open it once, then go to System Settings, Privacy &amp; Security, and choose Open Anyway. On macOS 12, that's System Preferences, Security &amp; Privacy.</li>
+      <li><strong>Linux:</strong> make the AppImage executable, then run it. It looks in the usual Wine, Lutris, Bottles, Proton and Faugus folders.</li>
     </ul>
     <p>Each release publishes its checksums, and you can read <a href="https://github.com/robbiemueller/wow-is-a-feeling">every line of the source</a>.</p>
 
     <h2>What it connects to</h2>
-    <p>GitHub, for the addon list, updates and most addon downloads. WoWInterface, for addons published there. ForeverDB's own site, if you install ForeverDB. Imgur and Postimages, for screenshots addon authors keep there. Nothing else, and it sends no telemetry. An addon's page can't make the app contact any other site.</p>
+    <p>GitHub, for the addon list, updates and most addon downloads. WoWInterface (wowinterface.com and mmoui.com), for addons published there. ForeverDB's own site, if you install ForeverDB. Imgur and Postimages, for screenshots addon authors keep there. Nothing else, apart from certificate checks your system may make for those sites, and it sends no telemetry. An addon's page can't make the app contact any other site.</p>
 
     <h2>Why some addons are missing</h2>
-    <p>Addons published only on CurseForge, Wago or Tukui can't be listed, because those sites don't allow it without approval. You can still drop a downloaded zip onto the window to install it. When you search for one, the app suggests alternatives.</p>
+    <p>Addons whose ready-to-install builds are only on CurseForge, Wago or Tukui can't be listed, because those sites don't allow it without approval. You can still drop a downloaded zip onto the window to install it. When you search for one, the app suggests alternatives.</p>
   </section>
 
   <footer>

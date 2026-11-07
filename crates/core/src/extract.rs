@@ -84,7 +84,7 @@ const BLOCKED_EXTENSIONS: [&str; 22] = [
 /// app installers and archives that put a program one click away. The game reads none of
 /// these. It loads what its TOCs list, which is `lua`, `xml`, `blp`, `tga`, `ogg`, `mp3`,
 /// `ttf` and so on.
-const BLOCKED_FILE_EXTENSIONS: [&str; 44] = [
+const BLOCKED_FILE_EXTENSIONS: [&str; 56] = [
     "vbe",
     "jse",
     "js",
@@ -129,6 +129,20 @@ const BLOCKED_FILE_EXTENSIONS: [&str; 44] = [
     "7z",
     "rar",
     "cab",
+    // Scripts that run on a double-click once their language is installed, which plenty of
+    // players have: AutoHotkey above all.
+    "ahk",
+    "pyc",
+    "pyo",
+    "pl",
+    "rb",
+    "wsc",
+    "sct",
+    "inf",
+    "psm1",
+    "psd1",
+    "scpt",
+    "applescript",
 ];
 
 /// `Foo_Vanilla.toc`, `Foo-Classic.toc` and friends: TOC names the Forever client
@@ -2653,6 +2667,33 @@ mod tests {
         let fixture = Fixture::new();
         let extracted = fixture.extract(&raw_zip(&entries), &[]).unwrap();
         assert_eq!(paths(&fixture), ["Foo/Foo.toc", "Foo/fine.lua"]);
+        names.sort();
+        assert_eq!(extracted.skipped_files, names);
+    }
+
+    #[test]
+    fn scripts_that_run_once_their_language_is_installed_are_skipped() {
+        let mut names: Vec<String> = [
+            "Foo/macro.ahk",
+            "Foo/cache.pyc",
+            "Foo/cache.pyo",
+            "Foo/tool.pl",
+            "Foo/tool.rb",
+            "Foo/part.wsc",
+            "Foo/part.sct",
+            "Foo/driver.inf",
+            "Foo/module.psm1",
+            "Foo/module.psd1",
+            "Foo/Run.scpt",
+            "Foo/Run.applescript",
+        ]
+        .map(String::from)
+        .to_vec();
+        let mut entries = vec![RawEntry::new("Foo/Foo.toc", TOC)];
+        entries.extend(names.iter().map(|n| RawEntry::new(n, b"payload")));
+        let fixture = Fixture::new();
+        let extracted = fixture.extract(&raw_zip(&entries), &[]).unwrap();
+        assert_eq!(paths(&fixture), ["Foo/Foo.toc"]);
         names.sort();
         assert_eq!(extracted.skipped_files, names);
     }
