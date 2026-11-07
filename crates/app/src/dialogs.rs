@@ -91,10 +91,11 @@ impl PackPlan {
         }
     }
 
-    /// The main button, which installs the addon and every pack offered.
+    /// The main button, which installs the addon and every pack offered. With several, it
+    /// answers the question in its own words.
     pub fn yes_label(&self) -> &'static str {
         if self.packs.len() > 1 {
-            "Install all"
+            "Install them too"
         } else {
             "Install both"
         }
@@ -717,7 +718,7 @@ mod tests {
             "Spoken Audio: Quests and Spoken Audio: Bosses are a 1.6 GB download. \
              Install them too?"
         );
-        assert_eq!(two.yes_label(), "Install all");
+        assert_eq!(two.yes_label(), "Install them too");
         assert!(matches!(
             two.with_packs(),
             Action::InstallWithPacks { packs, .. } if packs == [QUESTS.0, BOSSES.0]

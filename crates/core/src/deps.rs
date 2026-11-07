@@ -4,13 +4,18 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::catalog::{Addon, Catalog};
+use crate::catalog::{Addon, Catalog, Channel};
 use crate::scan::LocalFolder;
 use crate::state::State;
 
 /// Addons that ship inside the game client. TOCs can require them, but they never
 /// live in `Interface/AddOns` and nobody can install them.
 const GAME_ADDON_PREFIX: &str = "blizzard_";
+
+/// The biggest download, in bytes, that installs as another addon's dependency without the
+/// player seeing its size first. Voice packs run to gigabytes, and any addon's TOC can require
+/// one of their folders.
+pub const BIGGEST_UNASKED_DOWNLOAD: u64 = 100_000_000;
 
 /// Which catalog addons provide each folder.
 #[derive(Debug, Clone, Default)]
@@ -53,6 +58,9 @@ pub struct Resolution {
     /// Required folders whose pick is trusted but was never reviewed by a person, so it
     /// isn't installed by itself. The player can open it from the Requires line and decide.
     pub unreviewed: Vec<Unreviewed>,
+    /// Required folders whose pick is a download over [`BIGGEST_UNASKED_DOWNLOAD`], reviewed
+    /// or not, so it isn't installed by itself either. The player hears its size and decides.
+    pub too_big: Vec<TooBig>,
 }
 
 /// A required addon left for the player to install, because nobody reviewed its entry.
@@ -66,19 +74,36 @@ pub struct Unreviewed {
     pub provider: String,
 }
 
+/// A required addon left for the player to install, because its download is big.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TooBig {
+    /// The addon whose TOC requires it, which is the page whose Requires line links to it.
+    pub needed_by: String,
+    /// The folder, spelled the way that TOC spells it.
+    pub folder: String,
+    /// The entry the app picked for the folder, the same one the Requires line shows.
+    pub provider: String,
+    /// Its download, in bytes, from the channel it would install from.
+    pub size: u64,
+}
+
 /// Work out what installing `addon_id` needs, walking required dependencies
 /// transitively. Folders in `installed_folders` count as satisfied, along with
 /// anything they would have needed. The requested addon is always included, so the
-/// same call serves a first install, an update and a repair.
+/// same call serves a first install, an update and a repair. `channel` says which channel
+/// each addon would install from, which decides how big its download is.
 ///
 /// A dependency joins the plan only when its pick is reviewed as well as trusted: any addon
 /// can ship a library's folder name long before anything needs it, and a trusted entry only
-/// had to be old enough. The rest are left out and listed in `unreviewed`.
+/// had to be old enough. The rest are left out and listed in `unreviewed`. Nor does a pick
+/// whose download is over [`BIGGEST_UNASKED_DOWNLOAD`], reviewed or not, because a voice pack
+/// can run to gigabytes: those are listed in `too_big`, with their size.
 pub fn resolve<I, S>(
     addon_id: &str,
     catalog: &Catalog,
     index: &FolderIndex,
     installed_folders: I,
+    channel: impl Fn(&str) -> Channel,
 ) -> Resolution
 where
     I: IntoIterator<Item = S>,
@@ -94,7 +119,8 @@ where
     // itself from pulling in another provider.
     let mut planned: HashSet<String> = HashSet::new();
     let mut seen_missing: HashSet<String> = HashSet::new();
-    let mut seen_unreviewed: HashSet<(usize, String)> = HashSet::new();
+    // Each addon's requirement left for the player is named once, whichever list it's in.
+    let mut seen_left: HashSet<(usize, String)> = HashSet::new();
 
     plan_folders(&catalog.addons[root], &mut planned);
     // An explicit stack, because a chain in a bad catalog could be thousands deep.
@@ -116,24 +142,33 @@ where
         {
             continue;
         }
-        match best_provider(&folder, catalog, index) {
-            Some(provider) if catalog.addons[provider].reviewed => {
-                plan_folders(&catalog.addons[provider], &mut planned);
-                stack.push((provider, 0));
+        let Some(provider) = best_provider(&folder, catalog, index) else {
+            if seen_missing.insert(folder) {
+                resolution.missing.push(dep.clone());
             }
-            Some(provider) => {
-                if seen_unreviewed.insert((current, folder)) {
-                    resolution.unreviewed.push(Unreviewed {
-                        needed_by: addon.id.clone(),
-                        folder: dep.clone(),
-                        provider: catalog.addons[provider].id.clone(),
-                    });
-                }
-            }
-            None => {
-                if seen_missing.insert(folder) {
-                    resolution.missing.push(dep.clone());
-                }
+            continue;
+        };
+        let pick = &catalog.addons[provider];
+        let size = download_size(pick, channel(&pick.id));
+        if size <= BIGGEST_UNASKED_DOWNLOAD && pick.reviewed {
+            plan_folders(pick, &mut planned);
+            stack.push((provider, 0));
+        } else if seen_left.insert((current, folder)) {
+            let needed_by = addon.id.clone();
+            let provider = pick.id.clone();
+            if size > BIGGEST_UNASKED_DOWNLOAD {
+                resolution.too_big.push(TooBig {
+                    needed_by,
+                    folder: dep.clone(),
+                    provider,
+                    size,
+                });
+            } else {
+                resolution.unreviewed.push(Unreviewed {
+                    needed_by,
+                    folder: dep.clone(),
+                    provider,
+                });
             }
         }
     }
@@ -144,11 +179,17 @@ fn plan_folders(addon: &Addon, planned: &mut HashSet<String>) {
     planned.extend(addon.folders.iter().map(|f| f.to_lowercase()));
 }
 
+/// What installing this addon from `channel` downloads, in bytes. 0 when unknown, or when
+/// there's no build, which an install then says for itself.
+fn download_size(addon: &Addon, channel: Channel) -> u64 {
+    addon.release(channel).map_or(0, |release| release.size)
+}
+
 /// The addon the app would pick for this folder: the trusted one whose main folder it is,
 /// then the most downloaded trusted one. Ties keep catalog order. An untrusted entry is never
 /// picked, even when nothing else provides the folder, because its folder list is only a
 /// claim and its downloads can be inflated. [`resolve`] installs the pick by itself only when
-/// it's reviewed too, and the Requires line links to it either way.
+/// it's reviewed too and its download isn't big, and the Requires line links to it either way.
 pub fn best_provider(folder: &str, catalog: &Catalog, index: &FolderIndex) -> Option<usize> {
     let folder = folder.to_lowercase();
     index
@@ -227,6 +268,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::Release;
     use crate::state::ManagedAddon;
     use crate::toc;
 
@@ -278,7 +320,30 @@ mod tests {
     }
 
     fn resolve_in(catalog: &Catalog, id: &str, installed: &[&str]) -> Resolution {
-        resolve(id, catalog, &FolderIndex::build(catalog), installed)
+        resolve(id, catalog, &FolderIndex::build(catalog), installed, |_| {
+            Channel::Stable
+        })
+    }
+
+    /// A pick with a stable build of this many bytes.
+    fn sized(addon: Addon, size: u64) -> Addon {
+        Addon {
+            stable: Some(Release {
+                version: "1.0".to_string(),
+                size,
+                ..Default::default()
+            }),
+            ..addon
+        }
+    }
+
+    fn too_big(needed_by: &str, folder: &str, provider: &str, size: u64) -> TooBig {
+        TooBig {
+            needed_by: needed_by.to_string(),
+            folder: folder.to_string(),
+            provider: provider.to_string(),
+            size,
+        }
     }
 
     fn local(name: &str, toc_text: &str) -> LocalFolder {
@@ -606,15 +671,115 @@ mod tests {
     fn resolve_accepts_any_string_collection() {
         let catalog = catalog(vec![addon("a", &["A"], &["B"])]);
         let index = FolderIndex::build(&catalog);
+        let stable = |_: &str| Channel::Stable;
         let owned = vec!["B".to_string()];
-        assert!(resolve("a", &catalog, &index, &owned).missing.is_empty());
-        let owners: HashMap<String, Vec<String>> = HashMap::from([("b".to_string(), vec![])]);
         assert!(
-            resolve("a", &catalog, &index, owners.keys())
+            resolve("a", &catalog, &index, &owned, stable)
                 .missing
                 .is_empty()
         );
-        assert_eq!(resolve("a", &catalog, &index, NOTHING).missing, ["B"]);
+        let owners: HashMap<String, Vec<String>> = HashMap::from([("b".to_string(), vec![])]);
+        assert!(
+            resolve("a", &catalog, &index, owners.keys(), stable)
+                .missing
+                .is_empty()
+        );
+        assert_eq!(
+            resolve("a", &catalog, &index, NOTHING, stable).missing,
+            ["B"]
+        );
+    }
+
+    #[test]
+    fn a_pick_over_the_size_limit_is_left_for_the_player_with_its_size_even_when_reviewed() {
+        // A voice pack is hand-picked, and any addon's TOC can name one of its folders.
+        let catalog = catalog(vec![
+            addon(
+                "chatter",
+                &["Chatter"],
+                &["QuestsAudio", "Lib", "Places", "Bosses"],
+            ),
+            sized(addon("quests", &["QuestsAudio"], &[]), 1_479_966_451),
+            sized(addon("lib", &["Lib"], &[]), BIGGEST_UNASKED_DOWNLOAD),
+            sized(unreviewed("places", &["Places"], &[]), 456_216_109),
+            sized(
+                addon("bosses", &["Bosses"], &[]),
+                BIGGEST_UNASKED_DOWNLOAD + 1,
+            ),
+        ]);
+        let result = resolve_in(&catalog, "chatter", &[]);
+        assert_eq!(
+            result.to_install,
+            ["lib", "chatter"],
+            "up to the limit is fine"
+        );
+        assert_eq!(
+            result.too_big,
+            [
+                too_big("chatter", "QuestsAudio", "quests", 1_479_966_451),
+                too_big("chatter", "Places", "places", 456_216_109),
+                too_big("chatter", "Bosses", "bosses", BIGGEST_UNASKED_DOWNLOAD + 1),
+            ],
+            "reviewed or not, with the size the player is told"
+        );
+        assert!(result.unreviewed.is_empty() && result.missing.is_empty());
+    }
+
+    #[test]
+    fn a_big_pick_brings_nothing_it_would_have_needed_and_is_named_once() {
+        let catalog = catalog(vec![
+            addon("top", &["Top"], &["Pack", "PACK", "Middle"]),
+            addon("middle", &["Middle"], &["Pack"]),
+            sized(addon("pack", &["Pack"], &["PackLib"]), 2_000_000_000),
+            addon("packlib", &["PackLib"], &[]),
+        ]);
+        let result = resolve_in(&catalog, "top", &[]);
+        assert_eq!(result.to_install, ["middle", "top"]);
+        assert_eq!(
+            result.too_big,
+            [
+                too_big("top", "Pack", "pack", 2_000_000_000),
+                too_big("middle", "Pack", "pack", 2_000_000_000),
+            ],
+            "each page whose Requires line links it"
+        );
+        // Already here, it's nothing to tell anyone about.
+        assert!(resolve_in(&catalog, "top", &["pack"]).too_big.is_empty());
+    }
+
+    #[test]
+    fn the_size_that_counts_is_the_build_its_channel_would_install() {
+        let mut pack = sized(addon("pack", &["Pack"], &[]), 50_000_000);
+        pack.beta = Some(Release {
+            version: "2.0-beta".to_string(),
+            size: 1_600_000_000,
+            date: 1,
+            ..Default::default()
+        });
+        let catalog = catalog(vec![addon("top", &["Top"], &["Pack"]), pack]);
+        let index = FolderIndex::build(&catalog);
+        let stable = resolve("top", &catalog, &index, NOTHING, |_| Channel::Stable);
+        assert_eq!(stable.to_install, ["pack", "top"]);
+        let beta = resolve("top", &catalog, &index, NOTHING, |id: &str| {
+            if id == "pack" {
+                Channel::Beta
+            } else {
+                Channel::Stable
+            }
+        });
+        assert_eq!(beta.to_install, ["top"]);
+        assert_eq!(
+            beta.too_big,
+            [too_big("top", "Pack", "pack", 1_600_000_000)]
+        );
+    }
+
+    #[test]
+    fn the_requested_addon_is_never_too_big_to_install() {
+        let catalog = catalog(vec![sized(addon("pack", &["Pack"], &[]), 2_000_000_000)]);
+        let result = resolve_in(&catalog, "pack", &[]);
+        assert_eq!(result.to_install, ["pack"], "the player asked for it");
+        assert!(result.too_big.is_empty());
     }
 
     // ---- dependents ----

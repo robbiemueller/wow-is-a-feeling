@@ -170,12 +170,22 @@ impl Queue {
     /// The op about to put this folder in place, other than this addon's own. It may not be
     /// on disk yet, but it will be by the time anything queued now gets its turn.
     pub fn incoming(&self, lower_folder: &str, addon_id: &str) -> Option<&Op> {
-        self.running
-            .iter()
-            .map(|run| &run.op)
-            .chain(&self.waiting)
+        self.ops()
             .filter(|op| op.addon_id != addon_id && op.verb != Verb::Remove)
             .find(|op| op.folders.contains(lower_folder))
+    }
+
+    /// Is an op other than this addon's about to put a folder in place that `wanted` takes?
+    /// Folders are lowercased.
+    pub fn incoming_any(&self, addon_id: &str, wanted: impl Fn(&str) -> bool) -> bool {
+        self.ops()
+            .filter(|op| op.addon_id != addon_id && op.verb != Verb::Remove)
+            .any(|op| op.folders.iter().any(|folder| wanted(folder)))
+    }
+
+    /// Every op on the go, then every one waiting.
+    fn ops(&self) -> impl Iterator<Item = &Op> {
+        self.running.iter().map(|run| &run.op).chain(&self.waiting)
     }
 
     pub fn push(&mut self, op: Op) {
@@ -578,7 +588,8 @@ pub struct Installed<'a> {
     pub folders: Vec<String>,
     /// From [`not_in_zip`].
     pub not_in_zip: Vec<String>,
-    /// From `install::kept_zips`: the version just installed, then the one before it.
+    /// From `install::kept_zips`: the version just installed, then the one before it. One too
+    /// big to keep isn't there.
     pub kept: &'a [PathBuf],
     pub keep_previous: bool,
     pub now: i64,
@@ -668,7 +679,7 @@ pub fn record_after_install(prev: Option<&ManagedAddon>, facts: Installed<'_>) -
         _ if !facts.keep_previous => (None, None),
         // A repair changes nothing about what came before it.
         Some(prev) if same => (prev.previous_version.clone(), prev.previous_zip.clone()),
-        Some(prev) => match kept_zip_for(facts.kept, &prev.version) {
+        Some(prev) => match kept_zip_for(facts.kept, &prev.version, facts.version) {
             Some(zip) => (Some(prev.version.clone()), Some(zip)),
             // Adopted or kept with the setting off: nothing to go back to.
             None => (None, None),
@@ -691,25 +702,33 @@ pub fn record_after_install(prev: Option<&ManagedAddon>, facts: Installed<'_>) -
     }
 }
 
-/// Which kept zip holds this version. Core names them after the version with anything
-/// unusual replaced, and this spells it the same way.
-fn kept_zip_for(kept: &[PathBuf], version: &str) -> Option<PathBuf> {
-    let spelled: String = version
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+') {
-                c
-            } else {
-                '_'
-            }
-        })
-        .take(100)
-        .collect();
-    let matches = |zip: &&PathBuf| {
+/// Which kept zip holds `version`, the one before `installed`. Core names them after the
+/// version with anything unusual replaced, and this spells it the same way. The zip named
+/// after the version just installed never counts, even when the two are spelled alike. It
+/// isn't always there to skip: a version too big to keep leaves the one before it first.
+fn kept_zip_for(kept: &[PathBuf], version: &str, installed: &str) -> Option<PathBuf> {
+    let spelled = |version: &str| -> String {
+        version
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+') {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .take(100)
+            .collect()
+    };
+    let (wanted, just_installed) = (spelled(version), spelled(installed));
+    let named = |zip: &PathBuf, spelled: &str| {
         zip.file_stem()
             .is_some_and(|stem| stem.to_string_lossy().trim_start_matches('_') == spelled)
     };
-    kept.iter().skip(1).find(matches).cloned()
+    kept.iter()
+        .filter(|zip| !named(zip, &just_installed))
+        .find(|zip| named(zip, &wanted))
+        .cloned()
 }
 
 /// The folder an unmanaged local zip is named after: the one the others hang off, or the
@@ -1170,6 +1189,25 @@ mod tests {
         let kept = [PathBuf::from("zips/2.0.zip"), PathBuf::from("zips/0.9.zip")];
         let r = record_after_install(Some(&prev), facts("2.0", &kept, true));
         assert_eq!(r.previous_version, None, "that zip isn't this version");
+    }
+
+    #[test]
+    fn the_previous_version_is_kept_even_when_the_new_one_was_too_big_to_keep() {
+        let prev = record("a", "1.0", &["A"]);
+        // 2.0 was over the size limit, so the only zip is the one from before.
+        let kept = [PathBuf::from("zips/1.0.zip")];
+        let r = record_after_install(Some(&prev), facts("2.0", &kept, true));
+        assert_eq!(r.previous_version.as_deref(), Some("1.0"));
+        assert_eq!(r.previous_zip.as_deref(), Some(Path::new("zips/1.0.zip")));
+    }
+
+    #[test]
+    fn the_zip_of_the_version_just_installed_never_passes_for_the_one_before() {
+        // Spelled the same once their slashes are made safe, so the zip can't tell them apart.
+        let prev = record("a", "bundle/v2", &["A"]);
+        let kept = [PathBuf::from("zips/bundle_v2.zip")];
+        let r = record_after_install(Some(&prev), facts("bundle_v2", &kept, true));
+        assert_eq!(r.previous_version, None);
     }
 
     #[test]

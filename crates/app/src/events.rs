@@ -415,8 +415,16 @@ impl App {
                     }
                 }
             }
-            // Main folder first, the order the catalog lists them in.
-            folders.sort_by_key(|folder| ops::listed_position(&addon.folders, folder));
+            // Main folder first, the order the catalog lists them in. A main folder it vouches
+            // the addon had before comes next, so a rollback to a build from before a rename
+            // still starts with that build's main folder, and is still this addon.
+            let known: Vec<String> = addon
+                .folders
+                .iter()
+                .chain(&addon.formerly)
+                .cloned()
+                .collect();
+            folders.sort_by_key(|folder| ops::listed_position(&known, folder));
         }
         if self.demo {
             self.demo_add_folders(&folders, &name, &version);

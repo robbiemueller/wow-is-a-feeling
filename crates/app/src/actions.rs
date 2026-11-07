@@ -11,7 +11,7 @@ use crate::worker::FoundGame;
 use eframe::egui::OpenUrl;
 use feeling_core::backup::{self, BackupEntry};
 use feeling_core::catalog::{Addon, Channel, Release};
-use feeling_core::deps::{self, Unreviewed};
+use feeling_core::deps::{self, TooBig, Unreviewed};
 use feeling_core::listfile;
 use feeling_core::search::SortBy;
 use feeling_core::selfupdate::UpdateInfo;
@@ -132,7 +132,7 @@ impl App {
             }
             Action::Install(ids) => self.install_addons(ids),
             Action::InstallFromPage(id) => self.install_from_page(id),
-            Action::InstallWithPacks { id, packs } => self.ask_about_folders(id, packs),
+            Action::InstallWithPacks { id, packs } => self.packs_answered(id, packs),
             Action::ReplaceAndInstall { id, folders, packs } => {
                 self.queue_with_packs(&id, &folders, &packs);
             }
@@ -229,23 +229,29 @@ impl App {
         }
     }
 
-    /// No game yet means ask for one first. The request picks up again afterward.
+    /// No game yet means ask for one first. The request picks up again afterward. Asked again
+    /// while it waits, it's already in hand, and the folder browser is already up.
     fn needs_a_folder(&mut self, action: Action) -> bool {
         if self.game.is_some() {
             return false;
         }
-        self.after_folder.push(action);
-        self.open_folder_browser();
+        if !self.after_folder.iter().any(|w| same_request(w, &action)) {
+            self.after_folder.push(action);
+            self.open_folder_browser();
+        }
         true
     }
 
     /// What's on disk decides what an install may replace. If the first look at the disk is
-    /// still on its way, the request waits for it, so it doesn't get decided blind.
+    /// still on its way, the request waits for it, so it doesn't get decided blind. A second
+    /// click while it waits adds nothing, so nothing is asked twice.
     fn needs_a_scan(&mut self, action: Action) -> bool {
         if self.scanned {
             return false;
         }
-        self.after_scan.push(action);
+        if !self.after_scan.iter().any(|w| same_request(w, &action)) {
+            self.after_scan.push(action);
+        }
         true
     }
 
@@ -259,6 +265,7 @@ impl App {
             return;
         }
         match ids.as_slice() {
+            [id] if self.asking_about(id) => {}
             [id] => self.ask_about_folders(id.clone(), Vec::new()),
             _ => self.queue_installs(&ids, &[]),
         }
@@ -269,13 +276,58 @@ impl App {
     /// answered it goes on as any other click would, so each question is asked once.
     fn install_from_page(&mut self, id: String) {
         let again = Action::InstallFromPage(id.clone());
-        if self.needs_a_folder(again.clone()) || self.needs_a_scan(again) {
+        if self.needs_a_folder(again.clone()) || self.needs_a_scan(again) || self.asking_about(&id)
+        {
             return;
         }
         match self.pack_plan(&id) {
             Some(plan) => self.show_popup(Popup::Packs(plan)),
             None => self.ask_about_folders(id, Vec::new()),
         }
+    }
+
+    /// Is a question about installing this addon on screen, or waiting its turn? Its answer
+    /// covers every click that asked it.
+    fn asking_about(&self, id: &str) -> bool {
+        self.popup
+            .iter()
+            .chain(&self.popup_queue)
+            .any(|popup| match popup {
+                Popup::Packs(plan) => plan.addon_id == id,
+                Popup::Replace(plan) => plan.addon_id == id,
+                _ => false,
+            })
+    }
+
+    /// The player answered the packs question. One that comes after the addon is already
+    /// here or on its way, from a question left open, only adds the packs still missing:
+    /// whatever got the addon there has seen to it, and it isn't installed again.
+    fn packs_answered(&mut self, id: String, packs: Vec<String>) {
+        if self.managed(&id).is_none() && !self.queue.busy_with(&id) {
+            self.ask_about_folders(id, packs);
+            return;
+        }
+        let installed = folder_set(&self.installed_folders());
+        let missing: Vec<String> = packs
+            .into_iter()
+            .filter(|pack| self.still_missing(pack, &installed))
+            .collect();
+        self.queue_installs(&missing, &[]);
+    }
+
+    /// A pack nothing has brought: not on its way, with no record, and none of its folders in
+    /// AddOns or in a record. `installed` is those folders, lowercased.
+    fn still_missing(&self, id: &str, installed: &HashSet<String>) -> bool {
+        if self.queue.busy_with(id) || self.managed(id).is_some() {
+            return false;
+        }
+        let pack = self.bundle.as_deref().and_then(|bundle| bundle.addon(id));
+        pack.is_some_and(|pack| {
+            !pack
+                .folders
+                .iter()
+                .any(|folder| installed.contains(&folder.to_lowercase()))
+        })
     }
 
     /// Ask before an install that would replace folders that aren't this addon's, then queue
@@ -292,9 +344,10 @@ impl App {
     }
 
     /// Queue an addon, then its packs. A pack only follows an addon that really joined the
-    /// queue: voices are no use without the addon that plays them.
+    /// queue: voices are no use without the addon that plays them. The player just chose the
+    /// packs, so the addon requiring one of them is nothing to tell them about.
     fn queue_with_packs(&mut self, id: &str, agreed: &[String], packs: &[String]) {
-        self.queue_installs(&[id.to_owned()], agreed);
+        self.queue_installs_beside(&[id.to_owned()], agreed, packs);
         if !packs.is_empty() && self.queue.busy_with(id) {
             self.queue_installs(packs, &[]);
         }
@@ -302,7 +355,8 @@ impl App {
 
     /// The question to ask before a first install of an addon with a needed pack group that
     /// nothing meets: nothing in AddOns or in a record, nothing this install brings with it,
-    /// and nothing already on its way. It offers each such group's first pack.
+    /// and nothing already on its way. It offers each such group's first pack. A requirement
+    /// too big to come along by itself doesn't count as brought.
     fn pack_plan(&self, id: &str) -> Option<PackPlan> {
         if self.managed(id).is_some() || self.queue.busy_with(id) {
             return None;
@@ -311,8 +365,14 @@ impl App {
         let addon = bundle.addon(id)?;
         let installed = self.installed_folders();
         // The addon itself and what it requires, which join the same batch.
-        let batch =
-            deps::resolve(id, &bundle.catalog, &bundle.folders, installed.iter()).to_install;
+        let batch = deps::resolve(
+            id,
+            &bundle.catalog,
+            &bundle.folders,
+            installed.iter(),
+            |dep| self.channel_of(dep),
+        )
+        .to_install;
         let batch_folders: HashSet<String> = batch
             .iter()
             .filter_map(|step| bundle.addon(step))
@@ -327,12 +387,23 @@ impl App {
                     })
                 })
         };
+        // A folder the group's prefixes take, such as another language's voices, on its way.
+        let met_on_arrival = |line: &model::PackLine| {
+            !line.met_by.is_empty()
+                && (batch_folders.iter().any(|f| line.met_by_folder(f))
+                    || self.queue.incoming_any(id, |f| line.met_by_folder(f)))
+        };
         let lines = model::pack_lines(addon, bundle, &folder_set(&installed), |pack| {
             self.channel_of(pack)
         });
         let unmet: Vec<model::PackLine> = lines
             .into_iter()
-            .filter(|line| line.needed && !line.met() && !line.choices.iter().any(arrives))
+            .filter(|line| {
+                line.needed
+                    && !line.met()
+                    && !line.choices.iter().any(arrives)
+                    && !met_on_arrival(line)
+            })
             .collect();
         if unmet.is_empty() {
             return None;
@@ -401,19 +472,33 @@ impl App {
         })
     }
 
-    /// The name of an installed addon whose catalog entry has since become another addon,
-    /// which counts as gone from the catalog: updating to it would swap this addon's folders
-    /// for that one's.
-    fn turned_into_another(&self, id: &str) -> Option<String> {
+    /// Why an installed addon whose catalog entry has since become a different addon is left
+    /// alone, or `None` while it's still the same addon. Updating to that one would swap this
+    /// addon's folders for its.
+    fn another_addon_now(&self, id: &str) -> Option<String> {
         let record = self.managed(id)?;
         let addon = self.bundle.as_deref()?.addon(id)?;
-        (!model::same_addon(record, addon)).then(|| record.name.clone())
+        (!model::same_addon(record, addon)).then(|| another_addon_line(&record.name, &addon.name))
+    }
+
+    /// Is this addon here already, or about to be? `ids` and `coming` are what this batch
+    /// installs and what the player chose to install right after it.
+    fn here_or_coming(&self, id: &str, ids: &[String], coming: &[String]) -> bool {
+        ids.iter().chain(coming).any(|other| other == id)
+            || self.queue.busy_with(id)
+            || self.managed(id).is_some()
     }
 
     /// Queue these and what they require. `agreed` is what the player said one of them may
     /// replace. Nothing here asks: what would take a folder from someone else stays out of
     /// the queue, with a yellow line saying why.
     fn queue_installs(&mut self, ids: &[String], agreed: &[String]) {
+        self.queue_installs_beside(ids, agreed, &[]);
+    }
+
+    /// [`Self::queue_installs`], when the player has chosen to install `coming` right after:
+    /// a requirement among those is on its way, and nothing needs saying about it.
+    fn queue_installs_beside(&mut self, ids: &[String], agreed: &[String], coming: &[String]) {
         let Some(bundle) = self.bundle.clone() else {
             return;
         };
@@ -425,8 +510,8 @@ impl App {
             if self.queue.busy_with(id) {
                 continue;
             }
-            if let Some(name) = self.turned_into_another(id) {
-                self.yellow(gone_line(&name));
+            if let Some(line) = self.another_addon_now(id) {
+                self.yellow(line);
                 continue;
             }
             let name = bundle.addon(id).map_or(id.as_str(), |a| a.name.as_str());
@@ -441,7 +526,13 @@ impl App {
                     continue;
                 }
             }
-            let resolved = deps::resolve(id, &bundle.catalog, &bundle.folders, installed.iter());
+            let resolved = deps::resolve(
+                id,
+                &bundle.catalog,
+                &bundle.folders,
+                installed.iter(),
+                |dep| self.channel_of(dep),
+            );
             for missing in &resolved.missing {
                 self.yellow(format!(
                     "{name} requires {}, which this app can't pick for you. Look for it yourself, \
@@ -449,13 +540,19 @@ impl App {
                     model::clean_line(missing, 60)
                 ));
             }
+            // Nothing to say about one that's on its way or already here.
             for left in &resolved.unreviewed {
-                // Nothing to say about one that's on its way or already here.
-                let coming = ids.contains(&left.provider)
-                    || self.queue.busy_with(&left.provider)
-                    || self.managed(&left.provider).is_some();
-                if !coming && told.insert(left.provider.clone()) {
+                if !self.here_or_coming(&left.provider, ids, coming)
+                    && told.insert(left.provider.clone())
+                {
                     self.yellow(unreviewed_line(&bundle, left));
+                }
+            }
+            for left in &resolved.too_big {
+                if !self.here_or_coming(&left.provider, ids, coming)
+                    && told.insert(left.provider.clone())
+                {
+                    self.yellow(too_big_line(&bundle, left));
                 }
             }
             for (position, step) in resolved.to_install.iter().enumerate() {
@@ -532,8 +629,8 @@ impl App {
     /// `allowed` is what this may replace on top of its own folders.
     fn install_draft(&mut self, id: &str, allowed: Vec<String>) -> Option<Draft> {
         let bundle = self.bundle.clone()?;
-        if let Some(name) = self.turned_into_another(id) {
-            self.yellow(gone_line(&name));
+        if let Some(line) = self.another_addon_now(id) {
+            self.yellow(line);
             return None;
         }
         let addon = bundle.addon(id)?;
@@ -853,9 +950,24 @@ impl App {
     }
 }
 
-/// Why an addon whose entry has become another addon isn't updated, in its page's words.
-fn gone_line(name: &str) -> String {
-    format!("{name} isn't in the catalog anymore, so it doesn't get updates.")
+/// Is this the same request as one already waiting? A second click while the first waits
+/// adds nothing, so nothing gets asked twice.
+fn same_request(waiting: &Action, action: &Action) -> bool {
+    match (waiting, action) {
+        (Action::InstallFromPage(a), Action::InstallFromPage(b)) => a == b,
+        (Action::Install(a), Action::Install(b)) => a == b,
+        (Action::UpdateAll, Action::UpdateAll) => true,
+        _ => false,
+    }
+}
+
+/// Why an installed addon whose entry has become a different addon isn't touched, in the
+/// words its page uses. `yours` is what the player has, `listed` what the catalog has now.
+fn another_addon_line(yours: &str, listed: &str) -> String {
+    format!(
+        "{yours} doesn't get updates: the catalog now lists a different addon in its place, \
+         {listed}."
+    )
 }
 
 fn verb_for(record: Option<&ManagedAddon>, release: &Release) -> Verb {
@@ -879,6 +991,22 @@ fn unreviewed_line(bundle: &CatalogBundle, left: &Unreviewed) -> String {
         "{needed_by} requires {provider}, which wasn't added because nobody has reviewed it. \
          Click it under Requires on the {needed_by} page to see who made it, and install it \
          yourself."
+    )
+}
+
+/// Why a required addon with a big download wasn't added, and how big it is, so getting it is
+/// the player's own choice.
+fn too_big_line(bundle: &CatalogBundle, left: &TooBig) -> String {
+    let named = |id: &str, fallback: &str| {
+        bundle
+            .addon(id)
+            .map_or_else(|| model::clean_line(fallback, 60), |a| a.name.clone())
+    };
+    format!(
+        "{} requires {}, a {} download. Install it from its page if you want it.",
+        named(&left.needed_by, &left.needed_by),
+        named(&left.provider, &left.folder),
+        model::size_text(left.size)
     )
 }
 

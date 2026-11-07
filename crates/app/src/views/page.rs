@@ -293,14 +293,18 @@ fn tier_ink(tier: u8) -> Color32 {
 fn addon_page(app: &mut App, ui: &mut Ui, rect: Rect, id: &str) {
     let bundle = app.bundle.clone();
     let record = app.managed(id).cloned();
-    // An installed addon whose entry has become another addon gets the page of one that left
-    // the catalog, with no Install, Update or Reinstall that would turn it into that addon.
+    // An installed addon whose entry has become another addon gets a page of its own, which
+    // says so, with no Install, Update or Reinstall that would turn it into that addon.
     let addon = bundle
         .as_deref()
         .and_then(|b| model::entry_for(b, id, record.as_ref()));
     let Some(addon) = addon else {
         match record {
-            Some(record) => managed_only_page(app, ui, rect, &record),
+            Some(record) => {
+                let listed = bundle.as_deref().and_then(|b| b.addon(id));
+                let note = model::no_updates_note(&record, listed);
+                managed_only_page(app, ui, rect, &record, &note);
+            }
             None => note_page(app, ui, rect, "This addon isn't in the catalog anymore."),
         }
         return;
@@ -454,14 +458,27 @@ fn requires(app: &mut App, ui: &mut Ui, addon: &Addon) {
         return;
     }
     let bundle = app.bundle.clone();
-    // What an install would leave for the player to add, decided the same way it decides.
+    // What an install would leave for the player to add, decided the same way it decides:
+    // nobody reviewed it, or it's a big download.
     let yourself: Vec<String> = bundle.as_deref().map_or_else(Vec::new, |b| {
         let installed = app.installed_folders();
-        deps::resolve(&addon.id, &b.catalog, &b.folders, installed.iter())
+        let resolved = deps::resolve(&addon.id, &b.catalog, &b.folders, installed.iter(), |id| {
+            app.channel_of(id)
+        });
+        let unreviewed = resolved
             .unreviewed
             .into_iter()
-            .filter(|left| left.needed_by == addon.id && app.managed(&left.provider).is_none())
-            .map(|left| left.folder.to_lowercase())
+            .map(|left| (left.needed_by, left.provider, left.folder));
+        let too_big = resolved
+            .too_big
+            .into_iter()
+            .map(|left| (left.needed_by, left.provider, left.folder));
+        unreviewed
+            .chain(too_big)
+            .filter(|(needed_by, provider, _)| {
+                *needed_by == addon.id && app.managed(provider).is_none()
+            })
+            .map(|(_, _, folder)| folder.to_lowercase())
             .collect()
     });
     widgets::fact_with(ui, "Requires:", |ui| {
@@ -635,8 +652,9 @@ fn details_sections(app: &mut App, ui: &mut Ui, addon: &Addon) {
     }
 }
 
-/// A managed addon the catalog doesn't know: a dropped zip, or one that left the catalog.
-fn managed_only_page(app: &mut App, ui: &mut Ui, rect: Rect, record: &ManagedAddon) {
+/// A managed addon with no catalog entry to go by: a dropped zip, one that left the catalog,
+/// or one whose entry now lists a different addon. `note` says which.
+fn managed_only_page(app: &mut App, ui: &mut Ui, rect: Rect, record: &ManagedAddon, note: &str) {
     let busy = app.queue.busy_with(&record.id) || app.queue.busy_exclusive();
     let mut buttons = vec![BarButton::main(
         "Remove",
@@ -649,7 +667,6 @@ fn managed_only_page(app: &mut App, ui: &mut Ui, rect: Rect, record: &ManagedAdd
     let name = record.name.clone();
     let version = record.version.clone();
     let folders = record.folders.join(", ");
-    let local = record.origin == Origin::LocalZip;
     let failure = app.failures.get(&record.id).cloned();
     framed_with_note(
         app,
@@ -661,14 +678,7 @@ fn managed_only_page(app: &mut App, ui: &mut Ui, rect: Rect, record: &ManagedAdd
         |_, ui| {
             title(ui, &name);
             rule(ui);
-            body(
-                ui,
-                if local {
-                    "Installed from a zip file, so it doesn't get updates."
-                } else {
-                    "This addon isn't in the catalog anymore, so it doesn't get updates."
-                },
-            );
+            body(ui, note);
             ui.add_space(10.0);
             widgets::section(ui, "Details");
             if !version.is_empty() {

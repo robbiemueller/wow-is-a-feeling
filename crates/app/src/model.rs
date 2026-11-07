@@ -231,20 +231,47 @@ pub fn same_version(a: &str, b: &str) -> bool {
     bare(a).eq_ignore_ascii_case(bare(b))
 }
 
-/// Is this catalog entry still the addon the record installed? One that no longer lists the
-/// record's main folder has become another addon, such as one of its repository's voice
+/// Is this catalog entry still the addon the record installed? It is while it lists the
+/// record's main folder, or names it in `formerly`, where the catalog vouches for a rename.
+/// One that does neither has become another addon, such as one of its repository's voice
 /// packs, and updating to it would swap this addon's folders for that one's.
 pub fn same_addon(record: &ManagedAddon, addon: &Addon) -> bool {
     record.folders.first().is_none_or(|main| {
         addon
             .folders
             .iter()
+            .chain(&addon.formerly)
             .any(|folder| crate::ops::same_folder(folder, main))
     })
 }
 
+/// What the page of an installed addon with no catalog entry to go by says about updates.
+/// `listed` is what the catalog has under its id now, which is a different addon.
+pub fn no_updates_note(record: &ManagedAddon, listed: Option<&Addon>) -> String {
+    if record.origin == Origin::LocalZip {
+        return "Installed from a zip file, so it doesn't get updates.".to_owned();
+    }
+    match listed {
+        Some(addon) => format!(
+            "The catalog now lists a different addon here, {}. Yours doesn't get updates from \
+             it. To switch, remove yours, then install that one.",
+            addon.name
+        ),
+        None => "This addon isn't in the catalog anymore, so it doesn't get updates.".to_owned(),
+    }
+}
+
+/// The same, in the few words a row's tooltip has room for.
+pub fn no_updates_tooltip(record: &ManagedAddon, listed: Option<&Addon>) -> &'static str {
+    match (record.origin, listed) {
+        (Origin::LocalZip, _) => "Installed from a zip file",
+        (_, Some(_)) => "The catalog now lists a different addon here",
+        (_, None) => "Not in the catalog anymore",
+    }
+}
+
 /// The catalog entry an addon's page, row and updates go by. An installed addon whose entry
-/// has become another addon has none: it's as good as gone from the catalog.
+/// has become another addon has none, so nothing offers to turn it into that one.
 pub fn entry_for<'a>(
     bundle: &'a CatalogBundle,
     id: &str,
@@ -533,9 +560,11 @@ impl Tag<'_> {
     }
 }
 
-/// A row in Browse: an installed addon says so, grey ones have fallen behind Forever.
+/// A row in Browse: an installed addon says so, grey ones have fallen behind Forever. An
+/// entry that has become another addon isn't what the record installed, so it's shown like
+/// any addon that isn't installed.
 pub fn browse_tag<'a>(addon: &'a Addon, managed: Option<&ManagedAddon>) -> Tag<'a> {
-    if let Some(managed) = managed {
+    if let Some(managed) = managed.filter(|managed| same_addon(managed, addon)) {
         return if !managed.pinned && update_for(managed, addon).is_some() {
             Tag::Update
         } else {
@@ -691,11 +720,23 @@ pub struct PackLine {
     pub needed: bool,
     /// In the order to offer them. The first is the one offered by default.
     pub choices: Vec<PackChoice>,
+    /// Folder name prefixes that meet the group too, lowercased: packs the catalog doesn't
+    /// list, such as another language's or another tool's.
+    pub met_by: Vec<String>,
+    /// Some folder in AddOns or in a record starts with one of `met_by`.
+    pub met_elsewhere: bool,
 }
 
 impl PackLine {
     pub fn met(&self) -> bool {
-        self.choices.iter().any(|choice| choice.installed)
+        self.met_elsewhere || self.choices.iter().any(|choice| choice.installed)
+    }
+
+    /// Would this folder, lowercased, meet the group although it's none of its packs'?
+    pub fn met_by_folder(&self, lower_folder: &str) -> bool {
+        self.met_by
+            .iter()
+            .any(|prefix| lower_folder.starts_with(prefix.as_str()))
     }
 }
 
@@ -703,7 +744,8 @@ impl PackLine {
 /// person wrote them down, and only trusted packs the catalog has, since a page that offers
 /// one invites installing it. A pack that isn't here and has no build to install is left out,
 /// and so is a group left with nothing to show. `installed` is every folder in AddOns or in a
-/// record, lowercased, and `channel` says which build each pack would install.
+/// record, lowercased, and `channel` says which build each pack would install. A folder there
+/// that starts with one of a group's `met_by` prefixes meets it too, in any case.
 pub fn pack_lines(
     addon: &Addon,
     bundle: &CatalogBundle,
@@ -738,7 +780,17 @@ pub fn pack_lines(
                     })
                 })
                 .collect();
-            (!choices.is_empty()).then(|| PackLine {
+            if choices.is_empty() {
+                return None;
+            }
+            // A blank prefix would meet every group with anything at all installed.
+            let met_by: Vec<String> = group
+                .met_by
+                .iter()
+                .map(|prefix| prefix.trim().to_lowercase())
+                .filter(|prefix| !prefix.is_empty())
+                .collect();
+            let mut line = PackLine {
                 name: if group.name.is_empty() {
                     UNNAMED_PACKS.to_owned()
                 } else {
@@ -746,7 +798,12 @@ pub fn pack_lines(
                 },
                 needed: group.needed,
                 choices,
-            })
+                met_by,
+                met_elsewhere: false,
+            };
+            line.met_elsewhere =
+                !line.met_by.is_empty() && installed.iter().any(|f| line.met_by_folder(f));
+            Some(line)
         })
         .collect()
 }
@@ -1460,6 +1517,8 @@ mod tests {
                             installed: false,
                         },
                     ],
+                    met_by: Vec::new(),
+                    met_elsewhere: false,
                 },
                 PackLine {
                     name: "Place voices".to_owned(),
@@ -1470,10 +1529,36 @@ mod tests {
                         size: 456_216_109,
                         installed: false,
                     }],
+                    met_by: Vec::new(),
+                    met_elsewhere: false,
                 },
             ]
         );
         assert!(!lines[0].met() && !lines[1].met());
+    }
+
+    #[test]
+    fn a_pack_group_is_met_by_any_folder_starting_with_one_of_its_prefixes_in_any_case() {
+        let mut quests = group("Quest voices", true, &[QUESTS]);
+        quests.met_by = vec![
+            "SpokenQuestsAudio".to_owned(),
+            "SpokenCommunity_".to_owned(),
+            String::new(),
+            " ".to_owned(),
+        ];
+        let b = spoken_catalog(vec![quests], Vec::new());
+        // German voices from another tool, and a community pack, neither of them listed.
+        let german = lines_for(&b, &["Spoken", "SPOKENQUESTSAUDIO_deDE"]);
+        assert!(german[0].met() && !german[0].choices[0].installed);
+        assert!(german[0].met_elsewhere);
+        assert!(lines_for(&b, &["spokencommunity_ivrit"])[0].met());
+        assert!(
+            !lines_for(&b, &["Spoken", "Spoken_Quests", "SpokenPlacesAudio"])[0].met(),
+            "a blank prefix meets nothing"
+        );
+        assert!(!lines_for(&b, &["SpokenQuests"])[0].met(), "a whole prefix");
+        assert!(german[0].met_by_folder("spokenquestsaudio_frfr"));
+        assert!(!german[0].met_by_folder("spokenplacesaudio"));
     }
 
     #[test]
@@ -1586,7 +1671,11 @@ mod tests {
         record.folders = vec!["Spoken".to_owned(), "Spoken_Quests".to_owned()];
         assert!(!same_addon(&record, &hijacked));
         assert_eq!(update_for(&record, &hijacked), None);
-        assert_eq!(browse_tag(&hijacked, Some(&record)), Tag::Installed);
+        assert_eq!(
+            browse_tag(&hijacked, Some(&record)),
+            Tag::Version("v2.5.0"),
+            "that addon isn't installed"
+        );
         assert_eq!(
             managed_tag(&record, Some(&hijacked), true),
             Tag::Version("v3.8.3")
@@ -1617,6 +1706,68 @@ mod tests {
         // A record with no folders has nothing to tell it by.
         record.folders.clear();
         assert!(same_addon(&record, &hijacked));
+    }
+
+    #[test]
+    fn a_main_folder_the_catalog_vouches_for_as_a_rename_is_still_the_same_addon() {
+        let mut renamed = addon("wowi:424242", "ShortRoyalty", "misc", 10);
+        renamed.stable.as_mut().unwrap().version = "v0.3.1".to_owned();
+        let record = managed("wowi:424242", "ShortKings", "v0.3.0");
+        assert!(
+            !same_addon(&record, &renamed),
+            "a rename nobody vouched for"
+        );
+        assert_eq!(browse_tag(&renamed, Some(&record)), Tag::Version("v0.3.1"));
+
+        renamed.formerly = vec!["shortkings".to_owned()];
+        assert!(same_addon(&record, &renamed), "in any case");
+        assert!(update_for(&record, &renamed).is_some());
+        assert_eq!(browse_tag(&renamed, Some(&record)), Tag::Update);
+        assert_eq!(managed_tag(&record, Some(&renamed), true), Tag::Update);
+        let b = CatalogBundle::new(Catalog {
+            addons: vec![renamed],
+            ..Default::default()
+        });
+        assert!(entry_for(&b, "wowi:424242", Some(&record)).is_some());
+        let list = map(vec![record]);
+        assert_eq!(updates_available(&list, Some(&b)), ["wowi:424242"]);
+
+        // Only the record's main folder counts: another of its folders proves nothing.
+        let mut other = managed("wowi:424242", "ShortKings", "v0.3.0");
+        other.folders = vec!["SomethingElse".to_owned(), "ShortKings".to_owned()];
+        assert!(!same_addon(&other, b.addon("wowi:424242").unwrap()));
+    }
+
+    #[test]
+    fn a_page_without_an_entry_says_which_of_three_reasons_it_has() {
+        let mut record = managed("gh:a/sixty", "Forever Sixty", "addon-v2.0.34");
+        let data = addon("gh:a/sixty", "Forever Sixty Data", "misc", 1);
+        assert_eq!(
+            no_updates_note(&record, Some(&data)),
+            "The catalog now lists a different addon here, Forever Sixty Data. Yours doesn't \
+             get updates from it. To switch, remove yours, then install that one."
+        );
+        assert_eq!(
+            no_updates_tooltip(&record, Some(&data)),
+            "The catalog now lists a different addon here"
+        );
+        assert_eq!(
+            no_updates_note(&record, None),
+            "This addon isn't in the catalog anymore, so it doesn't get updates."
+        );
+        assert_eq!(
+            no_updates_tooltip(&record, None),
+            "Not in the catalog anymore"
+        );
+        record.origin = Origin::LocalZip;
+        assert_eq!(
+            no_updates_note(&record, None),
+            "Installed from a zip file, so it doesn't get updates."
+        );
+        assert_eq!(
+            no_updates_tooltip(&record, None),
+            "Installed from a zip file"
+        );
     }
 
     #[test]

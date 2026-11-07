@@ -3388,23 +3388,63 @@ fn a_pack_already_on_its_way_means_no_question() {
     assert!(managed(&h, SPOKEN).is_some() && managed(&h, QUEST_VOICES).is_some());
 }
 
-#[test]
-fn a_pack_the_addon_itself_requires_comes_along_without_a_question() {
-    let rig = Rig::new();
+/// Spoken with a TOC that requires one of its quest pack's folders, which is as big as the
+/// real one. It's never downloaded here.
+fn spoken_requiring_its_big_pack(rig: &Rig) -> Catalog {
     let mut spoken = spoken(&rig.site, "v3.8.3");
     spoken.deps = vec!["SpokenQuestsAudioAlliance".to_owned()];
-    rig.site
-        .publish(&catalog_of(vec![spoken, quest_voices(&rig.site, "v2.5.0")]));
+    let mut pack = quest_voices(&rig.site, "v2.5.0");
+    pack.stable.as_mut().unwrap().size = 1_479_966_451;
+    catalog_of(vec![spoken, pack])
+}
+
+#[test]
+fn a_big_pack_the_addon_itself_requires_is_asked_about_and_never_comes_along_unasked() {
+    let rig = Rig::new();
+    rig.site.publish(&spoken_requiring_its_big_pack(&rig));
+    let mut h = rig.launch_settled();
+    click(&mut h, "Spoken, v3.8.3");
+    assert!(has_label(&h, "Requires:"));
+    assert!(has_label(&h, "(install it yourself)"));
+
+    click(&mut h, "Install");
+    assert!(
+        matches!(app(&h).popup, Some(Popup::Packs(_))),
+        "a requirement that big is a question, with its size"
+    );
+    assert!(has_label(
+        &h,
+        "Spoken Audio: Quests is a 1.5 GB download. Install it too?"
+    ));
+    assert!(app(&h).queue.is_idle());
+    click(&mut h, "Just Spoken");
+    assert!(said(
+        &h,
+        "Spoken requires Spoken Audio: Quests, a 1.5 GB download. Install it from its page if \
+         you want it."
+    ));
+    assert!(!app(&h).queue.busy_with(QUEST_VOICES));
+    finish_ops(&mut h);
+    assert!(managed(&h, SPOKEN).is_some() && managed(&h, QUEST_VOICES).is_none());
+    assert!(has_label(&h, "(install it yourself)"));
+}
+
+#[test]
+fn installing_both_brings_a_big_pack_the_addon_requires_without_saying_to_fetch_it() {
+    let rig = Rig::new();
+    rig.site.publish(&spoken_requiring_its_big_pack(&rig));
     let mut h = rig.launch_settled();
     click(&mut h, "Spoken, v3.8.3");
     click(&mut h, "Install");
-    assert!(app(&h).popup.is_none(), "it's in the same batch");
-    assert!(said(
-        &h,
-        "Spoken requires Spoken Audio: Quests, so that installs first."
-    ));
+    // Answered without drawing a frame, so nothing has finished yet when it's looked at.
+    let Some(Popup::Packs(plan)) = app_mut(&mut h).popup.take() else {
+        panic!("the packs question comes first");
+    };
+    app_mut(&mut h).apply(plan.with_packs());
+    assert!(app(&h).queue.busy_with(SPOKEN) && app(&h).queue.busy_with(QUEST_VOICES));
+    assert!(!said(&h, "Install it from its page if you want it."));
+    app_mut(&mut h).apply(Action::CancelOps);
     finish_ops(&mut h);
-    assert!(managed(&h, SPOKEN).is_some() && managed(&h, QUEST_VOICES).is_some());
 }
 
 #[test]
@@ -3618,14 +3658,16 @@ fn an_entry_that_turned_into_another_addon_is_never_updated_into_it() {
 
     // A voice pack released after Spoken, taken as the repository's newest build under
     // Spoken's own id: what a catalog that doesn't pin an entry to its addon would publish.
-    let mut hijacked = publish_bundle(
-        &rig.site,
-        SPOKEN,
-        &QUEST_VOICE_FOLDERS,
-        &QUEST_VOICE_FOLDERS,
-        "v2.5.0",
+    let hijacked = named(
+        publish_bundle(
+            &rig.site,
+            SPOKEN,
+            &QUEST_VOICE_FOLDERS,
+            &QUEST_VOICE_FOLDERS,
+            "v2.5.0",
+        ),
+        "Spoken Audio: Quests",
     );
-    hijacked.name = "Spoken".to_owned();
     rig.site.publish(&catalog_of(vec![
         hijacked,
         publish_addon(&rig.site, FOO, "Foo", "2.0"),
@@ -3646,7 +3688,8 @@ fn an_entry_that_turned_into_another_addon_is_never_updated_into_it() {
     assert!(app(&h).queue.is_idle());
     assert!(said(
         &h,
-        "Spoken isn't in the catalog anymore, so it doesn't get updates."
+        "Spoken doesn't get updates: the catalog now lists a different addon in its place, \
+         Spoken Audio: Quests."
     ));
     finish_ops(&mut h);
     for folder in ["Spoken", "Spoken_Quests"] {
@@ -3660,20 +3703,24 @@ fn an_entry_that_turned_into_another_addon_is_never_updated_into_it() {
     assert_eq!(managed(&h, SPOKEN).unwrap().version, "v3.8.3");
     assert!(app(&h).updates.is_empty());
 
-    // Its page is the one an addon gets when it has left the catalog.
+    // Its page says what the catalog lists now, and offers nothing that would turn it into that.
     click(&mut h, "Spoken, v3.8.3");
-    const LEFT: &str = "This addon isn't in the catalog anymore, so it doesn't get updates.";
-    assert!(has_label(&h, LEFT));
+    const ANOTHER: &str = "The catalog now lists a different addon here, Spoken Audio: Quests. \
+                           Yours doesn't get updates from it. To switch, remove yours, then \
+                           install that one.";
+    assert!(has_label(&h, ANOTHER));
     for label in ["Install", "Update", "Reinstall"] {
         assert!(!has_label(&h, label), "{label} is offered");
     }
     press(&mut h, Key::Enter);
     assert!(app(&h).queue.is_idle() && app(&h).popup.is_none());
 
-    // Browse still lists the entry, as installed, and it opens the same page.
+    // Browse still lists the entry, as the addon it is, which isn't installed. It opens the
+    // same page.
     click(&mut h, "Browse");
-    click(&mut h, "Spoken, installed");
-    assert!(has_label(&h, LEFT));
+    assert!(!has_label(&h, "Spoken Audio: Quests, installed"));
+    click(&mut h, "Spoken Audio: Quests, v2.5.0");
+    assert!(has_label(&h, ANOTHER));
     close(h);
     assert_eq!(
         rig.saved_state()
@@ -3718,4 +3765,579 @@ fn a_pack_from_elsewhere_that_an_installed_addons_entry_now_lists_is_not_adopted
         ["Spoken", "Spoken_Quests"],
         "Spoken keeps its record"
     );
+}
+
+fn named(mut addon: Addon, name: &str) -> Addon {
+    addon.name = name.to_owned();
+    addon
+}
+
+/// Foo, whose author later renamed its main folder from Foo to FooCore.
+const RENAMED: &str = "gh:someone/foo";
+
+fn foo_before_the_rename(site: &Site) -> Addon {
+    let folders = ["Foo", "Foo_Options"];
+    named(
+        publish_bundle(site, RENAMED, &folders, &folders, "1.0"),
+        "Foo",
+    )
+}
+
+fn foo_after_the_rename(site: &Site, formerly: &[&str]) -> Addon {
+    let folders = ["FooCore", "Foo_Options"];
+    let mut foo = named(
+        publish_bundle(site, RENAMED, &folders, &folders, "2.0"),
+        "Foo",
+    );
+    foo.formerly = formerly.iter().map(|f| (*f).to_owned()).collect();
+    foo
+}
+
+#[test]
+fn a_renamed_main_folder_updates_once_the_catalog_vouches_for_the_rename_and_not_before() {
+    let rig = Rig::new();
+    rig.site
+        .publish(&catalog_of(vec![foo_before_the_rename(&rig.site)]));
+    let mut h = rig.launch_settled();
+    app_mut(&mut h).apply(Action::Install(vec![RENAMED.to_owned()]));
+    finish_ops(&mut h);
+    assert_eq!(
+        managed(&h, RENAMED).unwrap().folders,
+        ["Foo", "Foo_Options"]
+    );
+    close(h);
+
+    // Nothing says FooCore is Foo, so it could be any addon: Foo stays as it is.
+    rig.site
+        .publish(&catalog_of(vec![foo_after_the_rename(&rig.site, &[])]));
+    let mut h = rig.launch_settled();
+    assert!(app(&h).updates.is_empty());
+    click(&mut h, "Foo, 1.0");
+    assert!(has_label(
+        &h,
+        "The catalog now lists a different addon here, Foo. Yours doesn't get updates from \
+         it. To switch, remove yours, then install that one."
+    ));
+    close(h);
+    assert_eq!(rig.version_on_disk("Foo").as_deref(), Some("1.0"));
+
+    // The catalog vouches for the rename.
+    rig.site
+        .publish(&catalog_of(vec![foo_after_the_rename(&rig.site, &["Foo"])]));
+    let mut h = rig.launch_settled();
+    assert_eq!(app(&h).updates, [RENAMED], "Foo is still Foo");
+    click(&mut h, "Foo, update");
+    assert!(has_label(&h, "Update"), "its page is the catalog's");
+    click(&mut h, "Browse");
+    assert!(has_label(&h, "Foo, update"));
+
+    click(&mut h, "Update all (1)");
+    finish_ops(&mut h);
+    assert_eq!(rig.version_on_disk("FooCore").as_deref(), Some("2.0"));
+    assert_eq!(rig.version_on_disk("Foo_Options").as_deref(), Some("2.0"));
+    assert!(
+        !rig.addons().join("Foo").exists(),
+        "the old main folder goes"
+    );
+    let record = managed(&h, RENAMED).unwrap();
+    assert_eq!(record.folders, ["FooCore", "Foo_Options"]);
+    assert_eq!(record.version, "2.0");
+    assert!(app(&h).updates.is_empty());
+}
+
+#[test]
+fn a_main_folder_moved_in_two_steps_still_reaches_whoever_skipped_the_middle_build() {
+    // HogTron UI's real first step: v0.1 shipped HogHeals and its modules, and v0.2 ships
+    // HogTronUI first and keeps HogHeals. The catalog remembers HogHeals from then on.
+    const HOGTRON: &str = "gh:Hogtron-Solutions-Tech-Stack/hogtron-ui";
+    let v01 = ["HogHeals", "HogHeals_Frames", "HogHeals_HUD"];
+    let v02 = ["HogTronUI", "HogTron_HUD", "HogHeals", "HogHeals_Frames"];
+    let v03 = ["HogTronUI", "HogTron_HUD"];
+    let build = |site: &Site, folders: &[&str], version: &str, formerly: &[&str]| {
+        let mut entry = named(
+            publish_bundle(site, HOGTRON, folders, folders, version),
+            "HogTron UI",
+        );
+        entry.formerly = formerly.iter().map(|f| (*f).to_owned()).collect();
+        entry
+    };
+    let rig = Rig::new();
+    rig.site
+        .publish(&catalog_of(vec![build(&rig.site, &v01, "v0.1.0", &[])]));
+    let mut h = rig.launch_settled();
+    app_mut(&mut h).apply(Action::Install(vec![HOGTRON.to_owned()]));
+    finish_ops(&mut h);
+    assert_eq!(managed(&h, HOGTRON).unwrap().folders[0], "HogHeals");
+    close(h);
+
+    // The player sits v0.2 out.
+    rig.site.publish(&catalog_of(vec![build(
+        &rig.site,
+        &v02,
+        "v0.2.0",
+        &["HogHeals"],
+    )]));
+    let mut h = rig.launch_settled();
+    assert_eq!(app(&h).updates, [HOGTRON]);
+    app_mut(&mut h).apply(Action::SetPin(HOGTRON.to_owned(), true));
+    close(h);
+
+    // v0.3 drops HogHeals. Without the catalog's word that HogHeals was HogTron UI, the player
+    // who sat v0.2 out has an addon the entry doesn't list, and it's left alone.
+    rig.site
+        .publish(&catalog_of(vec![build(&rig.site, &v03, "v0.3.0", &[])]));
+    let mut h = rig.launch_settled();
+    app_mut(&mut h).apply(Action::SetPin(HOGTRON.to_owned(), false));
+    h.step();
+    h.step();
+    assert!(app(&h).updates.is_empty(), "unpinned, and still nothing");
+    close(h);
+
+    rig.site.publish(&catalog_of(vec![build(
+        &rig.site,
+        &v03,
+        "v0.3.0",
+        &["HogHeals"],
+    )]));
+    let mut h = rig.launch_settled();
+    assert_eq!(app(&h).updates, [HOGTRON], "v0.3 is still HogTron UI");
+    click(&mut h, "Update all (1)");
+    finish_ops(&mut h);
+    assert_eq!(managed(&h, HOGTRON).unwrap().folders, v03);
+    for folder in v01 {
+        assert!(!rig.addons().join(folder).exists(), "{folder} is left over");
+    }
+}
+
+#[test]
+fn a_rollback_to_a_build_from_before_a_rename_is_still_the_same_addon() {
+    // 1.0 bundled Ace3, whose name sorts before the addon's own folder. 2.0 renamed the main
+    // folder and dropped the library.
+    const TRACKER: &str = "gh:someone/questtracker";
+    let rig = Rig::new();
+    let before = ["QuestTracker", "Ace3"];
+    rig.site.publish(&catalog_of(vec![named(
+        publish_bundle(&rig.site, TRACKER, &before, &before, "1.0"),
+        "Quest Tracker",
+    )]));
+    let mut h = rig.launch_settled();
+    app_mut(&mut h).apply(Action::Install(vec![TRACKER.to_owned()]));
+    finish_ops(&mut h);
+    close(h);
+
+    let mut renamed = named(
+        publish_addon(&rig.site, TRACKER, "QuestGuide", "2.0"),
+        "Quest Tracker",
+    );
+    renamed.formerly = vec!["QuestTracker".to_owned()];
+    rig.site.publish(&catalog_of(vec![renamed]));
+    let mut h = rig.launch_settled();
+    click(&mut h, "Update all (1)");
+    finish_ops(&mut h);
+    click(&mut h, "Quest Tracker, 2.0");
+    click(&mut h, "Roll back to 1.0");
+    finish_ops(&mut h);
+    assert_eq!(rig.version_on_disk("QuestTracker").as_deref(), Some("1.0"));
+    assert_eq!(
+        managed(&h, TRACKER).unwrap().folders,
+        ["QuestTracker", "Ace3"],
+        "its own main folder first"
+    );
+    assert_eq!(app(&h).updates, [TRACKER], "2.0 is still its update");
+}
+
+#[test]
+fn a_rename_the_catalog_does_not_vouch_for_is_never_updated_and_its_page_says_how_to_switch() {
+    // A WoWInterface file holds one addon, so nothing stops its main folder changing.
+    const SHORT: &str = "wowi:424242";
+    let rig = Rig::new();
+    rig.site.publish(&catalog_of(vec![named(
+        publish_addon(&rig.site, SHORT, "ShortKings", "v0.3.0"),
+        "ShortKings",
+    )]));
+    let mut h = rig.launch_settled();
+    app_mut(&mut h).apply(Action::Install(vec![SHORT.to_owned()]));
+    finish_ops(&mut h);
+    close(h);
+
+    let mut catalog = catalog_of(vec![named(
+        publish_addon(&rig.site, SHORT, "ShortRoyalty", "v0.3.1"),
+        "ShortRoyalty",
+    )]);
+    catalog.kits = vec![Kit {
+        name: "Fun".to_owned(),
+        description: "Fun things.".to_owned(),
+        addons: vec![SHORT.to_owned()],
+    }];
+    rig.site.publish(&catalog);
+    let mut h = rig.launch_settled();
+    assert!(app(&h).updates.is_empty());
+    assert!(has_label(&h, "ShortKings, v0.3.0"), "no update tag");
+    h.get_by_label("ShortKings, v0.3.0").hover();
+    for _ in 0..30 {
+        h.step();
+    }
+    assert!(has_label(
+        &h,
+        "The catalog now lists a different addon here"
+    ));
+    assert!(!has_label(&h, "Not in the catalog anymore"));
+
+    click(&mut h, "ShortKings, v0.3.0");
+    assert!(has_label(
+        &h,
+        "The catalog now lists a different addon here, ShortRoyalty. Yours doesn't get updates \
+         from it. To switch, remove yours, then install that one."
+    ));
+    assert!(!has_label(
+        &h,
+        "This addon isn't in the catalog anymore, so it doesn't get updates."
+    ));
+    for label in ["Install", "Update", "Reinstall"] {
+        assert!(!has_label(&h, label), "{label} is offered");
+    }
+    press(&mut h, Key::Enter);
+    assert!(app(&h).queue.is_idle() && app(&h).popup.is_none());
+    // Asked for by id, the way a list or a requirement would: refused, and said why.
+    app_mut(&mut h).apply(Action::Install(vec![SHORT.to_owned()]));
+    assert!(app(&h).queue.is_idle());
+    assert!(said(
+        &h,
+        "ShortKings doesn't get updates: the catalog now lists a different addon in its place, \
+         ShortRoyalty."
+    ));
+
+    // Browse and the kit show that entry as what it is: an addon that isn't installed.
+    click(&mut h, "Browse");
+    assert!(has_label(&h, "ShortRoyalty, v0.3.1"));
+    click(&mut h, "Fun, 1 addons");
+    assert!(has_label(&h, "ShortRoyalty, v0.3.1"));
+    assert!(!has_label(&h, "ShortRoyalty, installed"));
+    close(h);
+    assert_eq!(rig.version_on_disk("ShortKings").as_deref(), Some("v0.3.0"));
+    assert!(!rig.addons().join("ShortRoyalty").exists());
+}
+
+#[test]
+fn an_entry_that_became_a_different_addon_is_shown_as_not_installed_and_can_be_switched_to() {
+    // The live catalog's foreversixty, once its nightly data pack took the addon's place.
+    const SIXTY: &str = "gh:jhunthrop/foreversixty";
+    let rig = Rig::new();
+    let addon = ["ForeverSixty", "ForeverSixtyInbox"];
+    rig.site.publish(&catalog_of(vec![named(
+        publish_bundle(&rig.site, SIXTY, &addon, &addon, "addon-v2.0.34"),
+        "Forever Sixty",
+    )]));
+    let mut h = rig.launch_settled();
+    app_mut(&mut h).apply(Action::Install(vec![SIXTY.to_owned()]));
+    finish_ops(&mut h);
+    close(h);
+
+    rig.site.publish(&catalog_of(vec![named(
+        publish_addon(&rig.site, SIXTY, "ForeverSixtyData", "data-v2026.11.07"),
+        "Forever Sixty Data",
+    )]));
+    let mut h = rig.launch_settled();
+    assert!(app(&h).updates.is_empty());
+    click(&mut h, "Browse");
+    assert!(!has_label(&h, "Forever Sixty Data, installed"));
+    click(&mut h, "Forever Sixty Data, data-v2026.11.07");
+    assert!(
+        has_label(&h, "Forever Sixty"),
+        "the player's own addon's page"
+    );
+    assert!(has_label(
+        &h,
+        "The catalog now lists a different addon here, Forever Sixty Data. Yours doesn't get \
+         updates from it. To switch, remove yours, then install that one."
+    ));
+
+    // Doing what it says works.
+    click(&mut h, "Remove");
+    click_last(&mut h, "Remove");
+    finish_ops(&mut h);
+    assert!(managed(&h, SIXTY).is_none());
+    click(&mut h, "Install");
+    finish_ops(&mut h);
+    assert_eq!(
+        rig.version_on_disk("ForeverSixtyData").as_deref(),
+        Some("data-v2026.11.07")
+    );
+    assert!(!rig.addons().join("ForeverSixty").exists());
+}
+
+#[test]
+fn an_addon_that_left_the_catalog_says_so_on_its_page_and_its_row() {
+    let rig = Rig::new();
+    rig.site.publish(&catalog_of(vec![
+        publish_addon(&rig.site, FOO, "Foo", "1.0"),
+        publish_addon(&rig.site, BAR, "Bar", "1.0"),
+    ]));
+    let mut h = rig.launch_settled();
+    app_mut(&mut h).apply(Action::Install(vec![FOO.to_owned()]));
+    finish_ops(&mut h);
+    close(h);
+
+    rig.site.publish(&catalog_of(vec![publish_addon(
+        &rig.site, BAR, "Bar", "1.0",
+    )]));
+    let mut h = rig.launch_settled();
+    h.get_by_label("Foo Addon, 1.0").hover();
+    for _ in 0..30 {
+        h.step();
+    }
+    assert!(has_label(&h, "Not in the catalog anymore"));
+    click(&mut h, "Foo Addon, 1.0");
+    assert!(has_label(
+        &h,
+        "This addon isn't in the catalog anymore, so it doesn't get updates."
+    ));
+    assert!(!has_label(&h, "Install") && !has_label(&h, "Reinstall"));
+}
+
+#[test]
+fn quest_voices_in_another_language_from_elsewhere_meet_the_group() {
+    let rig = Rig::new();
+    rig.plant("SpokenQuestsAudio_deDE", "1.0.1");
+    let mut spoken = spoken(&rig.site, "v3.8.3");
+    spoken.packs[0].met_by = vec!["SpokenQuestsAudio".to_owned()];
+    rig.site
+        .publish(&catalog_of(vec![spoken, quest_voices(&rig.site, "v2.5.0")]));
+    let mut h = rig.launch_settled();
+    click(&mut h, "Browse");
+    click(&mut h, "Spoken, v3.8.3");
+    assert!(has_label(&h, "Quest voices:"), "the pack is still offered");
+    assert!(!has_label(&h, NEEDS_A_PACK));
+    click(&mut h, "Install");
+    assert!(app(&h).popup.is_none(), "nothing to ask");
+    finish_ops(&mut h);
+    assert!(managed(&h, SPOKEN).is_some() && managed(&h, QUEST_VOICES).is_none());
+    assert!(!has_label(&h, NEEDS_A_PACK));
+}
+
+#[test]
+fn a_community_voice_pack_from_the_catalog_meets_the_group_too() {
+    const IVRIT: &str = "gh:renanbazinin/spoken-ivrit";
+    let rig = Rig::new();
+    // As the live catalog lists it: trusted, never reviewed.
+    let mut hebrew = named(
+        publish_addon(&rig.site, IVRIT, "SpokenCommunity_ivrit", "v0.6.3"),
+        "Spoken Hebrew (Ivrit)",
+    );
+    hebrew.reviewed = false;
+    let mut spoken = spoken(&rig.site, "v3.8.3");
+    spoken.packs[0].met_by = vec![
+        "SpokenQuestsAudio".to_owned(),
+        "SpokenCommunity_".to_owned(),
+    ];
+    rig.site.publish(&catalog_of(vec![
+        spoken,
+        quest_voices(&rig.site, "v2.5.0"),
+        hebrew,
+    ]));
+    let mut h = rig.launch_settled();
+    app_mut(&mut h).apply(Action::InstallFromPage(IVRIT.to_owned()));
+    finish_ops(&mut h);
+    assert!(managed(&h, IVRIT).is_some());
+    click(&mut h, "Browse");
+    click(&mut h, "Spoken, v3.8.3");
+    assert!(!has_label(&h, NEEDS_A_PACK));
+    click(&mut h, "Install");
+    assert!(app(&h).popup.is_none());
+}
+
+#[test]
+fn an_addon_that_requires_big_packs_installs_without_them_and_says_how_big_they_are() {
+    const PLACES: &str = "gh:rusty-key/spoken-wow/places-audio";
+    let rig = Rig::new();
+    let mut quests = quest_voices(&rig.site, "v2.5.0");
+    // Never downloaded here, so they can be as big as the real ones.
+    quests.stable.as_mut().unwrap().size = 1_479_966_451;
+    let mut places = named(
+        publish_addon(&rig.site, PLACES, "SpokenPlacesAudio", "v2.1.0"),
+        "Spoken Audio: Places",
+    );
+    places.stable.as_mut().unwrap().size = 456_216_109;
+    // A stranger's new repository whose TOC requires the packs' folders.
+    let mut stranger = publish_addon(&rig.site, FOO, "Foo", "1.0");
+    stranger.trusted = false;
+    stranger.reviewed = false;
+    stranger.deps = vec![
+        "SpokenQuestsAudioAlliance".to_owned(),
+        "SpokenPlacesAudio".to_owned(),
+    ];
+    rig.site.publish(&catalog_of(vec![
+        stranger,
+        spoken(&rig.site, "v3.8.3"),
+        quests,
+        places,
+    ]));
+    let mut h = rig.launch_settled();
+    click(&mut h, "Foo Addon, 1.0");
+    assert!(has_label(&h, crate::model::UNTRUSTED_NOTE));
+    assert!(has_label(&h, "Spoken Audio: Quests") && has_label(&h, "Spoken Audio: Places"));
+    assert_eq!(
+        h.query_all_by_label("(install it yourself)").count(),
+        2,
+        "both are left for the player"
+    );
+
+    click(&mut h, "Install");
+    assert!(app(&h).popup.is_none());
+    assert!(said(
+        &h,
+        "Foo Addon requires Spoken Audio: Quests, a 1.5 GB download. Install it from its page \
+         if you want it."
+    ));
+    assert!(said(
+        &h,
+        "Foo Addon requires Spoken Audio: Places, a 456.2 MB download. Install it from its \
+         page if you want it."
+    ));
+    assert!(!app(&h).queue.busy_with(QUEST_VOICES) && !app(&h).queue.busy_with(PLACES));
+    finish_ops(&mut h);
+    assert!(managed(&h, FOO).is_some());
+    assert!(managed(&h, QUEST_VOICES).is_none() && managed(&h, PLACES).is_none());
+    assert!(
+        QUEST_VOICE_FOLDERS
+            .iter()
+            .all(|folder| !rig.addons().join(folder).exists())
+    );
+}
+
+#[test]
+fn a_second_click_while_the_first_waits_asks_nothing_twice_and_reinstalls_nothing() {
+    let rig = Rig::new();
+    rig.site.publish(&catalog_of(vec![
+        spoken(&rig.site, "v3.8.3"),
+        quest_voices(&rig.site, "v2.5.0"),
+    ]));
+    let mut h = rig.launch_settled();
+    click(&mut h, "Spoken, v3.8.3");
+    // As during the first read of AddOns, which is all a click waits for.
+    app_mut(&mut h).scanned = false;
+    click(&mut h, "Install");
+    click(&mut h, "Install");
+    assert!(app(&h).popup.is_none() && app(&h).queue.is_idle());
+    assert_eq!(app(&h).after_scan.len(), 1, "the second click adds nothing");
+
+    app_mut(&mut h).rescan();
+    pump(&mut h, "the scan", |a| a.scanned);
+    h.step();
+    h.step();
+    assert!(matches!(app(&h).popup, Some(Popup::Packs(_))));
+    assert!(app(&h).popup_queue.is_empty(), "asked once");
+    // Another click while it's up doesn't stack the question behind itself.
+    app_mut(&mut h).apply(Action::InstallFromPage(SPOKEN.to_owned()));
+    assert!(app(&h).popup_queue.is_empty());
+
+    click(&mut h, "Just Spoken");
+    assert!(app(&h).popup.is_none(), "nothing left to answer");
+    finish_ops(&mut h);
+    assert!(managed(&h, SPOKEN).is_some() && managed(&h, QUEST_VOICES).is_none());
+
+    // An answer that comes late, as from a question left open behind another, only adds what's
+    // still missing. Spoken is marked, so a fresh copy of it would show.
+    fs::write(
+        rig.addons().join("Spoken").join("Spoken.lua"),
+        "-- marked\n",
+    )
+    .unwrap();
+    let late = Action::InstallWithPacks {
+        id: SPOKEN.to_owned(),
+        packs: vec![QUEST_VOICES.to_owned()],
+    };
+    app_mut(&mut h).apply(late.clone());
+    assert!(app(&h).popup.is_none());
+    assert!(
+        !app(&h).queue.busy_with(SPOKEN),
+        "Spoken isn't installed again"
+    );
+    assert!(app(&h).queue.busy_with(QUEST_VOICES));
+    finish_ops(&mut h);
+    assert_eq!(rig.version_on_disk("Spoken").as_deref(), Some("marked"));
+    for folder in QUEST_VOICE_FOLDERS {
+        assert_eq!(rig.version_on_disk(folder).as_deref(), Some("v2.5.0"));
+    }
+
+    // Once everything it chose is here, it adds nothing at all.
+    fs::write(
+        rig.addons()
+            .join("SpokenQuestsAudioShared")
+            .join("SpokenQuestsAudioShared.lua"),
+        "-- marked\n",
+    )
+    .unwrap();
+    app_mut(&mut h).apply(late);
+    assert!(app(&h).queue.is_idle());
+    finish_ops(&mut h);
+    assert_eq!(
+        rig.version_on_disk("SpokenQuestsAudioShared").as_deref(),
+        Some("marked")
+    );
+}
+
+/// A zip `padding` bytes bigger than an ordinary one, stored rather than compressed, so it
+/// crosses a size limit for real.
+fn padded_zip(folder: &str, version: &str, padding: usize) -> Vec<u8> {
+    let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    let plain = zip::write::SimpleFileOptions::default();
+    let toc = format!("{FOREVER_TOC}## Title: {folder}\n## Version: {version}\n");
+    writer
+        .start_file(format!("{folder}/{folder}.toc"), plain)
+        .unwrap();
+    writer.write_all(toc.as_bytes()).unwrap();
+    writer
+        .start_file(format!("{folder}/{folder}.lua"), plain)
+        .unwrap();
+    writer
+        .write_all(format!("-- {version}\n").as_bytes())
+        .unwrap();
+    let stored = plain.compression_method(zip::CompressionMethod::Stored);
+    writer
+        .start_file(format!("{folder}/media.ogg"), stored)
+        .unwrap();
+    let chunk = vec![7u8; 1 << 20];
+    let mut left = padding;
+    while left > 0 {
+        let n = left.min(chunk.len());
+        writer.write_all(&chunk[..n]).unwrap();
+        left -= n;
+    }
+    writer.finish().unwrap().into_inner()
+}
+
+#[test]
+fn rolling_back_is_still_offered_when_the_new_version_was_too_big_to_keep() {
+    let rig = Rig::new();
+    rig.site.publish(&catalog_of(vec![publish_addon(
+        &rig.site, FOO, "Foo", "1.0",
+    )]));
+    let mut h = rig.launch_settled();
+    click(&mut h, "Install");
+    finish_ops(&mut h);
+    close(h);
+
+    // Just over a quarter of the 500 MiB cache, so 2.0's zip isn't kept, and 1.0's still is.
+    let zip = padded_zip("Foo", "2.0", 132_000_000);
+    let size = zip.len() as u64;
+    let url = rig.site.put("/Foo-2.0-big.zip", zip);
+    let mut big = publish_addon(&rig.site, FOO, "Foo", "2.0");
+    big.source = Source::Direct { url: url.clone() };
+    let release = big.stable.as_mut().unwrap();
+    release.url = url;
+    release.size = size;
+    rig.site.publish(&catalog_of(vec![big]));
+    let mut h = rig.launch_settled();
+    click(&mut h, "Update all (1)");
+    finish_ops(&mut h);
+    assert_eq!(rig.version_on_disk("Foo").as_deref(), Some("2.0"));
+    assert_eq!(
+        managed(&h, FOO).unwrap().previous_version.as_deref(),
+        Some("1.0")
+    );
+    click(&mut h, "Foo Addon, 2.0");
+    click(&mut h, "Roll back to 1.0");
+    finish_ops(&mut h);
+    assert_eq!(rig.version_on_disk("Foo").as_deref(), Some("1.0"));
 }

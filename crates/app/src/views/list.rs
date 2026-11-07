@@ -13,7 +13,6 @@ use eframe::egui::{
     UiBuilder, pos2, vec2,
 };
 use feeling_core::catalog::Addon;
-use feeling_core::state::Origin;
 
 pub const ROW_HEIGHT: f32 = 23.0;
 const INDENT: f32 = 26.0;
@@ -312,15 +311,10 @@ fn tooltip(app: &App, ui: &mut Ui, row: &Row) {
                 Some(addon) => addon_tooltip(ui, addon),
                 None => {
                     if let Some(record) = record {
+                        // What the catalog lists under its id now, which is another addon.
+                        let listed = bundle.and_then(|b| b.addon(id));
                         widgets::tooltip_title(ui, &record.name, theme::tier_color(1));
-                        widgets::tooltip_line(
-                            ui,
-                            if record.origin == Origin::LocalZip {
-                                "Installed from a zip file"
-                            } else {
-                                "Not in the catalog anymore"
-                            },
-                        );
+                        widgets::tooltip_line(ui, model::no_updates_tooltip(record, listed));
                     }
                 }
             }

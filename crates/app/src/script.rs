@@ -5,7 +5,7 @@
 //! wait              # until the game, catalog and every operation have settled
 //! install <id>      # the page's Install button, whatever it says today
 //! replace           # Replace them, on the popup that can open next
-//! packs both        # Install both (or Install all), on the packs popup that can open next
+//! packs both        # Install both (or Install them too), on the packs popup that can open next
 //! packs just        # Just <addon>, on that popup: the addon without its packs
 //! rollback <id>
 //! remove <id>
