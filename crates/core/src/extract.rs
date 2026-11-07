@@ -5,13 +5,16 @@
 //! OS, so a zip behaves the same for every player. `ZipArchive::extract` is never
 //! used, and nothing here creates a symlink or keeps a file's permissions by default.
 
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufReader, Read, Seek, Write};
+use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use zip::read::{ArchiveOffset, Config};
 use zip::result::ZipError;
 use zip::{CompressionMethod, ZipArchive};
 
@@ -60,6 +63,9 @@ pub struct Limits {
     pub max_total_bytes: u64,
     pub max_file_bytes: u64,
     pub max_entries: usize,
+    /// How much of the file the zip crate may read to list what's inside. It keeps several
+    /// copies of what it reads, so this is what bounds its memory, however big the zip is.
+    pub max_directory_bytes: u64,
     /// Output bytes per compressed byte. Lua compresses well, but not this well.
     pub max_ratio: u64,
     /// The ratio is only judged past this many bytes, because tiny files can
@@ -73,6 +79,9 @@ impl Default for Limits {
             max_total_bytes: 2 * GB,
             max_file_bytes: 512 * MB,
             max_entries: 200_000,
+            // The biggest in the catalog is 11 MB, for 104,000 files. The catalog scan gives
+            // up at this same size, so nothing it could read trips this.
+            max_directory_bytes: 64 * MB,
             max_ratio: 1000,
             ratio_floor_bytes: 64 * MB,
         }
@@ -100,7 +109,7 @@ pub fn extract(
     progress: &mut dyn FnMut(Progress),
     cancel: &AtomicBool,
 ) -> Result<Extracted> {
-    let (mut archive, zip_len) = open_archive(zip_path)?;
+    let (mut archive, zip_len) = open_archive(zip_path, &limits)?;
     let entries = read_entries(&mut archive, &limits)?;
     let plan = plan_addons(&entries, moves)?;
     run_plan(
@@ -134,7 +143,7 @@ pub(crate) fn extract_tree(
     progress: &mut dyn FnMut(Progress),
     cancel: &AtomicBool,
 ) -> Result<Extracted> {
-    let (mut archive, zip_len) = open_archive(zip_path)?;
+    let (mut archive, zip_len) = open_archive(zip_path, &limits)?;
     let entries = read_entries(&mut archive, &limits)?;
     let plan = plan_tree(&entries, options)?;
     run_plan(
@@ -220,31 +229,131 @@ fn unsafe_zip(reason: impl Into<String>) -> Error {
     Error::UnsafeZip(reason.into())
 }
 
-fn open_archive(zip_path: &Path) -> Result<(ZipArchive<BufReader<File>>, u64)> {
+/// Open a zip the way the catalog scan does: the file list is where the end of the file
+/// says it is, with nothing in front of the zip. The crate's default hunts for whichever
+/// list it likes best instead, so one file with two lists could show the catalog one
+/// addon and install another, and the hunt reads through the whole file.
+fn open_archive(zip_path: &Path, limits: &Limits) -> Result<(ZipArchive<ZipReader>, u64)> {
     let long = long_path(zip_path);
-    let file = File::open(&long).map_err(|e| io_error(&long, e))?;
+    let mut file = File::open(&long).map_err(|e| io_error(&long, e))?;
     let zip_len = file.metadata().map_err(|e| io_error(&long, e))?.len();
-    let archive = ZipArchive::new(BufReader::new(file)).map_err(|e| match e {
-        ZipError::Io(io) if io.kind() != io::ErrorKind::UnexpectedEof => io_error(&long, io),
-        other => match foreign_archive(&long) {
-            Some(kind) => Error::Other(format!(
-                "This addon is packed as a {kind} file, which this app can't open. \
-                 Its author may offer a zip of another version."
-            )),
-            None => zip_error(other, "the zip"),
-        },
+    let declared = most_files_declared(&mut file, zip_len).map_err(|e| io_error(&long, e))?;
+    if declared > limits.max_entries as u64 {
+        return Err(too_many_files(declared, limits));
+    }
+    let budget = Rc::new(Cell::new(limits.max_directory_bytes));
+    let reader = ReadBudget {
+        inner: BufReader::new(file),
+        left: Rc::clone(&budget),
+    };
+    let config = Config {
+        archive_offset: ArchiveOffset::Known(0),
+    };
+    let archive = ZipArchive::with_config(config, reader).map_err(|e| {
+        if budget.get() == 0 {
+            return unsafe_zip(format!(
+                "its list of files is over the {} MB limit.",
+                limits.max_directory_bytes / MB
+            ));
+        }
+        match e {
+            ZipError::Io(io) if io.kind() != io::ErrorKind::UnexpectedEof => io_error(&long, io),
+            other => match foreign_archive(&long) {
+                Some(kind) => Error::Other(format!(
+                    "This addon is packed as a {kind} file, which this app can't open. \
+                     Its author may offer a zip of another version."
+                )),
+                None => zip_error(other, "the zip"),
+            },
+        }
     })?;
+    // From here on it's reading the files themselves, which have limits of their own.
+    budget.set(u64::MAX);
     Ok((archive, zip_len))
 }
 
-/// Older WoWInterface uploads include these. A real, intact file, so "corrupt, try
-/// again" would send the player in circles.
+type ZipReader = ReadBudget<BufReader<File>>;
+
+/// Fails once a set number of bytes has been read, however they were asked for. Counting
+/// here can't be fooled the way believing what a zip says about itself can.
+struct ReadBudget<R> {
+    inner: R,
+    left: Rc<Cell<u64>>,
+}
+
+impl<R: Read> Read for ReadBudget<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let left = self.left.get();
+        if left == 0 {
+            return Err(io::Error::other("the zip's list of files is too long"));
+        }
+        let wanted = buffer
+            .len()
+            .min(usize::try_from(left).unwrap_or(usize::MAX));
+        let count = self.inner.read(&mut buffer[..wanted])?;
+        self.left.set(left - count as u64);
+        Ok(count)
+    }
+}
+
+impl<R: Seek> Seek for ReadBudget<R> {
+    fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+        self.inner.seek(position)
+    }
+}
+
+/// Far enough from the end of a file to hold the longest zip comment and what's around it.
+const ZIP_TAIL_BYTES: u64 = 66 * KB;
+
+/// The most files any zip64 record near the end of the file claims. The zip crate sets
+/// aside room for that many before it reads a single one, and the only check on the number
+/// is the size of the file, so a big zip can ask for several times its size up front. This
+/// looks at every end marker in reach, because the crate moves on to earlier ones when one
+/// doesn't work out, so a harmless last one must not hide what's in front of it.
+fn most_files_declared(file: &mut File, zip_len: u64) -> io::Result<u64> {
+    file.seek(SeekFrom::Start(zip_len.saturating_sub(ZIP_TAIL_BYTES)))?;
+    let mut tail = Vec::new();
+    Read::by_ref(file)
+        .take(ZIP_TAIL_BYTES)
+        .read_to_end(&mut tail)?;
+    let read_u64 = |bytes: &[u8]| {
+        let mut number = [0u8; 8];
+        number.copy_from_slice(bytes);
+        u64::from_le_bytes(number)
+    };
+    let mut most = 0;
+    for (end, _) in tail
+        .windows(4)
+        .enumerate()
+        .filter(|(end, mark)| *end >= 20 && *mark == b"PK\x05\x06")
+    {
+        // A zip64 locator is 20 bytes: its mark, a disk number, then where the record is.
+        let locator = &tail[end - 20..end];
+        if &locator[..4] != b"PK\x06\x07" {
+            continue;
+        }
+        let mut record = [0u8; 40];
+        if file
+            .seek(SeekFrom::Start(read_u64(&locator[8..16])))
+            .is_ok()
+            && file.read_exact(&mut record).is_ok()
+            && &record[..4] == b"PK\x06\x06"
+        {
+            most = most.max(read_u64(&record[32..40]));
+        }
+    }
+    Ok(most)
+}
+
+/// Older WoWInterface uploads include the first two. A real, intact file, so "corrupt,
+/// try again" would send the player in circles.
 fn foreign_archive(path: &Path) -> Option<&'static str> {
     let mut magic = [0u8; 6];
     File::open(path).ok()?.read_exact(&mut magic).ok()?;
     match magic {
         [b'R', b'a', b'r', b'!', ..] => Some("RAR"),
         [b'7', b'z', 0xBC, 0xAF, 0x27, 0x1C] => Some("7-Zip"),
+        [b'M', b'Z', ..] => Some("self-extracting program"),
         _ => None,
     }
 }
@@ -277,11 +386,7 @@ fn read_entries<R: Read + Seek>(
     limits: &Limits,
 ) -> Result<Vec<ZipEntry>> {
     if archive.len() > limits.max_entries {
-        return Err(unsafe_zip(format!(
-            "it holds {} files, more than the {} allowed.",
-            archive.len(),
-            limits.max_entries
-        )));
+        return Err(too_many_files(archive.len() as u64, limits));
     }
     if archive.has_duplicate_names() {
         return Err(unsafe_zip("it lists the same file name twice."));
@@ -1007,6 +1112,13 @@ fn read_error(error: io::Error, name: &str) -> Error {
     Error::Corrupt(format!("{} couldn't be read ({error})", printable(name)))
 }
 
+fn too_many_files(count: u64, limits: &Limits) -> Error {
+    unsafe_zip(format!(
+        "it holds {count} files, more than the {} allowed.",
+        limits.max_entries
+    ))
+}
+
 fn zip_bomb(limits: Limits) -> Error {
     unsafe_zip(format!(
         "it expands to over {} times its size, which is how a zip bomb behaves.",
@@ -1161,7 +1273,7 @@ pub(crate) mod test_zips {
 
 #[cfg(test)]
 mod tests {
-    use super::test_zips::{RawEntry, raw_zip, zip_bytes};
+    use super::test_zips::{RawEntry, crc32, raw_zip, zip_bytes};
     use super::*;
     use std::collections::BTreeMap;
     use zip::ZipWriter;
@@ -1747,6 +1859,221 @@ mod tests {
             let text = result.unwrap_err().to_string();
             assert!(text.contains(kind) && !text.contains("Try again"), "{text}");
         }
+    }
+
+    #[test]
+    fn a_self_extracting_program_says_what_it_is() {
+        let mut bytes = b"MZ this would be a program".to_vec();
+        bytes.extend(raw_zip(&[RawEntry::new("Foo/Foo.toc", TOC)]));
+        let text = Fixture::new().extract(&bytes, &[]).unwrap_err().to_string();
+        assert!(
+            text.contains("self-extracting") && !text.contains("Try again"),
+            "{text}"
+        );
+    }
+
+    /// The catalog scan reads a zip with `Known(0)`, so anything with data in front of it
+    /// looks broken there. The installer has to agree, or the two see different things.
+    #[test]
+    fn data_in_front_of_a_zip_is_refused() {
+        let fixture = Fixture::new();
+        let mut bytes = b"anything at all".to_vec();
+        bytes.extend(raw_zip(&[RawEntry::new("Foo/Foo.toc", TOC)]));
+        let result = fixture.extract(&bytes, &[]);
+        assert!(matches!(result, Err(Error::Corrupt(_))), "{result:?}");
+        assert!(fixture.tree().is_empty());
+    }
+
+    /// One file in a hand-made central record, `stored_offset` from the zip's start.
+    fn central_record(name: &str, data: &[u8], stored_offset: u32) -> Vec<u8> {
+        let mut record = Vec::new();
+        record.extend_from_slice(&0x0201_4b50u32.to_le_bytes());
+        record.extend_from_slice(&20u16.to_le_bytes());
+        record.extend_from_slice(&20u16.to_le_bytes());
+        record.extend_from_slice(&0x0800u16.to_le_bytes());
+        record.extend_from_slice(&0u16.to_le_bytes());
+        record.extend_from_slice(&[0, 0, 0x21, 0]);
+        record.extend_from_slice(&crc32(data).to_le_bytes());
+        record.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        record.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        record.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        record.extend_from_slice(&[0u8; 12]);
+        record.extend_from_slice(&stored_offset.to_le_bytes());
+        record.extend_from_slice(name.as_bytes());
+        record
+    }
+
+    fn local_record(name: &str, data: &[u8]) -> Vec<u8> {
+        let mut record = Vec::new();
+        record.extend_from_slice(&0x0403_4b50u32.to_le_bytes());
+        record.extend_from_slice(&20u16.to_le_bytes());
+        record.extend_from_slice(&0x0800u16.to_le_bytes());
+        record.extend_from_slice(&0u16.to_le_bytes());
+        record.extend_from_slice(&[0, 0, 0x21, 0]);
+        record.extend_from_slice(&crc32(data).to_le_bytes());
+        record.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        record.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        record.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        record.extend_from_slice(&0u16.to_le_bytes());
+        record.extend_from_slice(name.as_bytes());
+        record.extend_from_slice(data);
+        record
+    }
+
+    fn end_record(count: u16, list_size: u32, list_offset: u32) -> Vec<u8> {
+        let mut record = Vec::new();
+        record.extend_from_slice(&0x0605_4b50u32.to_le_bytes());
+        record.extend_from_slice(&[0u8; 4]);
+        record.extend_from_slice(&count.to_le_bytes());
+        record.extend_from_slice(&count.to_le_bytes());
+        record.extend_from_slice(&list_size.to_le_bytes());
+        record.extend_from_slice(&list_offset.to_le_bytes());
+        record.extend_from_slice(&0u16.to_le_bytes());
+        record
+    }
+
+    /// The end record's offset names a list holding `Harmless`, and its size implies a second
+    /// list holding `Bartender4`. A reader that prefers the size installs what the catalog
+    /// never saw.
+    #[test]
+    fn a_zip_with_two_file_lists_installs_the_one_the_catalog_read() {
+        let harmless = local_record("Harmless/Harmless.toc", TOC);
+        let shown_list = central_record("Harmless/Harmless.toc", TOC, 0);
+        // Offsets in the hidden list get the distance between the two lists added to them.
+        let padding = vec![0u8; shown_list.len()];
+        let hidden_at = (harmless.len() + padding.len()) as u32;
+        let hidden = local_record("Bartender4/Bartender4.toc", TOC);
+        let hidden_list = central_record(
+            "Bartender4/Bartender4.toc",
+            TOC,
+            hidden_at - shown_list.len() as u32,
+        );
+
+        let mut bytes = harmless;
+        bytes.extend_from_slice(&padding);
+        bytes.extend_from_slice(&hidden);
+        let shown_at = bytes.len() as u32;
+        bytes.extend_from_slice(&shown_list);
+        bytes.extend_from_slice(&hidden_list);
+        bytes.extend(end_record(1, hidden_list.len() as u32, shown_at));
+
+        let fixture = Fixture::new();
+        let extracted = fixture.extract(&bytes, &[]).unwrap();
+        assert_eq!(extracted.folders, ["Harmless"]);
+        assert_eq!(paths(&fixture), ["Harmless/Harmless.toc"]);
+    }
+
+    #[test]
+    fn a_file_list_over_the_read_limit_is_refused() {
+        let entries: Vec<RawEntry> = (0..2000)
+            .map(|i| RawEntry::new(format!("Foo/file-{i:04}.lua"), b"1"))
+            .collect();
+        let limits = Limits {
+            max_directory_bytes: 32 * KB,
+            ..Limits::default()
+        };
+        let fixture = Fixture::new();
+        let result = fixture.extract_limited(&raw_zip(&entries), limits);
+        assert!(
+            matches!(&result, Err(Error::UnsafeZip(text)) if text.contains("list of files")),
+            "{result:?}"
+        );
+        assert!(fixture.tree().is_empty());
+    }
+
+    #[test]
+    fn the_read_limit_stops_counting_once_the_list_is_read() {
+        let big = vec![7u8; 512 * KB as usize];
+        let bytes = raw_zip(&[
+            RawEntry::new("Foo/Foo.toc", TOC),
+            RawEntry::new("Foo/big.bin", &big),
+        ]);
+        let limits = Limits {
+            max_directory_bytes: 128 * KB,
+            ..Limits::default()
+        };
+        let fixture = Fixture::new();
+        fixture.extract_limited(&bytes, limits).unwrap();
+        assert_eq!(fixture.tree()["Foo/big.bin"], big);
+    }
+
+    /// A zip's end as zip64 writes it: the record, the locator, and a plain end record whose
+    /// own fields are all marked "see the zip64 record".
+    fn zip64_end(claimed: u64, list_size: u64, list_at: u64, record_at: u64) -> Vec<u8> {
+        let mut end = Vec::new();
+        end.extend_from_slice(&0x0606_4b50u32.to_le_bytes());
+        end.extend_from_slice(&44u64.to_le_bytes());
+        end.extend_from_slice(&45u16.to_le_bytes());
+        end.extend_from_slice(&45u16.to_le_bytes());
+        end.extend_from_slice(&[0u8; 8]);
+        end.extend_from_slice(&claimed.to_le_bytes());
+        end.extend_from_slice(&claimed.to_le_bytes());
+        end.extend_from_slice(&list_size.to_le_bytes());
+        end.extend_from_slice(&list_at.to_le_bytes());
+        end.extend_from_slice(&0x0706_4b50u32.to_le_bytes());
+        end.extend_from_slice(&[0u8; 4]);
+        end.extend_from_slice(&record_at.to_le_bytes());
+        end.extend_from_slice(&1u32.to_le_bytes());
+        end.extend_from_slice(&0x0605_4b50u32.to_le_bytes());
+        end.extend_from_slice(&[0u8; 4]);
+        end.extend_from_slice(&[0xFF; 12]);
+        end.extend_from_slice(&0u16.to_le_bytes());
+        end
+    }
+
+    /// Turn a plain zip's end record into zip64, keeping what it says.
+    fn as_zip64(mut bytes: Vec<u8>, files: u64) -> Vec<u8> {
+        let eocd = bytes.len() - 22;
+        let field = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+        let (list_size, list_at) = (field(eocd + 12), field(eocd + 16));
+        bytes.truncate(eocd);
+        let end = zip64_end(files, list_size.into(), list_at.into(), eocd as u64);
+        bytes.extend(end);
+        bytes
+    }
+
+    #[test]
+    fn a_zip64_count_over_the_limit_is_refused_before_the_list_is_read() {
+        // Enough file for the crate's own check that this many could fit.
+        let padding = vec![0u8; 5000 * 46];
+        let toc = RawEntry::new("Foo/Foo.toc", TOC);
+        let lying = as_zip64(raw_zip(&[toc, RawEntry::new("Foo/pad", &padding)]), 5000);
+        let limits = Limits {
+            max_entries: 1000,
+            ..Limits::default()
+        };
+        // Without the check, the crate sets aside room for 5,000 and then finds the list
+        // damaged, which would say nothing about that room.
+        let fixture = Fixture::new();
+        let result = fixture.extract_limited(&lying, limits);
+        assert!(
+            matches!(&result, Err(Error::UnsafeZip(text)) if text.contains("5000 files")),
+            "{result:?}"
+        );
+
+        // A harmless end marker after the real one doesn't hide it.
+        let mut hidden = lying;
+        hidden.extend(end_record(1, 46, 0));
+        let result = fixture.extract_limited(&hidden, limits);
+        assert!(
+            matches!(&result, Err(Error::UnsafeZip(text)) if text.contains("5000 files")),
+            "{result:?}"
+        );
+    }
+
+    /// How the biggest addon in the catalog is packed: too many files for the plain end
+    /// record to count. Stops short of writing 65,000 files.
+    #[test]
+    fn a_real_zip64_list_within_the_limits_still_opens() {
+        let entries: Vec<RawEntry> = (0..u32::from(u16::MAX) + 2)
+            .map(|i| RawEntry::new(format!("Foo/{}/{i}", i % 64), b""))
+            .collect();
+        let files = entries.len() as u64;
+        let fixture = Fixture::new();
+        let zip = fixture.zip(&as_zip64(raw_zip(&entries), files));
+        let (mut archive, _) = open_archive(&zip, &Limits::default()).unwrap();
+        let read = read_entries(&mut archive, &Limits::default()).unwrap();
+        assert_eq!(read.len() as u64, files);
     }
 
     #[test]
