@@ -31,11 +31,12 @@ use crate::zipscan::{ScanError, scan_zip};
 
 /// Topic and code search only find new repositories, so once a day is plenty.
 const SEARCH_EVERY_SECS: i64 = 20 * 60 * 60;
+const DAY_SECS: i64 = 24 * 60 * 60;
 /// How often a listed addon gets a proper look even without a new release: download
 /// counts move, and files can be replaced under the same tag.
-const RELOOK_LISTED_SECS: i64 = 24 * 60 * 60;
+const RELOOK_LISTED_SECS: i64 = DAY_SECS;
 /// The same for repositories that weren't Forever-capable last time.
-const RELOOK_OTHERS_SECS: i64 = 7 * 24 * 60 * 60;
+const RELOOK_OTHERS_SECS: i64 = 7 * DAY_SECS;
 /// How often progress is written to the state file.
 const SAVE_EVERY: Duration = Duration::from_secs(120);
 /// Significant digits kept for download and star counts in the published file.
@@ -205,13 +206,23 @@ pub fn github_candidate(
         .filter(|a| a.name.to_ascii_lowercase().ends_with(".zip"))
         .map(|a| a.downloads)
         .sum();
-    let release = |build: &Build| Release {
-        version: clean_version(&build.tag, &[main, repo_name]),
-        url: build.asset.url.clone(),
-        size: build.asset.size,
-        date: build.published,
-        sha256: build.asset.sha256.clone(),
-        ..Release::default()
+    let release = |build: &Build| {
+        let mut version = clean_version(&build.tag, &[main, repo_name]);
+        // A tag like `latest` keeps its name while its files change, so the
+        // file's digest has to be what tells one version from the next.
+        if is_rolling_tag(&build.tag)
+            && let Some(digest) = build.asset.sha256.as_deref().and_then(|d| d.get(..7))
+        {
+            version = format!("{version}-{digest}");
+        }
+        Release {
+            version,
+            url: build.asset.url.clone(),
+            size: build.asset.size,
+            date: build.published,
+            sha256: build.asset.sha256.clone(),
+            ..Release::default()
+        }
     };
     Some(Candidate {
         addon: feeling_core::catalog::Addon {
@@ -240,6 +251,11 @@ pub fn github_candidate(
         no_longer_forever: chosen.no_longer_forever,
         ..Candidate::default()
     })
+}
+
+/// `latest` or `Release`: a tag with no number in it is one authors keep reusing.
+fn is_rolling_tag(tag: &str) -> bool {
+    !tag.bytes().any(|b| b.is_ascii_digit())
 }
 
 fn rounded_stars(stars: u32) -> u32 {
@@ -301,7 +317,9 @@ fn process_repo(
         eprintln!("{} {problem}", info.name);
     }
     record.newest_tag = info.releases.first().map(|r| r.tag.clone());
-    record.looked_at = unix_now();
+    // Rounded to the day, so looking at something and finding no change leaves the
+    // state file byte-identical, and a run with no news doesn't need to push anything.
+    record.looked_at = unix_now().div_euclid(DAY_SECS) * DAY_SECS;
     record.incomplete = !chosen.errors.is_empty();
 
     match github_candidate(info, &chosen, record.known_downloads) {
@@ -340,8 +358,11 @@ pub fn needs_full_look(record: &RepoState, head: &RepoInfo, now: i64) -> bool {
     if record.incomplete || record.newest_tag.as_deref() != newest {
         return true;
     }
-    if newest.is_none() {
+    let Some(newest) = newest else {
         return false;
+    };
+    if is_rolling_tag(newest) {
+        return true;
     }
     let relook = if record.entry.is_some() {
         RELOOK_LISTED_SECS
@@ -1178,6 +1199,25 @@ mod tests {
     }
 
     #[test]
+    fn rolling_tags_are_always_looked_at_and_versioned_by_their_file() {
+        let now = 10_000_000;
+        let record = RepoState {
+            newest_tag: Some("latest".into()),
+            looked_at: now - 60,
+            ..RepoState::default()
+        };
+        assert!(needs_full_look(&record, &head(Some("latest")), now));
+
+        let rolling = Chosen {
+            stable: Some(build("latest", "https://github.com/a.zip")),
+            ..Chosen::default()
+        };
+        let c = github_candidate(&info(), &rolling, 0).unwrap();
+        let version = c.addon.stable.unwrap().version;
+        assert_eq!(version, format!("latest-{}", "a".repeat(7)));
+    }
+
+    #[test]
     fn repositories_are_checked_seeds_first_then_most_downloaded() {
         let state = state_with(&[
             ("a/small", 1),
@@ -1431,6 +1471,7 @@ mod tests {
         assert_eq!(record.entry.as_ref(), Some(&entry));
         assert_eq!(record.newest_tag.as_deref(), Some("v1"));
         assert!(record.looked_at > 0);
+        assert_eq!(record.looked_at % DAY_SECS, 0, "changes at most once a day");
         assert!(!record.incomplete);
 
         // The same release again costs nothing.

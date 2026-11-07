@@ -32,6 +32,10 @@ repos = [
   "Tercioo/Details-Damage-Meter",
   "tukui-org/ElvUI",
   "CaptainBritish/GnomeLevelUp",
+  # In the table too, without a usable Forever build today. Checked in case that changes.
+  "Jaliborc/Bagnon",
+  "WeakAuras/WeakAuras2",
+  "shagu/pfQuest",
   # Other addons with Forever builds, found while researching.
   "2072/Decursive",
   "7hedubz/ForeverPlus",

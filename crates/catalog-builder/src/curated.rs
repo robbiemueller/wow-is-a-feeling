@@ -93,6 +93,11 @@ pub struct DirectSpec {
     pub author: Option<String>,
     #[serde(default)]
     pub website: Option<String>,
+    /// The file gets replaced many times a day under the same version, and its old
+    /// links serve the newest copy. A checksum from a catalog built hours ago would
+    /// then fail every install, so none is published, and no cache-busting query.
+    #[serde(default)]
+    pub changes_often: bool,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -652,6 +657,24 @@ fn direct_candidate(spec: &DirectSpec, entry: &ManifestEntry, state: &DirectStat
         .as_deref()
         .or(scan.author.as_deref())
         .unwrap_or_default();
+    let release = if spec.changes_often {
+        Release {
+            url: entry
+                .url
+                .split('?')
+                .next()
+                .unwrap_or(&entry.url)
+                .to_string(),
+            ..Release::default()
+        }
+    } else {
+        Release {
+            url: entry.url.clone(),
+            size: entry.bytes,
+            sha256: entry.sha256.clone(),
+            ..Release::default()
+        }
+    };
     Candidate {
         addon: Addon {
             id: spec.id.clone(),
@@ -664,11 +687,8 @@ fn direct_candidate(spec: &DirectSpec, entry: &ManifestEntry, state: &DirectStat
             website,
             stable: Some(Release {
                 version: entry.version.clone(),
-                url: entry.url.clone(),
-                size: entry.bytes,
                 date: state.first_seen,
-                sha256: entry.sha256.clone(),
-                ..Release::default()
+                ..release
             }),
             folders: scan.folders.clone(),
             deps: scan.external_deps(),
@@ -993,6 +1013,51 @@ mod tests {
         assert!(read_manifest(br#"{"addon":{"url":"a.zip"}}"#, "addon", "https://x.test").is_err());
         let http_url = br#"{"addon":{"version":"1","url":"http://x.test/a.zip"}}"#;
         assert!(read_manifest(http_url, "addon", "https://x.test").is_err());
+    }
+
+    #[test]
+    fn a_file_that_changes_often_gets_no_checksum_to_go_stale() {
+        let entry = read_manifest(MANIFEST.as_bytes(), "addon", "https://foreverdb.net").unwrap();
+        let state = DirectState {
+            version: "0.57.0".into(),
+            first_seen: 5,
+            scan: ZipScan {
+                folders: vec!["ForeverDB".into()],
+                forever: true,
+                ..ZipScan::default()
+            },
+            entry: None,
+        };
+        let spec = DirectSpec {
+            id: "direct:foreverdb".into(),
+            name: "ForeverDB".into(),
+            site: "https://foreverdb.net".into(),
+            ..DirectSpec::default()
+        };
+        let steady = direct_candidate(&spec, &entry, &state)
+            .addon
+            .stable
+            .unwrap();
+        assert_eq!(
+            steady.url,
+            "https://foreverdb.net/downloads/ForeverDB.zip?v=5a0e"
+        );
+        assert_eq!(steady.size, 5_558_921);
+        assert!(steady.sha256.is_some());
+
+        let often = DirectSpec {
+            changes_often: true,
+            ..spec
+        };
+        let release = direct_candidate(&often, &entry, &state)
+            .addon
+            .stable
+            .unwrap();
+        assert_eq!(release.url, "https://foreverdb.net/downloads/ForeverDB.zip");
+        assert_eq!(release.version, "0.57.0");
+        assert_eq!(release.date, 5);
+        assert_eq!(release.size, 0);
+        assert_eq!(release.sha256, None);
     }
 
     #[test]

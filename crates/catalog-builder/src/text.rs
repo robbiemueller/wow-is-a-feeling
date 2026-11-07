@@ -79,6 +79,7 @@ pub fn zip_stem(file_name: &str) -> String {
 /// readable is left, and the caller falls back to something else.
 pub fn clean_name(raw: &str) -> String {
     let text = drop_packager_tokens(raw).replace(['<', '>', '_'], " ");
+    let text: String = text.chars().filter(|c| !c.is_control()).collect();
     let text = drop_flavor_groups(&text);
     let words: Vec<&str> = text
         .split_whitespace()
@@ -401,6 +402,7 @@ mod tests {
         assert_eq!(clean_name("Decursive -Ace3-"), "Decursive");
         assert_eq!(clean_name("IceHUD -Ace3"), "IceHUD");
         assert_eq!(clean_name("MaxDps_Warlock"), "MaxDps Warlock");
+        assert_eq!(clean_name("Odd\u{7}Title"), "OddTitle");
         assert_eq!(
             clean_name("Titan Panel [Currencies] Multi! v12.0.0 Forever"),
             "Titan Panel [Currencies] Multi! Forever"

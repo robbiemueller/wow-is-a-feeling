@@ -162,6 +162,7 @@ name = "ForeverDB"
 summary = "The ForeverDB database in the game: gear upgrades on tooltips, the best quest reward, routes and more."
 author = "ForeverDB"
 website = "https://foreverdb.net"
+changes_often = true
 
 [exclude]
 # These accounts mirror other people's addons. Authors have filed DMCA notices
