@@ -73,6 +73,28 @@ fn is_all_digits(value: &str) -> bool {
     is_short_id(value) && value.bytes().all(|b| b.is_ascii_digit())
 }
 
+/// An addon kept out of the catalog, and why, for a maintainer to look at. Published as
+/// `catalog-held.json`. Dates and counts stay out, so the file only changes when a
+/// decision does.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Held {
+    pub id: String,
+    pub name: String,
+    pub folders: Vec<String>,
+    pub reason: String,
+}
+
+impl Held {
+    pub fn new(addon: &Addon, reason: String) -> Self {
+        Self {
+            id: addon.id.clone(),
+            name: addon.name.clone(),
+            folders: addon.folders.iter().take(16).cloned().collect(),
+            reason,
+        }
+    }
+}
+
 /// One addon on its way into the catalog, with the signals that aren't part of
 /// the published schema but decide its category and tier.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

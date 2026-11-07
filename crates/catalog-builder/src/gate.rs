@@ -6,8 +6,15 @@ use std::collections::BTreeSet;
 
 use feeling_core::catalog::{Addon, CATALOG_SCHEMA, CATEGORIES, Catalog, Release};
 
-use crate::curated::GapSpec;
-use crate::text::normalize;
+use crate::curated::{Curated, HandPicked};
+use crate::model::{Held, MAX_DEPS};
+use crate::text::fold_name;
+use crate::zipscan::MAX_FOLDERS;
+
+/// The most the published file may hold: about ten times today's, and room for some
+/// twelve thousand ordinary entries. Past it, a catalog takes real memory on every player's
+/// machine just to sit there.
+const MAX_CATALOG_BYTES: usize = 8 * 1024 * 1024;
 
 const DEVICE_NAMES: [&str; 22] = [
     "con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8",
@@ -75,6 +82,12 @@ pub fn addon_problem(addon: &Addon) -> Option<String> {
     if addon.folders.is_empty() {
         return Some("no folders".to_string());
     }
+    if addon.folders.len() > MAX_FOLDERS {
+        return Some(format!("too many folders ({})", addon.folders.len()));
+    }
+    if addon.deps.len() > MAX_DEPS {
+        return Some(format!("too many dependencies ({})", addon.deps.len()));
+    }
     if let Some(bad) = addon.folders.iter().find(|f| !is_safe_folder(f)) {
         return Some(format!("unsafe folder name {bad:?}"));
     }
@@ -93,14 +106,139 @@ pub fn addon_problem(addon: &Addon) -> Option<String> {
         .find_map(|release| release_problem(release, &addon.folders))
 }
 
-/// Check everything and fix what can be fixed. `gaps` carries the hand-written
-/// gap list, and `previous` is how many addons the last published catalog had.
-/// `Err` means don't publish.
-pub fn run_gate(
-    mut catalog: Catalog,
-    gaps: &[GapSpec],
-    previous: Option<usize>,
-) -> Result<(Catalog, Vec<String>), String> {
+/// What the gate goes by besides the catalog itself.
+pub struct GateContext<'a> {
+    pub curated: &'a Curated,
+    pub picks: &'a HandPicked,
+    /// The last published catalog.
+    pub previous: Option<&'a Catalog>,
+    /// Lowercased ids a source gave a clear answer about this run, whatever the answer was.
+    pub answered: &'a BTreeSet<String>,
+    /// A maintainer looked and says a smaller catalog is right.
+    pub accept_smaller: bool,
+}
+
+/// A catalog that's fit to publish, and what it took to get there.
+#[derive(Debug)]
+pub struct Passed {
+    pub catalog: Catalog,
+    pub warnings: Vec<String>,
+    /// Entries the gate itself kept out, for `catalog-held.json`.
+    pub held: Vec<Held>,
+}
+
+/// Over the size limit. The youngest and then the largest go first, never anything
+/// hand-picked: a size limit that stops the whole build would let a stranger stop it too.
+/// Only hand-picked entries being too big is a refusal, and that needs a person anyway.
+fn trim_to_size(
+    catalog: &mut Catalog,
+    picks: &HandPicked,
+    limit: usize,
+    warnings: &mut Vec<String>,
+) -> Result<Vec<Held>, String> {
+    let size_of = |addon: &Addon| serde_json::to_vec(addon).map_or(0, |bytes| bytes.len());
+    let sizes: Vec<usize> = catalog.addons.iter().map(size_of).collect();
+    let mut total: usize = sizes.iter().sum();
+    if total <= limit {
+        return Ok(Vec::new());
+    }
+    let largest = sizes
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, size)| **size)
+        .map_or(String::new(), |(at, size)| {
+            format!("{} at {size} bytes", catalog.addons[at].id)
+        });
+    warnings.push(format!(
+        "the catalog came to {total} bytes, over the limit of {limit}. The largest entry is {largest}."
+    ));
+
+    let mut order: Vec<usize> = (0..catalog.addons.len())
+        .filter(|at| !picks.contains(&catalog.addons[*at].id))
+        .collect();
+    order.sort_by_key(|at| {
+        (
+            std::cmp::Reverse(catalog.addons[*at].created),
+            std::cmp::Reverse(sizes[*at]),
+        )
+    });
+    let mut dropped = BTreeSet::new();
+    for at in order {
+        if total <= limit {
+            break;
+        }
+        total -= sizes[at];
+        dropped.insert(at);
+    }
+    if total > limit {
+        return Err(format!(
+            "the catalog is {total} bytes with only hand-picked entries left, over the limit of {limit}. The largest entry is {largest}. Not publishing."
+        ));
+    }
+
+    let mut held = Vec::with_capacity(dropped.len());
+    let mut at = 0;
+    catalog.addons.retain(|addon| {
+        let drop = dropped.contains(&at);
+        at += 1;
+        if drop {
+            held.push(Held::new(
+                addon,
+                "the catalog went over its size limit, and newer and larger entries go first"
+                    .to_string(),
+            ));
+        }
+        !drop
+    });
+    Ok(held)
+}
+
+/// Whether this catalog lost so much, with no explanation, that something must be wrong.
+/// Only entries nobody answered for count: a repository that's gone, or that a maintainer
+/// excluded, explains itself, and counting those would let a flood of junk that gets
+/// deleted freeze the catalog for everyone. Hand-picked entries count however they went,
+/// because a stranger can't make them vanish, and an outage or a bad answer from a source would.
+fn shrink_problem(catalog: &Catalog, context: &GateContext<'_>) -> Option<String> {
+    let previous = context.previous?;
+    if context.accept_smaller {
+        return None;
+    }
+    let listed: BTreeSet<String> = catalog
+        .addons
+        .iter()
+        .map(|a| a.id.to_ascii_lowercase())
+        .collect();
+    let missing = || {
+        previous
+            .addons
+            .iter()
+            .filter(|a| !listed.contains(&a.id.to_ascii_lowercase()))
+    };
+    let unexplained = missing()
+        .filter(|a| {
+            !context.answered.contains(&a.id.to_ascii_lowercase())
+                && !context.curated.excludes_id(&a.id)
+        })
+        .count();
+    if unexplained * 2 > previous.addons.len() {
+        return Some(format!(
+            "{unexplained} of the last catalog's {} addons are missing and no source said why, so something is wrong. Not publishing.",
+            previous.addons.len()
+        ));
+    }
+    let picked = |a: &&Addon| context.picks.contains(&a.id);
+    let picked_before = previous.addons.iter().filter(picked).count();
+    let picked_missing = missing().filter(picked).count();
+    if picked_missing * 2 > picked_before {
+        return Some(format!(
+            "{picked_missing} of the last catalog's {picked_before} hand-picked addons are missing, so something is wrong. Not publishing."
+        ));
+    }
+    None
+}
+
+/// Check everything and fix what can be fixed. `Err` means don't publish.
+pub fn run_gate(mut catalog: Catalog, context: &GateContext<'_>) -> Result<Passed, String> {
     if catalog.schema != CATALOG_SCHEMA {
         return Err(format!(
             "the catalog has schema {} instead of {CATALOG_SCHEMA}",
@@ -126,13 +264,14 @@ pub fn run_gate(
         true
     });
 
-    if let Some(previous) = previous
-        && catalog.addons.len() * 2 < previous
-    {
-        return Err(format!(
-            "the new catalog has {} addons and the last one had {previous}, so something is wrong. Not publishing.",
-            catalog.addons.len()
-        ));
+    let held = trim_to_size(
+        &mut catalog,
+        context.picks,
+        MAX_CATALOG_BYTES,
+        &mut warnings,
+    )?;
+    if let Some(problem) = shrink_problem(&catalog, context) {
+        return Err(problem);
     }
     if catalog.addons.is_empty() {
         return Err("the new catalog has no addons at all. Not publishing.".to_string());
@@ -168,15 +307,19 @@ pub fn run_gate(
 
     let mut kept_gaps = Vec::with_capacity(catalog.gaps.len());
     for mut gap in std::mem::take(&mut catalog.gaps) {
-        let unrelated = gaps
+        let unrelated = context
+            .curated
+            .gaps
             .iter()
             .find(|g| g.name == gap.name)
             .map_or(&[][..], |g| g.unrelated.as_slice());
-        let wanted = normalize(&gap.name);
-        let present = catalog
-            .addons
-            .iter()
-            .find(|a| normalize(&a.name) == wanted && !unrelated.contains(&a.id));
+        let wanted = fold_name(&gap.name);
+        // A name alone is anyone's to write, so only an entry someone picked closes a gap.
+        let present = catalog.addons.iter().find(|a| {
+            fold_name(&a.name) == wanted
+                && !unrelated.contains(&a.id)
+                && context.picks.contains(&a.id)
+        });
         if let Some(addon) = present {
             warnings.push(format!(
                 "gap {}: {} is in the catalog now, dropped the gap",
@@ -194,7 +337,11 @@ pub fn run_gate(
         kept_gaps.push(gap);
     }
     catalog.gaps = kept_gaps;
-    Ok((catalog, warnings))
+    Ok(Passed {
+        catalog,
+        warnings,
+        held,
+    })
 }
 
 #[cfg(test)]
@@ -202,6 +349,7 @@ mod tests {
     use feeling_core::catalog::{Gap, Kit, Move, Release, Source};
 
     use super::*;
+    use crate::curated::{GapSpec, Seeds};
 
     fn addon(id: &str, name: &str) -> Addon {
         Addon {
@@ -228,8 +376,49 @@ mod tests {
         }
     }
 
+    /// The gate with nothing special going on.
+    fn gate(c: Catalog) -> Result<Passed, String> {
+        gate_with(c, &Curated::default(), &HandPicked::default(), None, &[])
+    }
+
+    fn gate_with(
+        c: Catalog,
+        curated: &Curated,
+        picks: &HandPicked,
+        previous: Option<&Catalog>,
+        answered: &[&str],
+    ) -> Result<Passed, String> {
+        let answered: BTreeSet<String> = answered.iter().map(|id| id.to_lowercase()).collect();
+        run_gate(
+            c,
+            &GateContext {
+                curated,
+                picks,
+                previous,
+                answered: &answered,
+                accept_smaller: false,
+            },
+        )
+    }
+
     fn pass(c: Catalog) -> (Catalog, Vec<String>) {
-        run_gate(c, &[], None).unwrap()
+        let passed = gate(c).unwrap();
+        (passed.catalog, passed.warnings)
+    }
+
+    fn picked(repos: &[&str]) -> HandPicked {
+        let seeds = Seeds {
+            repos: repos.iter().map(|r| (*r).to_string()).collect(),
+            wowi: vec![],
+        };
+        HandPicked::new(&seeds, &Curated::default())
+    }
+
+    fn numbered(count: usize) -> Catalog {
+        let addons = (0..count)
+            .map(|i| addon(&format!("gh:a/{i}"), &format!("N{i}")))
+            .collect();
+        catalog(addons)
     }
 
     #[test]
@@ -352,6 +541,18 @@ mod tests {
                     }];
                 }),
             ),
+            (
+                "too many folders",
+                Box::new(|a| {
+                    a.folders = (0..=MAX_FOLDERS).map(|i| format!("Pack{i}")).collect();
+                }),
+            ),
+            (
+                "too many dependencies",
+                Box::new(|a| {
+                    a.deps = (0..=MAX_DEPS).map(|i| format!("Lib{i}")).collect();
+                }),
+            ),
         ];
         for (want, breaker) in cases {
             let mut bad = addon("gh:a/bad", "Foo");
@@ -396,36 +597,189 @@ mod tests {
     fn a_wrong_schema_is_refused() {
         let mut c = catalog(vec![addon("gh:a/b", "Foo")]);
         c.schema = 0;
-        assert!(run_gate(c, &[], None).is_err());
+        assert!(gate(c).is_err());
+    }
+
+    fn shrink(new: Catalog, previous: &Catalog, answered: &[&str]) -> Result<Passed, String> {
+        gate_with(
+            new,
+            &Curated::default(),
+            &HandPicked::default(),
+            Some(previous),
+            answered,
+        )
     }
 
     #[test]
-    fn fewer_than_half_the_previous_addons_is_refused() {
-        let three = || {
-            catalog(vec![
-                addon("gh:a/1", "A"),
-                addon("gh:a/2", "B"),
-                addon("gh:a/3", "C"),
-            ])
-        };
-        assert!(
-            run_gate(three(), &[], Some(6)).is_ok(),
-            "exactly half is allowed"
-        );
-        let error = run_gate(three(), &[], Some(7)).unwrap_err();
+    fn losing_more_than_half_with_no_explanation_is_refused() {
+        let new = || numbered(3);
+        let six = numbered(6);
+        let seven = numbered(7);
+        assert!(shrink(new(), &six, &[]).is_ok(), "exactly half is allowed");
+        let error = shrink(new(), &seven, &[]).unwrap_err();
         assert!(error.contains("Not publishing"), "{error}");
-        assert!(run_gate(three(), &[], Some(0)).is_ok());
-        assert!(run_gate(three(), &[], None).is_ok());
+        assert!(error.contains("4 of the last catalog's 7"), "{error}");
+        assert!(shrink(new(), &numbered(0), &[]).is_ok());
+        assert!(gate(new()).is_ok());
+    }
+
+    #[test]
+    fn repositories_that_answered_dont_freeze_the_catalog() {
+        // A flood that got listed, then deleted: GitHub said so for every one of them.
+        let mut flooded = numbered(3);
+        let junk: Vec<String> = (0..100).map(|i| format!("gh:flood/{i}")).collect();
+        flooded
+            .addons
+            .extend(junk.iter().map(|id| addon(id, "Junk")));
+        let answered: Vec<&str> = junk.iter().map(String::as_str).collect();
+        assert!(shrink(numbered(3), &flooded, &answered).is_ok());
+        assert!(
+            shrink(numbered(3), &flooded, &[]).is_err(),
+            "the same loss with nobody saying why"
+        );
+    }
+
+    #[test]
+    fn new_entries_cant_hide_a_real_loss() {
+        // Everything real gone in a bad run, and a flood of new names to make up the count.
+        let previous = numbered(10);
+        let mut new = catalog(
+            (0..50)
+                .map(|i| addon(&format!("gh:flood/{i}"), &format!("Junk{i}")))
+                .collect(),
+        );
+        new.addons.push(addon("gh:a/0", "N0"));
+        assert!(shrink(new, &previous, &[]).is_err());
+    }
+
+    #[test]
+    fn excluding_a_flooding_owner_explains_the_loss_by_itself() {
+        let mut flooded = numbered(3);
+        flooded
+            .addons
+            .extend((0..100).map(|i| addon(&format!("gh:flood/{i}"), "Junk")));
+        let curated = Curated {
+            exclude: crate::curated::Exclude {
+                owners: vec!["flood".into()],
+                ..Default::default()
+            },
+            ..Curated::default()
+        };
+        let result = gate_with(
+            numbered(3),
+            &curated,
+            &HandPicked::default(),
+            Some(&flooded),
+            &[],
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn a_source_saying_everything_is_gone_is_stopped_by_the_hand_picked_entries() {
+        let repos: Vec<String> = (0..6).map(|i| format!("a/{i}")).collect();
+        let seeds: Vec<&str> = repos.iter().map(String::as_str).collect();
+        let picks = picked(&seeds);
+        let ids: Vec<String> = repos.iter().map(|r| format!("gh:{r}")).collect();
+        let answered: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let result = gate_with(
+            numbered(2),
+            &Curated::default(),
+            &picks,
+            Some(&numbered(6)),
+            &answered,
+        );
+        let error = result.unwrap_err();
+        assert!(error.contains("hand-picked"), "{error}");
+        assert!(
+            gate_with(
+                numbered(3),
+                &Curated::default(),
+                &picks,
+                Some(&numbered(6)),
+                &answered
+            )
+            .is_ok(),
+            "half of them is still allowed"
+        );
+    }
+
+    #[test]
+    fn a_maintainer_can_accept_a_smaller_catalog() {
+        let picks = HandPicked::default();
+        let answered = BTreeSet::new();
+        let previous = numbered(100);
+        let result = run_gate(
+            numbered(1),
+            &GateContext {
+                curated: &Curated::default(),
+                picks: &picks,
+                previous: Some(&previous),
+                answered: &answered,
+                accept_smaller: true,
+            },
+        );
+        assert!(result.is_ok());
     }
 
     #[test]
     fn an_empty_catalog_is_refused_even_without_a_previous_one() {
-        assert!(run_gate(catalog(vec![]), &[], None).is_err());
+        assert!(gate(catalog(vec![])).is_err());
         let all_bad = catalog(vec![Addon {
             id: "x".into(),
             ..Addon::default()
         }]);
-        assert!(run_gate(all_bad, &[], None).is_err());
+        assert!(gate(all_bad).is_err());
+    }
+
+    fn sized(id: &str, created: i64, folders: usize) -> Addon {
+        Addon {
+            created,
+            folders: (0..folders).map(|i| format!("Pack{i:0100}")).collect(),
+            ..addon(id, id)
+        }
+    }
+
+    #[test]
+    fn a_catalog_over_the_size_limit_loses_its_youngest_largest_entries_and_names_the_largest() {
+        // Each entry here is about 26 KB, so this is well past the limit.
+        let mut c = numbered(0);
+        let count = MAX_CATALOG_BYTES / 26_000 + 20;
+        c.addons = (0..count)
+            .map(|i| sized(&format!("gh:old/{i}"), 100, 250))
+            .collect();
+        c.addons.push(sized("gh:young/small", 200, 1));
+        c.addons.push(sized("gh:young/big", 200, 256));
+        c.addons.push(sized("gh:chosen/big", 300, 256));
+
+        let picks = picked(&["chosen/big"]);
+        let passed = gate_with(c, &Curated::default(), &picks, None, &[]).unwrap();
+        let bytes = serde_json::to_vec(&passed.catalog).unwrap();
+        assert!(bytes.len() <= MAX_CATALOG_BYTES + 4096);
+        let listed = |id: &str| passed.catalog.addons.iter().any(|a| a.id == id);
+        assert!(listed("gh:chosen/big"), "hand-picked is never what goes");
+        assert!(!listed("gh:young/big"), "the newest and largest went first");
+        assert!(!listed("gh:young/small"));
+        assert!(listed("gh:old/0"), "and only as many as it took");
+        assert!(
+            passed.warnings[0].contains("largest entry is gh:young/big")
+                || passed.warnings[0].contains("largest entry is gh:chosen/big"),
+            "{:?}",
+            passed.warnings
+        );
+        assert!(passed.held.iter().any(|h| h.id == "gh:young/big"));
+        assert!(passed.held.iter().all(|h| h.reason.contains("size limit")));
+    }
+
+    #[test]
+    fn hand_picked_entries_alone_over_the_limit_stop_the_build_and_name_the_largest() {
+        let mut c = catalog(vec![sized("gh:chosen/small", 1, 2)]);
+        c.addons.push(sized("gh:chosen/big", 1, 256));
+        let picks = picked(&["chosen/small", "chosen/big"]);
+        let mut warnings = Vec::new();
+        let error = trim_to_size(&mut c, &picks, 100, &mut warnings).unwrap_err();
+        assert!(error.contains("gh:chosen/big"), "{error}");
+        assert!(error.contains("Not publishing"), "{error}");
     }
 
     #[test]
@@ -461,7 +815,7 @@ mod tests {
     }
 
     #[test]
-    fn a_gap_naming_a_present_addon_is_dropped_unless_declared_unrelated() {
+    fn only_something_hand_picked_closes_a_gap_and_not_if_declared_unrelated() {
         let build = || {
             let mut c = catalog(vec![
                 addon("gh:7hedubz/ForeverPlus", "Forever Plus"),
@@ -474,17 +828,29 @@ mod tests {
             }];
             c
         };
-        let (out, warnings) = pass(build());
-        assert!(out.gaps.is_empty());
-        assert!(warnings[0].contains("in the catalog now"), "{warnings:?}");
+        let picks = picked(&["7hedubz/ForeverPlus"]);
+        let passed = gate_with(build(), &Curated::default(), &picks, None, &[]).unwrap();
+        assert!(passed.catalog.gaps.is_empty());
+        assert!(
+            passed.warnings[0].contains("in the catalog now"),
+            "{:?}",
+            passed.warnings
+        );
 
-        let spec = GapSpec {
-            name: "ForeverPlus".into(),
-            unrelated: vec!["gh:7hedubz/ForeverPlus".into()],
-            ..GapSpec::default()
-        };
-        let (out, warnings) = run_gate(build(), &[spec], None).unwrap();
-        assert_eq!(out.gaps.len(), 1);
+        let (out, warnings) = pass(build());
+        assert_eq!(out.gaps.len(), 1, "a name alone doesn't close it");
         assert!(warnings.is_empty(), "{warnings:?}");
+
+        let curated = Curated {
+            gaps: vec![GapSpec {
+                name: "ForeverPlus".into(),
+                unrelated: vec!["gh:7hedubz/ForeverPlus".into()],
+                ..GapSpec::default()
+            }],
+            ..Curated::default()
+        };
+        let passed = gate_with(build(), &curated, &picks, None, &[]).unwrap();
+        assert_eq!(passed.catalog.gaps.len(), 1);
+        assert!(passed.warnings.is_empty(), "{:?}", passed.warnings);
     }
 }

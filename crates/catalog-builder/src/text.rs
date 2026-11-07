@@ -94,14 +94,9 @@ fn small_lookalike(c: char) -> char {
         'х' | 'χ' => 'x',
         'у' | 'γ' | 'ү' | 'ý' | 'ÿ' | 'ŷ' => 'y',
         'ζ' | 'ź' | 'ż' | 'ž' => 'z',
-        // Full-width letters and digits sit in the same order as their plain forms.
+        // Full-width letters and digits sit at a fixed distance from their plain forms.
         '\u{ff41}'..='\u{ff5a}' | '\u{ff10}'..='\u{ff19}' => {
-            let base = if c >= '\u{ff41}' {
-                0xff41 - 0x61
-            } else {
-                0xff10 - 0x30
-            };
-            char::from_u32(u32::from(c) - base).unwrap_or(c)
+            char::from_u32(u32::from(c) - 0xfee0).unwrap_or(c)
         }
         other => other,
     }
