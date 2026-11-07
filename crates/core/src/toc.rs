@@ -396,7 +396,10 @@ mod tests {
     #[test]
     fn strips_ui_escapes() {
         assert_eq!(strip_ui_escapes("|cFFFF0000Red|r Text"), "Red Text");
-        assert_eq!(strip_ui_escapes("|cnCONTEXT_FEEDBACK_COLOR:Sippy Cup|r"), "Sippy Cup");
+        assert_eq!(
+            strip_ui_escapes("|cnCONTEXT_FEEDBACK_COLOR:Sippy Cup|r"),
+            "Sippy Cup"
+        );
         assert_eq!(strip_ui_escapes("|cnot a color"), "not a color");
         assert_eq!(strip_ui_escapes("|TInterface\\Foo:16|t Icon"), "Icon");
         assert_eq!(strip_ui_escapes("|Aatlas:16:16|a Atlas"), "Atlas");

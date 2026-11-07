@@ -12,7 +12,7 @@ use zip::read::{ArchiveOffset, Config};
 use zip::result::ZipError;
 
 use crate::model::ZipScan;
-use crate::text::normalize;
+use crate::text::{clean_author, normalize};
 
 /// No real TOC comes close to this, and it stops a hostile one from filling memory.
 const MAX_TOC_BYTES: u64 = 256 * 1024;
@@ -299,7 +299,8 @@ fn summarize(mut folders: Vec<Folder>, hints: &[String]) -> ZipScan {
     if let Some(ForeverToc { toc, .. }) = folders.into_iter().next().and_then(|f| f.toc) {
         scan.title = toc.title;
         scan.notes = toc.notes;
-        scan.author = toc.author;
+        // Kept in the public scan cache, so no addresses from here on.
+        scan.author = toc.author.as_deref().map(clean_author);
         scan.deps = toc.deps;
         scan.category = toc.category;
         scan.curse = toc.curse_id;

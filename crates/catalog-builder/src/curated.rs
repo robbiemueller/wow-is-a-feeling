@@ -359,7 +359,7 @@ pub fn plan_source_install(
         forever,
         title: main_toc.title,
         notes: main_toc.notes,
-        author: main_toc.author,
+        author: main_toc.author.as_deref().map(clean_author),
         deps: main_toc.deps,
         category: main_toc.category,
         curse: main_toc.curse_id,
