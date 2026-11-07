@@ -8,9 +8,23 @@ license.workspace = true
 repository.workspace = true
 publish = false
 
+[features]
+default = ["full"]
+# Everything but xtask-sign. Without it, only xtask-sign builds, on minisign's crates alone.
+full = ["dep:feeling-core", "dep:serde_json", "dep:sha2", "dep:tempfile"]
+
+[[bin]]
+name = "xtask"
+path = "src/main.rs"
+required-features = ["full"]
+
+[[bin]]
+name = "xtask-sign"
+path = "src/sign_main.rs"
+
 [dependencies]
-feeling-core.workspace = true
+feeling-core = { workspace = true, optional = true }
 minisign = "0.10"
-serde_json.workspace = true
-sha2.workspace = true
-tempfile = "3"
+serde_json = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
+tempfile = { version = "3", optional = true }

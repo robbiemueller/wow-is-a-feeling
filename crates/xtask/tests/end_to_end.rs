@@ -8,9 +8,14 @@ use std::process::{Command, Output};
 use feeling_core::selfupdate::verified_manifest;
 
 const XTASK: &str = env!("CARGO_BIN_EXE_xtask");
+const XTASK_SIGN: &str = env!("CARGO_BIN_EXE_xtask-sign");
 
 fn run(args: &[&str], secret_key: Option<&str>) -> Output {
-    let mut command = Command::new(XTASK);
+    run_program(XTASK, args, secret_key)
+}
+
+fn run_program(program: &str, args: &[&str], secret_key: Option<&str>) -> Output {
+    let mut command = Command::new(program);
     command.args(args).env_remove("MINISIGN_SECRET_KEY");
     if let Some(key) = secret_key {
         command.env("MINISIGN_SECRET_KEY", key);
@@ -134,6 +139,91 @@ fn sign_and_make_latest_pass_the_apps_verification() {
     let other = tempfile::tempdir().unwrap();
     let (other_public_key, _) = keygen(other.path());
     assert!(verified_manifest(&json, &signature, &other_public_key).is_err());
+}
+
+/// The binary the release workflow really signs with: its output has to pass the app's check
+/// too, and with the wrong key, no key or no file it has to say so without printing the key.
+#[test]
+fn xtask_sign_signs_what_the_app_accepts_and_does_nothing_else() {
+    let dir = tempfile::tempdir().unwrap();
+    let (public_key, secret_key) = keygen(dir.path());
+    let assets = release_folder(dir.path());
+    assert!(make_latest(dir.path(), &assets).status.success());
+    let latest = assets.join("latest.json");
+    let latest_path = latest.to_str().unwrap();
+
+    let output = run_program(XTASK_SIGN, &[latest_path], Some(&secret_key));
+    assert!(output.status.success(), "{}", text(&output.stderr));
+    let printed = format!("{}{}", text(&output.stdout), text(&output.stderr));
+    assert!(
+        !printed.contains(secret_key.lines().nth(1).unwrap()),
+        "xtask-sign printed the secret key"
+    );
+    let json = fs::read(&latest).unwrap();
+    let signature = fs::read(assets.join("latest.json.minisig")).unwrap();
+    let manifest = verified_manifest(&json, &signature, &public_key).unwrap();
+    assert_eq!(manifest.version, "0.2.0");
+    fs::remove_file(assets.join("latest.json.minisig")).unwrap();
+
+    let no_key = run_program(XTASK_SIGN, &[latest_path], None);
+    assert!(!no_key.status.success());
+    assert!(text(&no_key.stderr).contains("MINISIGN_SECRET_KEY"));
+
+    let bad_key = run_program(XTASK_SIGN, &[latest_path], Some("hunter2-not-really-a-key"));
+    assert!(!bad_key.status.success());
+    let printed = format!("{}{}", text(&bad_key.stdout), text(&bad_key.stderr));
+    assert!(!printed.contains("hunter2"), "{printed}");
+
+    let not_one_file = run_program(XTASK_SIGN, &[latest_path, "extra"], Some(&secret_key));
+    assert!(!not_one_file.status.success());
+    assert!(text(&not_one_file.stderr).contains("Usage"));
+    assert!(!assets.join("latest.json.minisig").exists());
+}
+
+/// A crate linked into a program can read that program's environment, so what `xtask-sign` is
+/// built from is part of what protects the key.
+#[test]
+fn xtask_sign_builds_on_minisigns_crates_alone() {
+    let output = Command::new(env!("CARGO"))
+        .args([
+            "tree",
+            "--offline",
+            "--locked",
+            "-p",
+            "xtask",
+            "--no-default-features",
+            "-e",
+            "normal,build",
+            "--prefix",
+            "none",
+            "--color",
+            "never",
+        ])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", text(&output.stderr));
+    let tree = text(&output.stdout);
+    let crates: std::collections::BTreeSet<&str> = tree
+        .lines()
+        .filter_map(|line| line.split(' ').next())
+        .collect();
+    assert!(crates.contains("minisign"), "{tree}");
+    for heavy in [
+        "feeling-core",
+        "serde_json",
+        "tempfile",
+        "ureq",
+        "rustls",
+        "serde_derive",
+    ] {
+        assert!(!crates.contains(heavy), "{heavy} is in {tree}");
+    }
+    assert!(
+        crates.len() <= 30,
+        "{} crates can read the signing key now:\n{tree}",
+        crates.len()
+    );
 }
 
 #[test]

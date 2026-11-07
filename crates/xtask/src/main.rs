@@ -2,22 +2,24 @@
 //! `cargo run -p xtask -- <command>`.
 //!
 //! The secret key never appears in any output, and `sign` only takes it from the
-//! environment, so it can live in a CI secret and never touch a command line.
+//! environment, so it can live in a CI secret and never touch a command line. CI itself
+//! signs with `xtask-sign` instead, so that far fewer crates get to run beside the key.
 
 mod check_catalog;
+mod signing;
 
 use std::collections::BTreeMap;
 use std::env;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Cursor, Read, Write};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use feeling_core::selfupdate::{self, UPDATE_PUBLIC_KEY};
-use minisign::{KeyPair, SecretKeyBox};
+use minisign::KeyPair;
 use serde_json::json;
 use sha2::{Digest, Sha256};
+use signing::{sign_from_env, unix_now};
 
 const USAGE: &str = "\
 Release chores for WoW is a Feeling.
@@ -34,8 +36,6 @@ Release chores for WoW is a Feeling.
   check-catalog <catalog.json> <how-many> <max-megabytes>
       Check a catalog's references, and really install a sample of it into temp folders.
 ";
-
-const SECRET_KEY_VAR: &str = "MINISIGN_SECRET_KEY";
 
 /// Published file name, then its `latest.json` key and kind.
 const ASSETS: [(&str, &str, &str); 4] = [
@@ -60,13 +60,7 @@ fn main() -> ExitCode {
         ["keygen", path] => keygen(Path::new(path)).map(|public_key| {
             println!("{public_key}");
         }),
-        ["sign", file] => env::var(SECRET_KEY_VAR)
-            .map_err(|_| {
-                format!(
-                    "{SECRET_KEY_VAR} isn't set. It should hold the secret key file's contents."
-                )
-            })
-            .and_then(|secret_key| sign_file(Path::new(file), &secret_key))
+        ["sign", file] => sign_from_env(Path::new(file))
             .map(|signature| println!("Wrote {}", signature.display())),
         ["make-latest", options @ ..] => parse_make_latest(options)
             .and_then(|options| make_latest(&options))
@@ -116,33 +110,6 @@ fn keygen(path: &Path) -> Result<String, String> {
         .and_then(|()| file.sync_all())
         .map_err(|e| format!("Couldn't write {}: {e}", path.display()))?;
     Ok(pair.pk.to_base64())
-}
-
-/// Sign `file` with the key text and write `<file>.minisig` beside it.
-fn sign_file(file: &Path, secret_key: &str) -> Result<PathBuf, String> {
-    // Errors here never include the key, only that it couldn't be read.
-    let secret = SecretKeyBox::from_string(secret_key.trim())
-        .and_then(SecretKeyBox::into_unencrypted_secret_key)
-        .map_err(|_| format!("{SECRET_KEY_VAR} isn't a usable secret key without a password."))?;
-    let data = fs::read(file).map_err(|e| format!("Couldn't read {}: {e}", file.display()))?;
-    let name = file
-        .file_name()
-        .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
-    let trusted_comment = format!("timestamp:{}\tfile:{name}", unix_now());
-    let signature = minisign::sign(
-        None,
-        &secret,
-        Cursor::new(data),
-        Some(&trusted_comment),
-        None,
-    )
-    .map_err(|e| format!("Couldn't sign {}: {e}", file.display()))?;
-    let mut path = file.as_os_str().to_os_string();
-    path.push(".minisig");
-    let path = PathBuf::from(path);
-    fs::write(&path, signature.into_string())
-        .map_err(|e| format!("Couldn't write {}: {e}", path.display()))?;
-    Ok(path)
 }
 
 /// Check a signed `latest.json` the way the app will, so a release signed with the wrong
@@ -259,14 +226,11 @@ fn hash_file(path: &Path) -> Result<(String, u64), String> {
     Ok((sha256, size))
 }
 
-fn unix_now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_secs())
-}
-
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
+    use super::signing::sign_file;
     use super::*;
 
     fn options(dir: &Path) -> MakeLatest {
@@ -326,6 +290,68 @@ mod tests {
             ("macos-universal", "app.zip"),
         ] {
             assert_eq!(value["assets"][key]["kind"], kind, "{key}");
+        }
+    }
+
+    /// Every `wow-is-a-feeling-...` file name in a text.
+    fn release_files(text: &str) -> BTreeSet<String> {
+        text.match_indices("wow-is-a-feeling-")
+            .map(|(at, _)| {
+                text[at..]
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.'))
+                    .collect::<String>()
+            })
+            .filter(|name| {
+                [".exe", ".gz", ".AppImage", ".zip", ".dmg"]
+                    .iter()
+                    .any(|extension| name.ends_with(extension))
+            })
+            .collect()
+    }
+
+    /// These names live in five places, and if they drift an update or a download link breaks
+    /// for everyone on that platform, which nothing else would catch before a real release.
+    #[test]
+    fn asset_names_agree_everywhere_they_appear() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .unwrap();
+        let read = |path: &str| fs::read_to_string(root.join(path)).unwrap();
+
+        // What the release publishes, and what its build jobs actually make.
+        let workflow = read(".github/workflows/release.yml");
+        let (gather, rest): (Vec<&str>, Vec<&str>) = workflow
+            .lines()
+            .partition(|line| line.trim_start().starts_with("take "));
+        let published = release_files(&gather.join("\n"));
+        assert_eq!(published.len(), 6, "{published:?}");
+        assert_eq!(release_files(&rest.join("\n")), published);
+
+        // What xtask describes in latest.json.
+        for (name, _, _) in ASSETS {
+            assert!(published.contains(name), "{name} isn't published");
+        }
+
+        // What the landing page and the README link to.
+        let site = release_files(&read("site/index.html"));
+        assert!(site.len() >= 3, "{site:?}");
+        for name in site.iter().chain(&release_files(&read("README.md"))) {
+            assert!(
+                published.contains(name),
+                "{name} is linked to, not published"
+            );
+        }
+
+        // What the app asks for.
+        let selfupdate = read("crates/core/src/selfupdate.rs");
+        for (_, key, kind) in ASSETS {
+            assert!(selfupdate.contains(&format!("\"{key}\"")), "{key}");
+            assert!(selfupdate.contains(&format!("\"{kind}\"")), "{kind}");
+        }
+        if let Some(wanted) = selfupdate::asset_key() {
+            assert!(ASSETS.iter().any(|(_, key, _)| *key == wanted), "{wanted}");
         }
     }
 
