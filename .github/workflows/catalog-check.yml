@@ -1,0 +1,30 @@
+name: Catalog check
+
+# Once a week, check the catalog players really get: every reference in it, and whether a
+# sample of about 40 addons of up to 100 MB install into a temp folder through the real
+# installer. A broken catalog shows up as a failed run. Addons are only unpacked, never run.
+on:
+  schedule:
+    - cron: "41 7 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+      - run: cargo build --locked -p xtask
+      - name: Fetch the published catalog
+        run: curl -fsSL --retry 3 --retry-all-errors -o catalog.json https://raw.githubusercontent.com/robbiemueller/wow-is-a-feeling/catalog/catalog.json
+      - name: Check the catalog
+        run: target/debug/xtask check-catalog catalog.json 40 100

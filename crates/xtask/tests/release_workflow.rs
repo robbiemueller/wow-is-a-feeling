@@ -972,6 +972,59 @@ fn gather_refuses_anything_but_the_expected_files() {
     }
 }
 
+/// The weekly check reads the catalog the app really fetches, needs no more than read access,
+/// and its exact arguments fail the run on a broken catalog. No network needed to see that.
+#[test]
+fn the_weekly_catalog_check_fails_on_a_broken_catalog() {
+    let text = workflow("catalog-check.yml");
+    assert!(text.contains(feeling_core::catalog::CATALOG_URL), "{text}");
+    assert!(text.contains("\n  schedule:\n    - cron: "), "{text}");
+    assert!(
+        text.contains("\npermissions:\n  contents: read\n\n"),
+        "{text}"
+    );
+    assert_eq!(text.matches("permissions:").count(), 1, "{text}");
+
+    let jobs = jobs(&text);
+    let command = jobs[0]
+        .steps()
+        .iter()
+        .filter_map(Step::script)
+        .find(|script| script.contains("check-catalog"))
+        .unwrap();
+    let words: Vec<&str> = command.split_whitespace().collect();
+    assert_eq!(
+        words[..5],
+        [
+            "target/debug/xtask",
+            "check-catalog",
+            "catalog.json",
+            "40",
+            "100"
+        ]
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let check = |catalog: &str| {
+        fs::write(dir.path().join("catalog.json"), catalog).unwrap();
+        Command::new(env!("CARGO_BIN_EXE_xtask"))
+            .args(&words[1..])
+            .current_dir(dir.path())
+            .output()
+            .unwrap()
+    };
+    assert!(
+        check(r#"{"schema":1,"generated":0,"addons":[]}"#)
+            .status
+            .success()
+    );
+    let broken = check(r#"{"schema":1,"generated":0,"addons":[],"featured":["gh:gone/addon"]}"#);
+    assert!(!broken.status.success());
+    let printed = String::from_utf8_lossy(&broken.stdout);
+    assert!(printed.contains("gh:gone/addon"), "{printed}");
+    assert!(!check("this isn't a catalog").status.success());
+}
+
 #[test]
 fn appimagetool_and_its_runtime_come_from_fixed_releases_with_checked_hashes() {
     let text = workflow("release.yml");
