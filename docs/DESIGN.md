@@ -37,7 +37,7 @@ Traps found in real addons:
 - Big zips: Questie and OpenMap are around 90 MB.
 - `/releases/latest` can point at another flavor (VuhDo's latest is a vanilla build), so scan recent releases.
 - Tags with slashes and `+` (`bundle/v12.6.2+v1.0.11`).
-- Same-named repos that are different projects (`ForeverPlus`, `ForeverUI`). Link sources by TOC IDs, never by name alone.
+- Same-named repos that are different projects (`ForeverPlus`, `ForeverUI`). Sources are only linked by a pair someone approved, never by name, TOC IDs or folders.
 - The `_retail_`, `_classic_` and `_classic_era_` folders can be leftovers with no game in them. Folder presence alone proves nothing.
 
 ## Layout
@@ -145,9 +145,33 @@ Update checks compare installed versions against the catalog: one request, not o
 - **Curated source installs** (`catalog/curated.toml`): addons whose authors publish tags but no packaged zips, such as Details. The app installs GitHub's source archive using `Release.moves`. An addon whose `.pkgmeta` pulls in externals can't be installed this way, because its tags don't contain the libraries it needs.
 - **Not used, on purpose:** CurseForge and Wago (their terms need approval or a key), the Tukui API (asks for staff permission), and any scraping of websites. Well-known gaps appear in `Catalog.gaps` with alternatives. ElvUI is one of them: its tags need 20 externals, and its packaged zips are only on Tukui's CDN. `curated.toml` keeps its entry, so it appears if that changes.
 
-Merge entries from different sources by TOC IDs (`X-WoWI-ID`) or identical folder sets, never by name alone. Prefer GitHub when both exist.
-
 Tier is a popularity color only: top 10 legendary, next 5% epic, next 15% rare, next 30% uncommon, rest common. Grey is reserved for addons that no longer target Forever.
+
+### Who owns a name
+
+Discovery has no review, so anyone with a free GitHub account gets looked at, and everything in their repository is theirs to write: its title, folders, TOC ids and download counts. None of that proves anything, so identity works like this.
+
+- **First come, oldest wins. Hand-picked beats everything.** Hand-picked means `catalog/seeds.toml`, anything `catalog/curated.toml` names, and both sides of an approved merge.
+- **Age.** `Addon.created` is when an entry first appeared. It comes from the last published catalog, because the scan cache can reset. A new entry gets the build's time. An entry that changes its name or main folder counts as new from then on, unless it's hand-picked, so a repo can't get established as one thing and then retitle itself. Everything listed before ages were kept shares one old date, 2026-07-01.
+- **Trust.** `Addon.trusted` is what lets the app pick an entry by itself. It's set for hand-picked entries, WoWInterface listings (moderated, and identified by listing id) and anything at least 14 days old, and for nothing else. An entry that isn't trusted has its ids on other sites cleared, because they're only claims. Among the rest an id stays with whoever got there first, and a listing always owns its own id.
+- **Merging.** A WoWInterface listing merges into a GitHub entry only when `merges` in `curated.toml` approves that pair, and GitHub's build is the one offered. A TOC id or matching folders never merge anything, remove a listing or move its counts. A listing that isn't approved stays its own entry, or is held if its name or main folder is taken.
+- **Collisions.** Candidates go in order, hand-picked first and then oldest. Each claims its name, folded for case, punctuation and letters that only look Latin, and its folders. One whose name or main folder is already claimed is held. So is one with a side folder claimed by something strictly ahead of it, and one that has just added a folder another listed entry already had, however old it is. Entries from before ages were kept stay as they were among themselves: only exact copies in repositories, with the same name and main folder, compete. The same goes for two hand-picked entries.
+- **Gaps.** Only a hand-picked entry closes a gap. Each gap has a hand-written `folders` list with the addon's real folder names, and `reserved` does the same for seeded repositories with no entry yet. Anything else claiming one of those, or a name that reads the same, is held.
+- **Forks.** A fork goes away only when it has the same folders as its real parent or a better-known sibling. Some other repository with those folders doesn't count, and a hand-picked fork always stays.
+- **Caps.** An owner gets 40 entries unless they're hand-picked, and new repositories past that aren't even read. A zip past 256 folders counts as having none, and text, dependencies and ids from a TOC are cut to size before they reach the scan cache.
+- **Held** means not published, and listed with the reason in `catalog-held.json`, which the catalog branch also carries, so a maintainer can look. To let something in, seed it or approve a merge. A held entry doesn't age: it stays new until it's actually listed.
+
+The zip scan reads a zip the way the installer does, through its own name cleaning and layout rules, so a zip can't show the catalog one list of folders and install another. A zip claiming to start past its first byte has two possible directories, and is treated as having nothing in it.
+
+### What stops a build
+
+One bad addon is dropped with a warning, and one stranger must never be able to stop the catalog for everyone, so very little is a refusal.
+
+- More than half of the last catalog is missing and no source said why. A repository GitHub says is gone, archived or empty explains itself, and so does one a maintainer excluded, so a flood of junk that gets deleted doesn't freeze anything. An outage or a lost scan cache does stop it.
+- More than half of the last catalog's hand-picked entries are missing, for any reason. A stranger can't cause that, but a bad answer from a source can.
+- `catalog.json` can't be read. Ages come from it, so starting over quietly would make everything brand new at once.
+
+Running the workflow by hand with `accept_smaller` skips all three, once someone has looked. The catalog also has a size limit of 8 MiB, past which the newest and largest entries that aren't hand-picked are held and the largest is named in the log. `catalog-state.json` over 95 MiB would stop every push, so the previous copy stays instead, the catalog still goes out, and the log names the largest repositories.
 
 ## UI
 

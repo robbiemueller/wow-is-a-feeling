@@ -4,6 +4,11 @@ on:
   schedule:
     - cron: "17 */3 * * *"
   workflow_dispatch:
+    inputs:
+      accept_smaller:
+        description: "Publish even if many addons went missing, after you've checked why. If the last catalog can't be read, this also starts every addon's age over."
+        type: boolean
+        default: false
   push:
     branches: [main]
     paths:
@@ -56,7 +61,16 @@ jobs:
           if git fetch --quiet --depth=1 origin catalog; then
             git show FETCH_HEAD:catalog.json > previous/catalog.json || rm -f previous/catalog.json
             git show FETCH_HEAD:catalog-state.json > previous/catalog-state.json || rm -f previous/catalog-state.json
+            git show FETCH_HEAD:catalog-held.json > previous/catalog-held.json || rm -f previous/catalog-held.json
           else
+            # Every addon's age comes from the last catalog, so a failed fetch must not
+            # look like a brand new project. `ls-remote` exits with 2 only for "no such branch".
+            status=0
+            git ls-remote --exit-code origin catalog > /dev/null || status=$?
+            if [ "$status" -ne 2 ]; then
+              echo "Couldn't read the catalog branch. Starting from nothing would lose every addon's age, so try again."
+              exit 1
+            fi
             echo "No catalog branch yet, starting from nothing."
           fi
 
@@ -69,10 +83,12 @@ jobs:
         timeout-minutes: 285
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACCEPT_SMALLER: ${{ inputs.accept_smaller }}
         run: |
           args=(build --out out --seeds catalog/seeds.toml --curated catalog/curated.toml --max-minutes 270)
           if [ -f previous/catalog.json ]; then args+=(--previous previous/catalog.json); fi
           if [ -f previous/catalog-state.json ]; then args+=(--state previous/catalog-state.json); fi
+          if [ "$ACCEPT_SMALLER" = "true" ]; then args+=(--accept-smaller); fi
           ./target/release/feeling-catalog "${args[@]}"
 
       # Runs after a failed or cut-off build too, so scan progress is never lost.
@@ -84,8 +100,21 @@ jobs:
             echo "The build saved nothing, so there's nothing to publish."
             exit 0
           fi
+          # GitHub refuses a file over 100 MiB, and this push carries the catalog as well, so
+          # a cache that big would stop every update. Keep the old one and publish the rest.
+          if [ "$(wc -c < out/catalog-state.json)" -gt $((95 * 1024 * 1024)) ]; then
+            echo "::warning::catalog-state.json is over 95 MiB, so the previous copy stays. The build's log names the largest repositories."
+            if [ -f previous/catalog-state.json ]; then
+              cp previous/catalog-state.json out/catalog-state.json
+            else
+              rm out/catalog-state.json
+            fi
+          fi
           if [ ! -f out/catalog.json ] && [ -f previous/catalog.json ]; then
             cp previous/catalog.json out/catalog.json
+          fi
+          if [ ! -f out/catalog-held.json ] && [ -f previous/catalog-held.json ]; then
+            cp previous/catalog-held.json out/catalog-held.json
           fi
 
           without_timestamp() { sed -E 's/"generated":[0-9]+/"generated":0/' "$1"; }
@@ -100,14 +129,19 @@ jobs:
           if [ -f previous/catalog-state.json ] && cmp -s previous/catalog-state.json out/catalog-state.json; then
             state_unchanged=true
           fi
-          if [ "$catalog_unchanged" = true ] && [ "$state_unchanged" = true ]; then
+          held_unchanged=false
+          if [ -f previous/catalog-held.json ] && cmp -s previous/catalog-held.json out/catalog-held.json; then
+            held_unchanged=true
+          fi
+          if [ "$catalog_unchanged" = true ] && [ "$state_unchanged" = true ] && [ "$held_unchanged" = true ]; then
             echo "Nothing changed, skipping the push."
             exit 0
           fi
 
           mkdir publish
-          cp out/catalog-state.json publish/
+          if [ -f out/catalog-state.json ]; then cp out/catalog-state.json publish/; fi
           if [ -f out/catalog.json ]; then cp out/catalog.json publish/; fi
+          if [ -f out/catalog-held.json ]; then cp out/catalog-held.json publish/; fi
           cat > publish/README.md <<'EOF'
           # Catalog data
 
@@ -117,6 +151,9 @@ jobs:
           - `catalog.json` is what the app downloads. It lists addons and points at
             their authors' own downloads. No addon files are stored here.
           - `catalog-state.json` is the builder's scan cache.
+          - `catalog-held.json` lists addons kept out of the catalog and why, for a
+            maintainer to look at. To let one in, seed it or add a pair to `merges`
+            in `catalog/curated.toml`.
           EOF
 
           # A single new commit with no parent, built without touching the checkout.
