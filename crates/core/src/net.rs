@@ -1,21 +1,25 @@
 //! HTTP for everything the app fetches: catalog with ETags, addon zips, update files.
 //!
-//! Redirects are followed by hand so every hop goes through the same URL check.
-//! ureq only exposes a single https-only switch, which can't express "https
-//! everywhere, plain http on loopback only" across a redirect chain.
+//! The app only ever talks to the public internet over https. Redirects are followed by
+//! hand so every hop goes through the same URL check, and a URL that a stranger wrote
+//! (a README's image, say) also goes through a resolver that refuses private addresses,
+//! because a name can point anywhere.
 
 use std::borrow::Cow;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use ureq::config::Config;
 use ureq::http::header::{ETAG, IF_NONE_MATCH, LOCATION};
 use ureq::http::{HeaderValue, Response, StatusCode, Uri};
 use ureq::tls::{RootCerts, TlsConfig};
+use ureq::unversioned::resolver::{DefaultResolver, ResolvedSocketAddrs, Resolver};
+use ureq::unversioned::transport::{DefaultConnector, NextTimeout};
 use ureq::{Agent, Body, Timeout};
 
 use crate::error::{Error, Result};
@@ -38,6 +42,18 @@ const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
 const CONNECT_RETRY_DELAYS: [Duration; 2] =
     [Duration::from_millis(300), Duration::from_millis(900)];
 const BUFFER_SIZE: usize = 64 * 1024;
+/// Names that only mean something on the player's own network.
+const INTERNAL_SUFFIXES: [&str; 9] = [
+    ".localhost",
+    ".local",
+    ".localdomain",
+    ".internal",
+    ".intranet",
+    ".lan",
+    ".home",
+    ".corp",
+    ".home.arpa",
+];
 
 /// How far a long-running operation has got, in bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,10 +73,22 @@ pub enum Fetched {
     },
 }
 
-/// A shared HTTP client. Cheap to clone; clones share one connection pool.
+/// Which addresses a client may ask for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reach {
+    /// https to public names only. What the app runs with.
+    Public,
+    /// The same, plus plain http to this machine, so a test can serve files locally.
+    PublicAndLoopback,
+}
+
+/// A shared HTTP client. Cheap to clone; clones share their connection pools.
 #[derive(Clone)]
 pub struct Http {
     agent: Agent,
+    /// For URLs a stranger wrote. Its own pool, so it never reuses a checked connection.
+    stranger_agent: Agent,
+    reach: Reach,
 }
 
 impl Default for Http {
@@ -70,11 +98,23 @@ impl Default for Http {
 }
 
 impl Http {
+    /// The client the app uses: https to public names, and nothing on this machine or
+    /// the local network, on any hop of a redirect.
     pub fn new() -> Self {
+        Self::with_reach(Reach::Public)
+    }
+
+    /// Also allows plain http to this machine. For tests that serve files locally; a
+    /// normal launch never uses it.
+    pub fn allowing_loopback() -> Self {
+        Self::with_reach(Reach::PublicAndLoopback)
+    }
+
+    fn with_reach(reach: Reach) -> Self {
         let tls = TlsConfig::builder()
             .root_certs(RootCerts::PlatformVerifier)
             .build();
-        let agent = Agent::config_builder()
+        let config = Agent::config_builder()
             .tls_config(tls)
             .timeout_connect(Some(CONNECT_TIMEOUT))
             .timeout_per_read(Some(IO_TIMEOUT))
@@ -82,14 +122,31 @@ impl Http {
             .max_redirects(0)
             .http_status_as_error(false)
             .user_agent(USER_AGENT)
-            .build()
-            .new_agent();
-        Http { agent }
+            .build();
+        Http {
+            agent: config.new_agent(),
+            stranger_agent: Agent::with_parts(
+                config,
+                DefaultConnector::default(),
+                PublicOnlyResolver::default(),
+            ),
+            reach,
+        }
     }
 
     /// Fetch a URL into memory. Anything over `max_bytes` is an error.
     pub fn get_bytes(&self, url: &str, max_bytes: u64) -> Result<Vec<u8>> {
         let opened = self.open(url, None)?;
+        read_limited(opened, max_bytes)
+    }
+
+    /// Fetch a URL a stranger wrote, such as an image in a README or on an addon's page.
+    /// Beyond the usual rules, a name that resolves to this machine or the local network
+    /// is refused at connect time, on every hop, and no client relaxes that.
+    pub fn get_untrusted(&self, url: &str, max_bytes: u64) -> Result<Vec<u8>> {
+        let start = Target::parse(url, Reach::Public)?;
+        let opened = follow_redirects(&self.stranger_agent, start, None, Reach::Public)
+            .map_err(|failure| failure.error)?;
         read_limited(opened, max_bytes)
     }
 
@@ -224,58 +281,146 @@ impl Http {
     }
 
     fn open_once(&self, url: &str, etag: Option<&str>) -> std::result::Result<Opened, OpenFailure> {
-        let mut target = Target::parse(url).map_err(OpenFailure::fatal)?;
-        for _ in 0..=MAX_REDIRECTS {
-            let response = self.request(&target, etag).map_err(|e| OpenFailure {
-                can_retry: is_connect_failure(&e),
-                error: offline(&target.host),
-            })?;
-            let status = response.status();
-            if status.is_success() || status == StatusCode::NOT_MODIFIED {
-                return Ok(Opened {
-                    host: target.host,
-                    response,
-                });
-            }
-            let location = response
-                .headers()
-                .get(LOCATION)
-                .and_then(|v| v.to_str().ok());
-            match location {
-                Some(location) if status.is_redirection() => {
-                    let next = join_location(&target.url, location);
-                    target = Target::parse(&next).map_err(OpenFailure::fatal)?;
-                }
-                _ => {
-                    return Err(OpenFailure::fatal(Error::HttpStatus {
-                        host: target.host,
-                        status: status.as_u16(),
-                    }));
-                }
-            }
-        }
-        Err(OpenFailure::fatal(Error::Other(format!(
-            "{} sent us through too many redirects. Try again in a little while.",
-            target.host
-        ))))
+        let start = Target::parse(url, self.reach).map_err(OpenFailure::fatal)?;
+        follow_redirects(&self.agent, start, etag, self.reach)
     }
+}
 
-    fn request(
-        &self,
-        target: &Target,
-        etag: Option<&str>,
-    ) -> std::result::Result<Response<Body>, ureq::Error> {
-        let mut request = self.agent.get(target.url.as_str());
-        // A cached ETag that isn't a valid header value is just a cache miss.
-        if let Some(etag) = etag.filter(|e| HeaderValue::from_str(e).is_ok()) {
-            request = request.header(IF_NONE_MATCH, etag);
+/// Request `start` and follow its redirects, holding every hop to `reach`.
+fn follow_redirects(
+    agent: &Agent,
+    start: Target,
+    etag: Option<&str>,
+    reach: Reach,
+) -> std::result::Result<Opened, OpenFailure> {
+    let mut target = start;
+    for _ in 0..=MAX_REDIRECTS {
+        let response = request(agent, &target, etag).map_err(|e| OpenFailure {
+            can_retry: is_connect_failure(&e),
+            error: offline(&target.host),
+        })?;
+        let status = response.status();
+        if status.is_success() || status == StatusCode::NOT_MODIFIED {
+            return Ok(Opened {
+                host: target.host,
+                response,
+            });
         }
-        if target.is_loopback {
-            request.config().proxy(None).build().call()
-        } else {
-            request.call()
+        let location = response
+            .headers()
+            .get(LOCATION)
+            .and_then(|v| v.to_str().ok());
+        match location {
+            Some(location) if status.is_redirection() => {
+                let next = join_location(&target.url, location);
+                target = Target::parse(&next, reach).map_err(OpenFailure::fatal)?;
+            }
+            _ => {
+                return Err(OpenFailure::fatal(Error::HttpStatus {
+                    host: target.host,
+                    status: status.as_u16(),
+                }));
+            }
         }
     }
+    Err(OpenFailure::fatal(Error::Other(format!(
+        "{} sent us through too many redirects. Try again in a little while.",
+        target.host
+    ))))
+}
+
+fn request(
+    agent: &Agent,
+    target: &Target,
+    etag: Option<&str>,
+) -> std::result::Result<Response<Body>, ureq::Error> {
+    let mut request = agent.get(target.url.as_str());
+    // A cached ETag that isn't a valid header value is just a cache miss.
+    if let Some(etag) = etag.filter(|e| HeaderValue::from_str(e).is_ok()) {
+        request = request.header(IF_NONE_MATCH, etag);
+    }
+    if target.is_loopback {
+        request.config().proxy(None).build().call()
+    } else {
+        request.call()
+    }
+}
+
+/// Refuses a name that resolves to this machine or the local network. The check happens
+/// at the moment of connecting, so DNS can't give one answer to a check and another to
+/// the connection.
+#[derive(Debug, Default)]
+struct PublicOnlyResolver {
+    inner: DefaultResolver,
+}
+
+impl Resolver for PublicOnlyResolver {
+    fn resolve(
+        &self,
+        uri: &Uri,
+        config: &Config,
+        timeout: NextTimeout,
+    ) -> std::result::Result<ResolvedSocketAddrs, ureq::Error> {
+        let addresses = self.inner.resolve(uri, config, timeout)?;
+        // The player's own proxy may well live on this machine. It's their choice, not a
+        // stranger's, and the name a stranger wrote is left for the proxy to resolve.
+        let is_players_proxy = config.proxy().is_some_and(|proxy| proxy.uri() == uri);
+        if is_players_proxy || addresses.iter().all(|address| is_public_ip(address.ip())) {
+            Ok(addresses)
+        } else {
+            log::warn!("Refused a private address for a link from an addon's page.");
+            Err(ureq::Error::HostNotFound)
+        }
+    }
+}
+
+/// Whether an address is out on the public internet, not on this machine or a local network.
+fn is_public_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => is_public_v4(v4),
+        IpAddr::V6(v6) => is_public_v6(v6),
+    }
+}
+
+fn is_public_v4(ip: Ipv4Addr) -> bool {
+    let [first, second, ..] = ip.octets();
+    let this_network = first == 0;
+    let carrier_nat = first == 100 && (64..128).contains(&second);
+    let reserved = first >= 240;
+    !(this_network
+        || carrier_nat
+        || reserved
+        || ip.is_loopback()
+        || ip.is_private()
+        || ip.is_link_local()
+        || ip.is_multicast()
+        || ip.is_broadcast())
+}
+
+fn is_public_v6(ip: Ipv6Addr) -> bool {
+    // These forms carry an IPv4 address and reach whatever that address reaches.
+    if let Some(v4) = ip.to_ipv4() {
+        return is_public_v4(v4);
+    }
+    let segments = ip.segments();
+    let embedded = |high: u16, low: u16| {
+        let [a, b] = high.to_be_bytes();
+        let [c, d] = low.to_be_bytes();
+        Ipv4Addr::new(a, b, c, d)
+    };
+    let nat64 = segments[..6] == [0x0064, 0xff9b, 0, 0, 0, 0];
+    if nat64 {
+        return is_public_v4(embedded(segments[6], segments[7]));
+    }
+    let six_to_four = segments[0] == 0x2002;
+    if six_to_four {
+        return is_public_v4(embedded(segments[1], segments[2]));
+    }
+    let unique_local = segments[0] & 0xfe00 == 0xfc00;
+    let link_local = segments[0] & 0xffc0 == 0xfe80;
+    let site_local = segments[0] & 0xffc0 == 0xfec0;
+    let multicast = segments[0] & 0xff00 == 0xff00;
+    !(unique_local || link_local || site_local || multicast)
 }
 
 struct Opened {
@@ -297,7 +442,7 @@ impl OpenFailure {
     }
 }
 
-/// A URL that passed the scheme check, ready to request.
+/// A URL that passed the address checks, ready to request.
 struct Target {
     url: String,
     host: String,
@@ -305,7 +450,7 @@ struct Target {
 }
 
 impl Target {
-    fn parse(url: &str) -> Result<Target> {
+    fn parse(url: &str, reach: Reach) -> Result<Target> {
         let url = escape_url(url.trim()).into_owned();
         let invalid = || Error::Other("That link isn't a web address this app can open.".into());
         let uri: Uri = url.parse().map_err(|_| invalid())?;
@@ -315,7 +460,7 @@ impl Target {
             return Err(invalid());
         }
         let host = authority.host().to_string();
-        let is_loopback = is_loopback_host(&host);
+        let is_loopback = reach == Reach::PublicAndLoopback && is_loopback_host(&host);
         match uri.scheme_str() {
             Some("https") => {}
             Some("http") if is_loopback => {}
@@ -325,12 +470,42 @@ impl Target {
                 )));
             }
         }
+        if !is_loopback && !is_public_name(&host) {
+            return Err(Error::Other(format!(
+                "Refused to connect to {host} because it isn't a public web address."
+            )));
+        }
         Ok(Target {
             url,
             host,
             is_loopback,
         })
     }
+}
+
+/// Whether a URL passes the checks every request has to pass, without fetching it. A cheap
+/// first look for links that won't be requested until later; the checks still run then.
+pub(crate) fn is_public_url(url: &str) -> bool {
+    Target::parse(url, Reach::Public).is_ok()
+}
+
+/// Whether `host` is a name on the public internet. An address written as numbers is
+/// refused wherever it points: nothing this app fetches lives at one, and resolvers accept
+/// many spellings of this machine, such as `2130706433`, `0x7f.1` and `127.1`.
+fn is_public_name(host: &str) -> bool {
+    let name = host.trim_end_matches('.').to_ascii_lowercase();
+    if name.starts_with('[') || name.contains('%') {
+        return false;
+    }
+    // A single word is a name on the local network: `localhost`, `router`, `nas`.
+    let Some((_, last_label)) = name.rsplit_once('.') else {
+        return false;
+    };
+    let is_number = last_label.bytes().all(|b| b.is_ascii_digit()) || last_label.starts_with("0x");
+    !is_number
+        && !INTERNAL_SUFFIXES
+            .iter()
+            .any(|suffix| name.ends_with(suffix))
 }
 
 fn is_loopback_host(host: &str) -> bool {
@@ -623,6 +798,17 @@ mod tests {
 
     fn no_progress(_: Progress) {}
 
+    fn parse_for_test(url: &str) -> Result<Target> {
+        Target::parse(url, Reach::PublicAndLoopback)
+    }
+
+    /// Lets the local test server stand in for a public site: the first hop may be the
+    /// server, and every later hop is held to the rules the app runs with.
+    fn open_from_stand_in(agent: &Agent, url: &str) -> std::result::Result<Opened, OpenFailure> {
+        let start = Target::parse(url, Reach::PublicAndLoopback).map_err(OpenFailure::fatal)?;
+        follow_redirects(agent, start, None, Reach::Public)
+    }
+
     fn is_empty_dir(dir: &Path) -> bool {
         fs::read_dir(dir).unwrap().next().is_none()
     }
@@ -637,7 +823,7 @@ mod tests {
             *captured.lock().unwrap() = request.header("user-agent").unwrap_or("").to_string();
             respond(stream, "200 OK", &[], b"hi");
         });
-        Http::new()
+        Http::allowing_loopback()
             .get_bytes(&format!("{}/x", server.base), 100)
             .unwrap();
         assert_eq!(*seen.lock().unwrap(), USER_AGENT.to_ascii_lowercase());
@@ -654,7 +840,7 @@ mod tests {
                 respond(stream, "200 OK", &[("ETag", "\"v1\"")], b"catalog");
             }
         });
-        let http = Http::new();
+        let http = Http::allowing_loopback();
         let url = format!("{}/catalog.json", server.base);
         let first = http.get_if_modified(&url, None, 100).unwrap();
         assert_eq!(
@@ -678,7 +864,7 @@ mod tests {
             assert!(request.header("if-none-match").is_none());
             respond(stream, "200 OK", &[], b"fresh");
         });
-        let fetched = Http::new()
+        let fetched = Http::allowing_loopback()
             .get_if_modified(&format!("{}/x", server.base), Some("bad\r\nvalue"), 100)
             .unwrap();
         assert!(matches!(fetched, Fetched::Body { .. }));
@@ -687,7 +873,7 @@ mod tests {
     #[test]
     fn oversized_body_is_rejected_by_declared_length() {
         let server = serve(|_, stream| respond(stream, "200 OK", &[], &[7u8; 1000]));
-        let http = Http::new();
+        let http = Http::allowing_loopback();
         let url = format!("{}/big", server.base);
         assert!(matches!(http.get_bytes(&url, 999), Err(Error::Corrupt(_))));
 
@@ -704,7 +890,7 @@ mod tests {
             let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n");
             let _ = stream.write_all(&[7u8; 300_000]);
         });
-        let http = Http::new();
+        let http = Http::allowing_loopback();
         let url = format!("{}/stream", server.base);
         assert!(matches!(http.get_bytes(&url, 1000), Err(Error::Corrupt(_))));
 
@@ -725,7 +911,7 @@ mod tests {
         let server = serve(move |_, stream| {
             respond(stream, "200 OK", &[("Content-Encoding", "gzip")], &bomb);
         });
-        let http = Http::new();
+        let http = Http::allowing_loopback();
         let url = format!("{}/bomb", server.base);
         assert!(matches!(
             http.get_bytes(&url, 100_000),
@@ -755,7 +941,7 @@ mod tests {
             assert!(request.header("accept-encoding").unwrap().contains("gzip"));
             respond(stream, "200 OK", &[("Content-Encoding", "gzip")], &gz);
         });
-        let body = Http::new()
+        let body = Http::allowing_loopback()
             .get_bytes(&format!("{}/x", server.base), 100)
             .unwrap();
         assert_eq!(body, b"hello gzip");
@@ -771,7 +957,7 @@ mod tests {
         let server = serve(move |_, stream| {
             respond(stream, "200 OK", &[("Content-Encoding", "gzip")], &gz);
         });
-        let result = Http::new().get_bytes(&format!("{}/x", server.base), 100_000);
+        let result = Http::allowing_loopback().get_bytes(&format!("{}/x", server.base), 100_000);
         assert!(matches!(result, Err(Error::Corrupt(_))), "{result:?}");
     }
 
@@ -782,7 +968,7 @@ mod tests {
         let dest = dir.path().join("addon.zip");
         fs::write(&dest, b"old").unwrap();
         let mut reports = Vec::new();
-        let size = Http::new()
+        let size = Http::allowing_loopback()
             .download(
                 &format!("{}/addon.zip", server.base),
                 &dest,
@@ -822,7 +1008,7 @@ mod tests {
         let dest = dir.path().join("addon.zip");
         fs::write(&dest, b"old").unwrap();
         let cancel = AtomicBool::new(false);
-        let result = Http::new().download(
+        let result = Http::allowing_loopback().download(
             &format!("{}/addon.zip", server.base),
             &dest,
             &mut |p| {
@@ -843,7 +1029,7 @@ mod tests {
         let server = serve(|_, stream| respond(stream, "200 OK", &[], b"x"));
         let dir = tempfile::tempdir().unwrap();
         let dest = dir.path().join("x");
-        let result = Http::new().download(
+        let result = Http::allowing_loopback().download(
             &format!("{}/x", server.base),
             &dest,
             &mut no_progress,
@@ -861,7 +1047,7 @@ mod tests {
                 b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 100\r\n\r\nonly ten b",
             );
         });
-        let http = Http::new();
+        let http = Http::allowing_loopback();
         let url = format!("{}/short", server.base);
         assert!(matches!(
             http.get_bytes(&url, 1000),
@@ -882,7 +1068,7 @@ mod tests {
         });
         let dir = tempfile::tempdir().unwrap();
         let dest = dir.path().join("chunked.zip");
-        let result = Http::new().download(
+        let result = Http::allowing_loopback().download(
             &format!("{}/x", server.base),
             &dest,
             &mut no_progress,
@@ -896,7 +1082,7 @@ mod tests {
     #[test]
     fn http_errors_map_to_http_status_with_the_host() {
         let server = serve(|_, stream| respond(stream, "503 Service Unavailable", &[], b"nope"));
-        let http = Http::new();
+        let http = Http::allowing_loopback();
         let url = format!("{}/x", server.base);
         match http.get_bytes(&url, 100) {
             Err(Error::HttpStatus { host, status }) => {
@@ -918,7 +1104,8 @@ mod tests {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             listener.local_addr().unwrap().port()
         };
-        let result = Http::new().get_bytes(&format!("http://127.0.0.1:{port}/x"), 100);
+        let result =
+            Http::allowing_loopback().get_bytes(&format!("http://127.0.0.1:{port}/x"), 100);
         assert!(matches!(result, Err(Error::Offline { .. })), "{result:?}");
     }
 
@@ -938,7 +1125,7 @@ mod tests {
         let (server, count) = server_that_drops_first(2);
         let dir = tempfile::tempdir().unwrap();
         let dest = dir.path().join("x");
-        Http::new()
+        Http::allowing_loopback()
             .download(
                 &format!("{}/x", server.base),
                 &dest,
@@ -956,7 +1143,7 @@ mod tests {
         let (server, count) = server_that_drops_first(usize::MAX);
         let dir = tempfile::tempdir().unwrap();
         let dest = dir.path().join("x");
-        let result = Http::new().download(
+        let result = Http::allowing_loopback().download(
             &format!("{}/x", server.base),
             &dest,
             &mut no_progress,
@@ -972,7 +1159,7 @@ mod tests {
         let server = serve(|_, stream| respond(stream, "404 Not Found", &[], b""));
         let dir = tempfile::tempdir().unwrap();
         let dest = dir.path().join("x");
-        let result = Http::new().download(
+        let result = Http::allowing_loopback().download(
             &format!("{}/x", server.base),
             &dest,
             &mut no_progress,
@@ -999,7 +1186,7 @@ mod tests {
         let dest = dir.path().join("x");
         let started = Instant::now();
         let mut reports = 0u64;
-        Http::new()
+        Http::allowing_loopback()
             .download(
                 &format!("{}/x", server.base),
                 &dest,
@@ -1014,7 +1201,7 @@ mod tests {
 
     #[test]
     fn plain_http_is_refused_except_on_loopback() {
-        let http = Http::new();
+        let http = Http::allowing_loopback();
         for url in [
             "http://example.com/x",
             "HTTP://example.com/x",
@@ -1035,14 +1222,14 @@ mod tests {
             "http://[::1]:1/x",
             "https://example.com/x",
         ] {
-            assert!(Target::parse(url).is_ok(), "{url}");
+            assert!(parse_for_test(url).is_ok(), "{url}");
         }
     }
 
     #[test]
     fn userinfo_in_a_url_is_refused() {
-        assert!(Target::parse("https://github.com@evil.example/x").is_err());
-        assert!(Target::parse("http://user:pw@127.0.0.1/x").is_err());
+        assert!(parse_for_test("https://github.com@evil.example/x").is_err());
+        assert!(parse_for_test("http://user:pw@127.0.0.1/x").is_err());
     }
 
     #[test]
@@ -1058,7 +1245,7 @@ mod tests {
             "/next/final?x=1" => respond(stream, "200 OK", &[], b"arrived"),
             other => panic!("unexpected path {other}"),
         });
-        let body = Http::new()
+        let body = Http::allowing_loopback()
             .get_bytes(&format!("{}/start", server.base), 100)
             .unwrap();
         assert_eq!(body, b"arrived");
@@ -1074,8 +1261,179 @@ mod tests {
                 b"",
             );
         });
-        let result = Http::new().get_bytes(&format!("{}/x", server.base), 100);
+        let result = Http::allowing_loopback().get_bytes(&format!("{}/x", server.base), 100);
         assert!(matches!(result, Err(Error::Other(_))), "{result:?}");
+    }
+
+    #[test]
+    fn the_apps_client_refuses_this_machine_and_the_local_network() {
+        let http = Http::new();
+        for url in [
+            "http://127.0.0.1:1/x",
+            "http://localhost:1/x",
+            "http://[::1]:1/x",
+            "https://127.0.0.1/x",
+            "https://127.0.0.1./x",
+            "https://127.1/x",
+            "https://2130706433/x",
+            "https://0x7f.0.0.1/x",
+            "https://0x7F000001/x",
+            "https://0177.0.0.1/x",
+            "https://localhost/x",
+            "https://LOCALHOST./x",
+            "https://[::1]/x",
+            "https://[::ffff:127.0.0.1]/x",
+            "https://[fe80::1]/x",
+            "https://[fc00::1]/x",
+            "https://10.0.0.1/x",
+            "https://172.16.0.1/x",
+            "https://192.168.1.1/x",
+            "https://169.254.169.254/latest/meta-data",
+            "https://0.0.0.0/x",
+            "https://8.8.8.8/x",
+            "https://router/x",
+            "https://nas.local/x",
+            "https://printer.lan/x",
+            "https://foo.localhost/x",
+            "https://vault.internal/x",
+            "https://box.home.arpa/x",
+            "https://%6c%6f%63%61%6c%68%6f%73%74/x",
+        ] {
+            let result = http.get_bytes(url, 10);
+            assert!(matches!(result, Err(Error::Other(_))), "{url}: {result:?}");
+            let result = http.get_untrusted(url, 10);
+            assert!(matches!(result, Err(Error::Other(_))), "{url}: {result:?}");
+            assert!(!is_public_url(url), "{url}");
+        }
+    }
+
+    #[test]
+    fn public_names_pass_the_address_check() {
+        for url in [
+            "https://raw.githubusercontent.com/a/b/HEAD/c.png",
+            "https://github.com/a/b/releases/download/v1/c.zip",
+            "https://api.mmoui.com:443/v3/game/WOW/filelist.json",
+            "https://cdn.wowinterface.com/downloads/My Addon.zip",
+            "https://GitHub.com./x",
+            "https://localhost.example.com/x",
+            "https://example.co.uk/x",
+        ] {
+            assert!(Target::parse(url, Reach::Public).is_ok(), "{url}");
+        }
+    }
+
+    #[test]
+    fn a_public_page_cannot_redirect_the_app_to_this_machine() {
+        let secret = serve(|_, stream| respond(stream, "200 OK", &[], b"secret"));
+        let location = format!("{}/secret", secret.base);
+        let page = serve(move |_, stream| {
+            respond(stream, "302 Found", &[("Location", &location)], b"");
+        });
+        let Err(failure) = open_from_stand_in(&Http::new().agent, &format!("{}/x", page.base))
+        else {
+            panic!("followed a redirect to this machine");
+        };
+        assert!(
+            matches!(failure.error, Error::Other(_)),
+            "{:?}",
+            failure.error
+        );
+        assert_eq!(secret.hits.load(Ordering::SeqCst), 0);
+        assert_eq!(page.hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_strangers_link_never_connects_to_a_private_address() {
+        let server = serve(|_, stream| respond(stream, "200 OK", &[], b"secret"));
+        let url = format!("{}/x", server.base);
+        let http = Http::new();
+        let Err(failure) = open_from_stand_in(&http.stranger_agent, &url) else {
+            panic!("connected to this machine");
+        };
+        assert!(
+            matches!(failure.error, Error::Offline { .. }),
+            "{:?}",
+            failure.error
+        );
+        assert_eq!(server.hits.load(Ordering::SeqCst), 0);
+        // The server was there all along, so it was the resolver that refused.
+        assert!(open_from_stand_in(&http.agent, &url).is_ok());
+        assert_eq!(server.hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn the_players_own_proxy_may_live_on_this_machine() {
+        let proxy = serve(|_, stream| respond(stream, "502 Bad Gateway", &[], b""));
+        let config = Agent::config_builder()
+            .proxy(Some(ureq::Proxy::new(&proxy.base).unwrap()))
+            .max_redirects(0)
+            .http_status_as_error(false)
+            .build();
+        let agent = Agent::with_parts(
+            config,
+            DefaultConnector::default(),
+            PublicOnlyResolver::default(),
+        );
+        // The proxy answers the CONNECT with an error, which is all this needs: the
+        // resolver let the connection to the proxy through.
+        assert!(agent.get("https://example.com/x").call().is_err());
+        assert_eq!(proxy.hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn only_addresses_on_the_public_internet_count_as_public() {
+        for ip in [
+            "127.0.0.1",
+            "127.255.255.254",
+            "10.0.0.1",
+            "172.16.0.1",
+            "172.31.255.255",
+            "192.168.0.1",
+            "169.254.169.254",
+            "0.0.0.0",
+            "0.1.2.3",
+            "100.64.0.1",
+            "100.127.255.255",
+            "224.0.0.1",
+            "240.0.0.1",
+            "255.255.255.255",
+            "::",
+            "::1",
+            "fe80::1",
+            "febf::1",
+            "fec0::1",
+            "fc00::1",
+            "fd12:3456::1",
+            "ff02::1",
+            "::ffff:127.0.0.1",
+            "::ffff:192.168.1.1",
+            "::127.0.0.1",
+            "64:ff9b::7f00:1",
+            "64:ff9b::c0a8:101",
+            "2002:7f00:1::",
+            "2002:c0a8:101::",
+        ] {
+            assert!(!is_public_ip(ip.parse().unwrap()), "{ip}");
+        }
+        for ip in [
+            "1.1.1.1",
+            "8.8.8.8",
+            "140.82.112.3",
+            "100.63.255.255",
+            "100.128.0.1",
+            "172.15.255.255",
+            "172.32.0.1",
+            "192.167.1.1",
+            // DNS-based proxy tools hand out this range for every public name.
+            "198.18.0.1",
+            "2606:4700:4700::1111",
+            "2001:4860:4860::8888",
+            "::ffff:8.8.8.8",
+            "64:ff9b::808:808",
+            "2002:808:808::",
+        ] {
+            assert!(is_public_ip(ip.parse().unwrap()), "{ip}");
+        }
     }
 
     #[test]
@@ -1093,13 +1451,13 @@ mod tests {
         };
         let server = hops(5);
         assert_eq!(
-            Http::new()
+            Http::allowing_loopback()
                 .get_bytes(&format!("{}/0", server.base), 100)
                 .unwrap(),
             b"done"
         );
         let server = hops(6);
-        let result = Http::new().get_bytes(&format!("{}/0", server.base), 100);
+        let result = Http::allowing_loopback().get_bytes(&format!("{}/0", server.base), 100);
         assert!(matches!(result, Err(Error::Other(_))), "{result:?}");
         assert_eq!(server.hits.load(Ordering::SeqCst), 6);
     }
@@ -1107,7 +1465,7 @@ mod tests {
     #[test]
     fn a_redirect_without_location_is_an_error() {
         let server = serve(|_, stream| respond(stream, "302 Found", &[], b""));
-        let result = Http::new().get_bytes(&format!("{}/x", server.base), 100);
+        let result = Http::allowing_loopback().get_bytes(&format!("{}/x", server.base), 100);
         assert!(matches!(result, Err(Error::HttpStatus { status: 302, .. })));
     }
 
@@ -1117,7 +1475,7 @@ mod tests {
             assert_eq!(request.path, "/My%20Addon%20%C3%A9.zip");
             respond(stream, "200 OK", &[], b"ok");
         });
-        let body = Http::new()
+        let body = Http::allowing_loopback()
             .get_bytes(&format!("{}/My Addon é.zip", server.base), 100)
             .unwrap();
         assert_eq!(body, b"ok");
@@ -1125,8 +1483,8 @@ mod tests {
 
     #[test]
     fn control_characters_in_links_are_refused() {
-        assert!(Target::parse("https://example.com/a\r\nX-Evil: 1").is_err());
-        assert!(Target::parse("https://example.com/a\0b").is_err());
+        assert!(parse_for_test("https://example.com/a\r\nX-Evil: 1").is_err());
+        assert!(parse_for_test("https://example.com/a\0b").is_err());
     }
 
     #[test]
@@ -1159,14 +1517,17 @@ mod tests {
             join_location(base, "file:///etc/passwd"),
             "file:///etc/passwd"
         );
-        assert!(Target::parse(&join_location(base, "file:///etc/passwd")).is_err());
+        assert!(parse_for_test(&join_location(base, "file:///etc/passwd")).is_err());
     }
 
     #[test]
     fn error_text_never_contains_the_full_url() {
         let server = serve(|_, stream| respond(stream, "500 Oops", &[], b""));
         let url = format!("{}/asset?token=SECRET", server.base);
-        let text = Http::new().get_bytes(&url, 10).unwrap_err().to_string();
+        let text = Http::allowing_loopback()
+            .get_bytes(&url, 10)
+            .unwrap_err()
+            .to_string();
         assert!(!text.contains("SECRET"), "{text}");
     }
 
@@ -1201,5 +1562,13 @@ mod tests {
             )
             .unwrap();
         assert_eq!(size, fs::metadata(&dest).unwrap().len());
+        // A stranger's link to a public file works, redirects and all.
+        let license = http
+            .get_untrusted(
+                "https://github.com/robbiemueller/wow-is-a-feeling/raw/HEAD/LICENSE",
+                1024 * 1024,
+            )
+            .unwrap();
+        assert_eq!(license.len() as u64, size);
     }
 }

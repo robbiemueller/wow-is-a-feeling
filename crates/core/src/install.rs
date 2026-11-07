@@ -2426,7 +2426,7 @@ mod tests {
         };
         let mut stages = Vec::new();
         let outcome = install_from_url(
-            &Http::new(),
+            &Http::allowing_loopback(),
             &game.layout,
             &request,
             &mut |s| stages.push(s),
@@ -2455,7 +2455,7 @@ mod tests {
             ..req
         };
         let result = install_from_url(
-            &Http::new(),
+            &Http::allowing_loopback(),
             &game.layout,
             &request,
             &mut |_| {},
@@ -2477,7 +2477,7 @@ mod tests {
             ..req
         };
         let result = install_from_url(
-            &Http::new(),
+            &Http::allowing_loopback(),
             &game.layout,
             &request,
             &mut |_| {},
@@ -2869,7 +2869,7 @@ mod tests {
             ..req
         };
         let outcome = install_from_url(
-            &Http::new(),
+            &Http::allowing_loopback(),
             &game.layout,
             &request,
             &mut |_| {},
