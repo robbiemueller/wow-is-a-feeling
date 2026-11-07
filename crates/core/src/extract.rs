@@ -324,9 +324,15 @@ fn open_archive(zip_path: &Path, limits: &Limits) -> Result<(ZipArchive<ZipReade
     let long = long_path(zip_path);
     let mut file = File::open(&long).map_err(|e| io_error(&long, e))?;
     let zip_len = file.metadata().map_err(|e| io_error(&long, e))?.len();
-    let declared = most_files_declared(&mut file, zip_len).map_err(|e| io_error(&long, e))?;
-    if declared > limits.max_entries as u64 {
-        return Err(too_many_files(declared, limits));
+    let claims = zip64_claims(&mut file, zip_len).map_err(|e| io_error(&long, e))?;
+    if claims.files > limits.max_entries as u64 {
+        return Err(too_many_files(claims.files, limits));
+    }
+    if claims.record_bytes > MAX_ZIP64_RECORD_BYTES {
+        return Err(unsafe_zip(format!(
+            "its end record says it's {} bytes long, more than the {MAX_ZIP64_RECORD_BYTES} allowed.",
+            claims.record_bytes
+        )));
     }
     let budget = Rc::new(Cell::new(limits.max_directory_bytes));
     let reader = ReadBudget {
@@ -392,12 +398,25 @@ impl<R: Seek> Seek for ReadBudget<R> {
 /// Far enough from the end of a file to hold the longest zip comment and what's around it.
 const ZIP_TAIL_BYTES: u64 = 66 * KB;
 
-/// The most files any zip64 record near the end of the file claims. The zip crate sets
-/// aside room for that many before it reads a single one, and the only check on the number
-/// is the size of the file, so a big zip can ask for several times its size up front. This
-/// looks at every end marker in reach, because the crate moves on to earlier ones when one
-/// doesn't work out, so a harmless last one must not hide what's in front of it.
-fn most_files_declared(file: &mut File, zip_len: u64) -> io::Result<u64> {
+/// Longest zip64 end record a zip may have, extra data included. Real ones are 56 bytes and
+/// carry no extra data at all.
+const MAX_ZIP64_RECORD_BYTES: u64 = 64 * KB;
+
+/// What the zip64 records near the end of a file claim, before the zip crate believes it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Zip64Claims {
+    /// The most files any of them claims. The crate sets aside room for that many before it
+    /// reads a single one, and the only check on the number is the size of the file, so a
+    /// big zip can ask for several times its size up front.
+    files: u64,
+    /// The longest any of them says it is. The crate sets aside that much for the record's
+    /// extra data before reading any of it, and the only check is that it fits in the file.
+    record_bytes: u64,
+}
+
+/// This looks at every end marker in reach, because the crate moves on to earlier ones when
+/// one doesn't work out, so a harmless last one must not hide what's in front of it.
+fn zip64_claims(file: &mut File, zip_len: u64) -> io::Result<Zip64Claims> {
     file.seek(SeekFrom::Start(zip_len.saturating_sub(ZIP_TAIL_BYTES)))?;
     let mut tail = Vec::new();
     Read::by_ref(file)
@@ -408,7 +427,7 @@ fn most_files_declared(file: &mut File, zip_len: u64) -> io::Result<u64> {
         number.copy_from_slice(bytes);
         u64::from_le_bytes(number)
     };
-    let mut most = 0;
+    let mut claims = Zip64Claims::default();
     for (end, _) in tail
         .windows(4)
         .enumerate()
@@ -426,10 +445,13 @@ fn most_files_declared(file: &mut File, zip_len: u64) -> io::Result<u64> {
             && file.read_exact(&mut record).is_ok()
             && &record[..4] == b"PK\x06\x06"
         {
-            most = most.max(read_u64(&record[32..40]));
+            claims.files = claims.files.max(read_u64(&record[32..40]));
+            // The length it gives leaves out its own mark and that length field.
+            let length = read_u64(&record[4..12]).saturating_add(12);
+            claims.record_bytes = claims.record_bytes.max(length);
         }
     }
-    Ok(most)
+    Ok(claims)
 }
 
 /// Older WoWInterface uploads include the first two. A real, intact file, so "corrupt,
@@ -2394,6 +2416,41 @@ mod tests {
         let result = fixture.extract_limited(&hidden, limits);
         assert!(
             matches!(&result, Err(Error::UnsafeZip(text)) if text.contains("5000 files")),
+            "{result:?}"
+        );
+    }
+
+    /// A zip that is only a zip64 end record at its very start, the locator and the plain
+    /// end record. The zip64 record says it runs on for `extra` bytes of extra data, right
+    /// up to the locator.
+    fn long_zip64_record(extra: usize) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0x0606_4b50u32.to_le_bytes());
+        bytes.extend_from_slice(&(44 + extra as u64).to_le_bytes());
+        bytes.extend_from_slice(&[45, 0, 45, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        bytes.extend_from_slice(&1u64.to_le_bytes());
+        bytes.extend_from_slice(&1u64.to_le_bytes());
+        bytes.extend_from_slice(&[0u8; 16]);
+        bytes.resize(bytes.len() + extra, 0);
+        let end = zip64_end(1, 0, 0, 0);
+        // Only the locator and the plain end record, not the record `zip64_end` starts with.
+        bytes.extend_from_slice(&end[56..]);
+        bytes
+    }
+
+    #[test]
+    fn a_zip64_end_record_claiming_extra_data_is_refused_before_it_is_read() {
+        let fixture = Fixture::new();
+        let long = long_zip64_record(MB as usize);
+        // Without the check, the crate sets aside the whole megabyte and starts filling it,
+        // so it's the read limit that stops it, however small that is.
+        let limits = Limits {
+            max_directory_bytes: 64 * KB,
+            ..Limits::default()
+        };
+        let result = fixture.extract_limited(&long, limits);
+        assert!(
+            matches!(&result, Err(Error::UnsafeZip(text)) if text.contains("end record")),
             "{result:?}"
         );
     }
