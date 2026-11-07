@@ -106,7 +106,7 @@ Checked once at launch, in the background, after the first frame. Never silent: 
 
 - `https://github.com/robbiemueller/wow-is-a-feeling/releases/latest/download/latest.json` plus `latest.json.minisig`. That URL is a plain redirect, so it doesn't touch GitHub's REST rate limit.
 - Verify the signature over `latest.json` with the public key embedded in the app, using `minisign-verify`, then compare versions, download the asset, and check its SHA-256 from the signed file.
-- Windows and Linux tarball: swap with `self-replace`. AppImage: replace `$APPIMAGE`. macOS: replace the whole `.app`.
+- Windows and a bare Linux binary: swap with `self-replace`. AppImage: replace `$APPIMAGE`. macOS: replace the whole `.app`.
 
 `latest.json`:
 
@@ -118,11 +118,13 @@ Checked once at launch, in the background, after the first frame. Never silent: 
   "assets": {
     "windows-x64": { "url": "...", "sha256": "...", "size": 123, "kind": "exe" },
     "linux-x64-appimage": { "url": "...", "sha256": "...", "size": 123, "kind": "appimage" },
-    "linux-x64-tar": { "url": "...", "sha256": "...", "size": 123, "kind": "tar.gz" },
-    "macos-universal": { "url": "...", "sha256": "...", "size": 123, "kind": "app.tar.gz" }
+    "linux-x64-bin": { "url": "...", "sha256": "...", "size": 123, "kind": "bin.gz" },
+    "macos-universal": { "url": "...", "sha256": "...", "size": 123, "kind": "app.zip" }
   }
 }
 ```
+
+`bin.gz` is one gzipped binary and `app.zip` is a zipped `.app`, so the updater needs no tar support.
 
 ## Catalog
 
