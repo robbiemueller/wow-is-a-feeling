@@ -182,6 +182,11 @@ pub(crate) struct TreeOptions {
     pub allow_executables: bool,
     /// Restore the exec bit from the zip on Unix.
     pub keep_exec_bits: bool,
+    /// For a player's own settings, whose names came from a folder that really existed.
+    /// Only a file's own name can get it held back, because an account folder can be called
+    /// `ME@EXAMPLE.COM`. Names that differ only by case both stay, because the disk they
+    /// came from held both, and `create_new` still refuses a clash on a disk that can't.
+    pub settings_backup: bool,
 }
 
 /// Extract a whole zip, without the addon layout rules, through the same checks and
@@ -207,6 +212,16 @@ pub(crate) fn extract_tree(
         progress,
         cancel,
     )
+}
+
+/// Every check [`extract_tree`] makes before it writes anything, without writing anything:
+/// whether unpacking this zip would be refused, short of the files inside turning out to
+/// be damaged.
+pub(crate) fn check_tree(zip_path: &Path, limits: Limits, options: TreeOptions) -> Result<()> {
+    let (mut archive, zip_len) = open_archive(zip_path, &limits)?;
+    let entries = read_entries(&mut archive, &limits)?;
+    let plan = plan_tree(&entries, options, &limits)?;
+    check_declared_sizes(&plan, zip_len, limits).map(drop)
 }
 
 /// The absolute form of `path` that survives the 260 character limit: `\\?\`-prefixed
@@ -645,16 +660,20 @@ fn is_junk_path(path: &str) -> bool {
     })
 }
 
-fn is_blocked_path(path: &str, is_dir: bool) -> bool {
+fn is_blocked_path(path: &str, is_dir: bool, file_names_only: bool) -> bool {
     let has_extension_in = |name: &str, list: &[&str]| {
         name.rsplit_once('.')
             .is_some_and(|(_, ext)| list.iter().any(|blocked| ext.eq_ignore_ascii_case(blocked)))
     };
     let file_name = path.rsplit('/').next().unwrap_or(path);
-    (!is_dir && has_extension_in(file_name, &BLOCKED_FILE_EXTENSIONS))
-        || path
-            .split('/')
-            .any(|segment| has_extension_in(segment, &BLOCKED_EXTENSIONS))
+    let blocked_file = !is_dir
+        && (has_extension_in(file_name, &BLOCKED_FILE_EXTENSIONS)
+            || has_extension_in(file_name, &BLOCKED_EXTENSIONS));
+    blocked_file
+        || (!file_names_only
+            && path
+                .split('/')
+                .any(|segment| has_extension_in(segment, &BLOCKED_EXTENSIONS)))
 }
 
 fn is_toc_name(name: &str) -> bool {
@@ -768,7 +787,7 @@ fn plan_addons(entries: &[ZipEntry], moves: &[Move], limits: &Limits) -> Result<
     } else {
         map_by_moves(&live, moves)?
     };
-    plan_from_mapped(mapped, true, false, limits)
+    plan_from_mapped(mapped, true, TreeOptions::default(), limits)
 }
 
 fn plan_tree(entries: &[ZipEntry], options: TreeOptions, limits: &Limits) -> Result<Plan> {
@@ -777,7 +796,7 @@ fn plan_tree(entries: &[ZipEntry], options: TreeOptions, limits: &Limits) -> Res
         .filter(|e| !is_junk_path(&e.path))
         .map(|e| (e, e.path.clone()))
         .collect();
-    plan_from_mapped(mapped, false, options.allow_executables, limits)
+    plan_from_mapped(mapped, false, options, limits)
 }
 
 /// Layout rules for a zip with no moves. Every rule keys off where the TOCs are.
@@ -909,11 +928,21 @@ fn move_matches(item: &ParsedMove<'_>, segments: &[&str]) -> bool {
 fn plan_from_mapped(
     mapped: Vec<(&ZipEntry, String)>,
     require_toc: bool,
-    allow_executables: bool,
+    options: TreeOptions,
     limits: &Limits,
 ) -> Result<Plan> {
-    let is_held_back = |dest: &str, is_dir| !allow_executables && is_blocked_path(dest, is_dir);
-    // Case-folded top-level name to its spelling.
+    let is_held_back = |dest: &str, is_dir| {
+        !options.allow_executables && is_blocked_path(dest, is_dir, options.settings_backup)
+    };
+    let top_key = |top: &str| {
+        if options.settings_backup {
+            top.to_string()
+        } else {
+            fold(top)
+        }
+    };
+    // Top-level name to its spelling. Two spellings of one name are the same folder, for
+    // everything but a settings backup, where the disk decides.
     let mut folders: HashMap<String, String> = HashMap::new();
     for (entry, dest) in &mapped {
         if is_held_back(dest, entry.is_dir) {
@@ -923,10 +952,12 @@ fn plan_from_mapped(
             Some((top, rest))
                 if !require_toc || (!entry.is_dir && !rest.contains('/') && is_toc_name(rest)) =>
             {
-                folders.entry(fold(top)).or_insert_with(|| top.to_string());
+                folders
+                    .entry(top_key(top))
+                    .or_insert_with(|| top.to_string());
             }
             None if !require_toc => {
-                folders.entry(fold(dest)).or_insert_with(|| dest.clone());
+                folders.entry(top_key(dest)).or_insert_with(|| dest.clone());
             }
             _ => {}
         }
@@ -938,7 +969,13 @@ fn plan_from_mapped(
     let mut plan = Plan::default();
     for (entry, dest) in mapped {
         let top = dest.split('/').next().unwrap_or(&dest);
-        let Some(spelling) = folders.get(&fold(top)) else {
+        let Some(spelling) = folders.get(&top_key(top)) else {
+            // With no TOC to ask for, this is a lone script at the top of the zip, or a
+            // folder holding nothing else. It was still left out, so it still gets reported.
+            if !require_toc && is_held_back(&dest, entry.is_dir) {
+                log::warn!("Skipped an executable in a zip: {}", printable(&dest));
+                plan.skipped.push(dest);
+            }
             continue;
         };
         if spelling != top {
@@ -959,7 +996,7 @@ fn plan_from_mapped(
             compressed_size: entry.compressed_size,
         });
     }
-    check_names(&plan.items, limits)?;
+    check_names(&plan.items, limits, options.settings_backup)?;
     plan.folders = folders.into_values().collect();
     plan.folders.sort();
     plan.skipped.sort();
@@ -969,7 +1006,7 @@ fn plan_from_mapped(
 /// Refuse a plan with too many folders, or whose names would collide. Everything here
 /// borrows whole paths: a set owning a copy of every parent of every path is how a 1 MB
 /// zip could once ask for all of a machine's memory before any limit got a look at it.
-fn check_names(items: &[PlanItem], limits: &Limits) -> Result<()> {
+fn check_names(items: &[PlanItem], limits: &Limits, disk_decides: bool) -> Result<()> {
     // As spelled, because a case-sensitive disk makes a folder for each spelling.
     let mut folders: HashSet<&str> = HashSet::new();
     for item in items {
@@ -980,6 +1017,9 @@ fn check_names(items: &[PlanItem], limits: &Limits) -> Result<()> {
                 limits.max_folders
             )));
         }
+    }
+    if disk_decides {
+        return Ok(());
     }
     let folded: Vec<String> = items.iter().map(|item| fold(&item.dest)).collect();
     let mut seen_files: HashSet<&str> = HashSet::new();
@@ -1010,6 +1050,29 @@ fn note_folders<'a>(folders: &mut HashSet<&'a str>, path: &'a str, is_dir: bool)
     while let Some(current) = folder.filter(|current| folders.insert(current)) {
         folder = parent(current);
     }
+}
+
+/// Declared sizes can't be trusted to be honest, but they do bound the output (a stream
+/// running past its own declaration is an error), so a bomb that admits what it is can be
+/// turned away before it writes anything. Returns the total.
+fn check_declared_sizes(plan: &Plan, zip_len: u64, limits: Limits) -> Result<u64> {
+    let mut declared_total = 0u64;
+    for item in plan.items.iter().filter(|item| !item.is_dir) {
+        if item.size > limits.max_file_bytes {
+            return Err(too_big_file(limits));
+        }
+        if over_ratio(item.size, item.compressed_size, limits) {
+            return Err(zip_bomb(limits));
+        }
+        declared_total = declared_total.saturating_add(item.size);
+    }
+    if declared_total > limits.max_total_bytes {
+        return Err(too_big_total(limits));
+    }
+    if over_ratio(declared_total, zip_len, limits) {
+        return Err(zip_bomb(limits));
+    }
+    Ok(declared_total)
 }
 
 /// Write the plan, or leave nothing behind.
@@ -1080,26 +1143,7 @@ fn write_items<R: Read + Seek>(
     progress: &mut dyn FnMut(Progress),
     cancel: &AtomicBool,
 ) -> Result<u64> {
-    let mut declared_total = 0u64;
-    for item in plan.items.iter().filter(|item| !item.is_dir) {
-        if item.size > limits.max_file_bytes {
-            return Err(too_big_file(limits));
-        }
-        if over_ratio(item.size, item.compressed_size, limits) {
-            return Err(zip_bomb(limits));
-        }
-        declared_total = declared_total.saturating_add(item.size);
-    }
-    if declared_total > limits.max_total_bytes {
-        return Err(too_big_total(limits));
-    }
-    // Declared sizes can't be trusted to be honest, but they do bound the output
-    // (a stream running past its own declaration is an error), so a bomb that admits
-    // what it is can be turned away before it writes anything.
-    if over_ratio(declared_total, zip_len, limits) {
-        return Err(zip_bomb(limits));
-    }
-
+    let declared_total = check_declared_sizes(plan, zip_len, limits)?;
     let mut buffer = vec![0u8; BUFFER_SIZE];
     let mut made_dirs: HashSet<PathBuf> = HashSet::new();
     let mut total = 0u64;
@@ -3165,6 +3209,99 @@ mod tests {
     }
 
     #[test]
+    fn extract_tree_reports_a_lone_script_at_the_top_of_a_zip() {
+        let fixture = Fixture::new();
+        let zip = fixture.zip(&raw_zip(&[
+            RawEntry::new("Config.wtf", b"cfg"),
+            RawEntry::new("sync.bat", b"@echo off"),
+            RawEntry::new("Tools/only.exe", b"MZ"),
+        ]));
+        let extracted = extract_tree(
+            &zip,
+            &fixture.dest(),
+            Limits::default(),
+            TreeOptions::default(),
+            &mut |_| {},
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(extracted.folders, ["Config.wtf"]);
+        assert_eq!(extracted.skipped_files, ["Tools/only.exe", "sync.bat"]);
+        assert_eq!(paths(&fixture), ["Config.wtf"]);
+    }
+
+    #[test]
+    fn check_tree_says_what_extract_tree_would_refuse_and_writes_nothing() {
+        let fixture = Fixture::new();
+        let good = fixture.zip(&raw_zip(&[RawEntry::new("Config.wtf", b"cfg")]));
+        let options = TreeOptions::default();
+        check_tree(&good, Limits::default(), options).unwrap();
+
+        for bad in [
+            raw_zip(&[RawEntry::new("../evil", b"x")]),
+            raw_zip(&[RawEntry::new("a.lua", b"1"), RawEntry::new("A.lua", b"2")]),
+            b"not a zip".to_vec(),
+        ] {
+            let zip = fixture.zip(&bad);
+            assert!(check_tree(&zip, Limits::default(), options).is_err());
+        }
+        let zip = fixture.zip(&zip_bytes(&[("big.bin", &[0u8; 2000])]));
+        let small = Limits {
+            max_file_bytes: 1000,
+            ..Limits::default()
+        };
+        assert!(matches!(
+            check_tree(&zip, small, options),
+            Err(Error::UnsafeZip(_))
+        ));
+        assert!(!fixture.dest().exists());
+    }
+
+    #[test]
+    fn a_settings_backup_keeps_both_spellings_and_folders_named_like_programs() {
+        let options = TreeOptions {
+            settings_backup: true,
+            ..TreeOptions::default()
+        };
+        let plan = |entries: Vec<ZipEntry>| plan_tree(&entries, options, &Limits::default());
+        let entry = |path: &str, is_dir: bool| ZipEntry {
+            index: 0,
+            path: path.to_string(),
+            is_dir,
+            size: 1,
+            compressed_size: 1,
+        };
+        let planned = plan(vec![
+            entry("Account/ME@EXAMPLE.COM/x.lua", false),
+            entry("Account/Thing.app/", true),
+            entry("foo.lua", false),
+            entry("Foo.lua", false),
+            entry("foo", false),
+            entry("Foo/x.lua", false),
+        ])
+        .unwrap();
+        assert_eq!(planned.items.len(), 6);
+        assert!(planned.skipped.is_empty());
+        assert_eq!(
+            planned.folders,
+            ["Account", "Foo", "Foo.lua", "foo", "foo.lua"]
+        );
+
+        // A file's own name still counts.
+        let planned = plan(vec![
+            entry("Account/keep.lua", false),
+            entry("Account/ME@EXAMPLE.COM/tool.exe", false),
+            entry("run.js", false),
+        ])
+        .unwrap();
+        assert_eq!(planned.items.len(), 1);
+        assert_eq!(
+            planned.skipped,
+            ["Account/ME@EXAMPLE.COM/tool.exe", "run.js"]
+        );
+    }
+
+    #[test]
     fn extract_tree_can_allow_executables_for_our_own_bundle() {
         let fixture = Fixture::new();
         let mut binary = RawEntry::new("Feeling.app/Contents/MacOS/feeling", b"\x7fELF");
@@ -3175,6 +3312,7 @@ mod tests {
         let options = TreeOptions {
             allow_executables: true,
             keep_exec_bits: true,
+            ..TreeOptions::default()
         };
         let extracted = extract_tree(
             &zip,

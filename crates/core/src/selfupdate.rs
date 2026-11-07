@@ -389,6 +389,7 @@ fn swap_app_bundle(zip: &Path, app: &Path, cancel: &AtomicBool) -> Result<()> {
     let options = TreeOptions {
         allow_executables: true,
         keep_exec_bits: true,
+        ..TreeOptions::default()
     };
     let result = extract_tree(
         zip,
