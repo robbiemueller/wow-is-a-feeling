@@ -83,7 +83,9 @@ pub struct Addon {
     pub trusted: bool,
     /// Whether a person chose this entry: seeded, hand-picked or part of an approved pair.
     /// Only these get installed by themselves as another addon's dependency, because any
-    /// addon can ship a library's folder name long before anything needs it.
+    /// addon can ship a library's folder name long before anything needs it. A pack over
+    /// 100 MB is chosen too, but goes out unreviewed, so apps up to 0.1.2 never install it
+    /// by themselves.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub reviewed: bool,
     /// Screenshots, for a source whose details don't list them (WoWInterface). Written by a

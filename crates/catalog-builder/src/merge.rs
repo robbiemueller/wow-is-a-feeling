@@ -1000,7 +1000,7 @@ pub fn settle_trust(
 
 /// Release lines, and the packs `[[packs]]` names, whose download is over 100 MB go out trusted
 /// but not reviewed. Apps up to 0.1.2 install any reviewed entry another addon requires by
-/// itself, whatever its size, and a voice pack can be 1.5 GB. Later apps never install anything
+/// itself, whatever its size, and a voice pack can be 1.5 GB. Later apps never install a pack
 /// that big without asking, and offer packs by their groups, which only needs them trusted.
 /// Returns a line for each, after [`settle_trust`].
 pub fn unreview_big_packs(candidates: &mut [Candidate], curated: &Curated) -> Vec<String> {
