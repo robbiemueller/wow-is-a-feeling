@@ -7,3 +7,12 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 publish = false
+
+[dependencies]
+minisign = "0.10"
+serde_json.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+feeling-core.workspace = true
+tempfile = "3"
