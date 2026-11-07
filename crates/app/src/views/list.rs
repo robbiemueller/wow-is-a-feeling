@@ -66,7 +66,12 @@ fn empty_note(app: &App, ui: &mut Ui, inner: Rect) {
     }
     let area = inner.shrink(14.0);
     let painter = ui.painter_at(inner);
-    let galley = painter.layout(text.to_owned(), theme::body(14.5), theme::TEXT_DIM, area.width());
+    let galley = painter.layout(
+        text.to_owned(),
+        theme::body(14.5),
+        theme::TEXT_DIM,
+        area.width(),
+    );
     painter.galley(area.min, galley, theme::TEXT_DIM);
 }
 
@@ -96,7 +101,11 @@ fn draw_row(app: &mut App, ui: &mut Ui, index: usize) {
         }
         row => {
             let selected = app.is_selected_row(&row);
-            let indent = if app.rows_are_flat() { FLAT_INDENT } else { INDENT };
+            let indent = if app.rows_are_flat() {
+                FLAT_INDENT
+            } else {
+                INDENT
+            };
             let view = row_view(app, &row);
             let label = if view.tag.is_empty() {
                 view.name.clone()
@@ -110,12 +119,11 @@ fn draw_row(app: &mut App, ui: &mut Ui, index: usize) {
             let response = response
                 .on_hover_cursor(CursorIcon::PointingHand)
                 .on_hover_ui(|ui| tooltip(app, ui, &row));
-            if response.clicked() {
-                if let Some(selection) =
+            if response.clicked()
+                && let Some(selection) =
                     model::row_selection(&row, app.bundle.as_deref(), &app.groups)
-                {
-                    app.actions.push(Action::Select(selection));
-                }
+            {
+                app.actions.push(Action::Select(selection));
             }
         }
     }

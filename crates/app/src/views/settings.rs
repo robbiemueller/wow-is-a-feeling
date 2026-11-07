@@ -179,7 +179,12 @@ fn backup_row(app: &mut App, ui: &mut Ui, entry: &BackupEntry, busy: bool) {
         ui.allocate_ui(vec2(text_width, 28.0), |ui| {
             ui.set_width(text_width);
             ui.horizontal_centered(|ui| {
-                widgets::ink(ui, format!("{when}, {size}"), theme::strong(14.5), theme::INK);
+                widgets::ink(
+                    ui,
+                    format!("{when}, {size}"),
+                    theme::strong(14.5),
+                    theme::INK,
+                );
             });
         });
         let restore = widgets::button(ui, "Restore", ButtonKind::Quiet, !busy);
@@ -244,7 +249,10 @@ fn display_page(app: &mut App, ui: &mut Ui, rect: Rect) {
             }
         });
         ui.add_space(8.0);
-        widgets::ink_note(ui, "Makes everything larger or smaller. It's remembered for next time.");
+        widgets::ink_note(
+            ui,
+            "Makes everything larger or smaller. It's remembered for next time.",
+        );
     });
 }
 
@@ -335,7 +343,9 @@ fn credit(ui: &mut Ui) {
     };
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing.x = 0.0;
-        ui.label(plain("Named after the song 'World of Warcraft is a Feeling' from "));
+        ui.label(plain(
+            "Named after the song 'World of Warcraft is a Feeling' from ",
+        ));
         ui.label(plain("Pure Pwnage").italics());
         ui.label(plain("."));
     });

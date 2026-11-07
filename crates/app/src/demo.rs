@@ -5,8 +5,8 @@ use crate::args::Scene;
 use eframe::egui::{Color32, ColorImage};
 use feeling_core::backup::BackupEntry;
 use feeling_core::catalog::{Catalog, Channel};
-use feeling_core::detect::{FoundBy, Install};
 use feeling_core::details::Details;
+use feeling_core::detect::{FoundBy, Install};
 use feeling_core::scan::LocalFolder;
 use feeling_core::selfupdate::{AssetKind, UpdateAsset, UpdateInfo};
 use feeling_core::state::{InstallRecord, ManagedAddon, Origin, State};
@@ -115,7 +115,12 @@ pub fn state(scene: Scene) -> State {
             ),
             record("gh:funkydude/BugSack", "BugSack", "v12.0.1", &["BugSack"]),
             record("gh:VgerMods/Pawn", "Pawn", "2.14.1", &["Pawn"]),
-            record("gh:someone/old-addon", "Old Abandoned Addon", "0.9", &["OldAddon"]),
+            record(
+                "gh:someone/old-addon",
+                "Old Abandoned Addon",
+                "0.9",
+                &["OldAddon"],
+            ),
             tomtom,
             dominos,
             tweaks,
@@ -142,7 +147,13 @@ pub fn install() -> (Install, String) {
     (install, INSTALL_KEY.to_owned())
 }
 
-fn folder(name: &str, title: &str, version: Option<&str>, forever: bool, notes: &str) -> LocalFolder {
+fn folder(
+    name: &str,
+    title: &str,
+    version: Option<&str>,
+    forever: bool,
+    notes: &str,
+) -> LocalFolder {
     LocalFolder {
         name: name.to_owned(),
         toc_file: Some(format!("{name}.toc")),
@@ -241,11 +252,7 @@ pub fn screenshot() -> ColorImage {
             pixels.push(if road {
                 Color32::from_rgb(214, 170, 60)
             } else {
-                Color32::from_rgb(
-                    (base * 0.8) as u8,
-                    (base * 1.1) as u8,
-                    (base * 0.55) as u8,
-                )
+                Color32::from_rgb((base * 0.8) as u8, (base * 1.1) as u8, (base * 0.55) as u8)
             });
         }
     }

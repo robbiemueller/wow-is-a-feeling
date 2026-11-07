@@ -9,7 +9,7 @@ use crate::demo;
 use crate::dialogs::Popup;
 use crate::easter;
 use crate::model::{CatalogStatus, GameState, Section, Selection, Tab};
-use crate::worker::Dirs;
+use crate::worker::{Dirs, Event};
 use eframe::egui::{self, Key, Modifiers, OutputCommand, ViewportId};
 use egui_kittest::Harness;
 use egui_kittest::kittest::{NodeT as _, Queryable as _};
@@ -65,11 +65,7 @@ impl Site {
             }
         }
         let request = String::from_utf8_lossy(&request).into_owned();
-        let path = request
-            .split_whitespace()
-            .nth(1)
-            .unwrap_or("/")
-            .to_owned();
+        let path = request.split_whitespace().nth(1).unwrap_or("/").to_owned();
         if path.starts_with("/slow/") {
             // A big download, forever underway, until the other end hangs up.
             let head = format!(
@@ -83,7 +79,9 @@ impl Site {
         }
         let body = self.files.lock().unwrap().get(&path).cloned();
         let Some(body) = body else {
-            let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
+            let _ = stream.write_all(
+                b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+            );
             return;
         };
         let etag = {
@@ -245,7 +243,11 @@ impl Rig {
 fn make_game(root: &Path) -> PathBuf {
     let forever = root.join("_forever_");
     fs::create_dir_all(forever.join("Interface").join("AddOns")).unwrap();
-    fs::write(forever.join(".flavor.info"), "Product Flavor!STRING:0\nwowf\n").unwrap();
+    fs::write(
+        forever.join(".flavor.info"),
+        "Product Flavor!STRING:0\nwowf\n",
+    )
+    .unwrap();
     fs::write(forever.join("Wow.exe"), b"").unwrap();
     fs::write(
         root.join(".build.info"),
@@ -301,11 +303,15 @@ fn demo_harness(scene: Scene, temp: &Path) -> Harness<'static, Option<App>> {
 }
 
 fn app<'a>(h: &'a Harness<'static, Option<App>>) -> &'a App {
-    h.state().as_ref().expect("the app starts on the first frame")
+    h.state()
+        .as_ref()
+        .expect("the app starts on the first frame")
 }
 
 fn app_mut<'a>(h: &'a mut Harness<'static, Option<App>>) -> &'a mut App {
-    h.state_mut().as_mut().expect("the app starts on the first frame")
+    h.state_mut()
+        .as_mut()
+        .expect("the app starts on the first frame")
 }
 
 /// Keep drawing frames until the workers have delivered what's being waited for.
@@ -390,15 +396,16 @@ const BAR: &str = "direct:Bar";
 #[test]
 fn a_player_installs_updates_rolls_back_and_removes_with_real_files() {
     let rig = Rig::new();
-    rig.site
-        .publish(&catalog_of(vec![publish_addon(&rig.site, FOO, "Foo", "1.0")]));
+    rig.site.publish(&catalog_of(vec![publish_addon(
+        &rig.site, FOO, "Foo", "1.0",
+    )]));
 
     // First launch: nothing installed, so Browse, with the addon recommended and selected.
     let mut h = rig.launch_settled();
     assert_eq!(app(&h).tab, Tab::Browse);
     assert_eq!(
         app(&h).status_text(),
-        "Forever 1.60.1.12345  |  1 addon  |  updated ".to_owned()
+        "Forever 1.60.1  |  1 addon  |  updated ".to_owned()
             + &crate::model::age_text(app(&h).now_unix() - 1_794_000_000)
     );
     assert!(has_label(&h, "Foo Addon, 1.0"));
@@ -419,13 +426,17 @@ fn a_player_installs_updates_rolls_back_and_removes_with_real_files() {
     assert!(has_label(&h, "Foo Addon, installed"));
     close(h);
     assert!(
-        rig.saved_state().installs.values().any(|i| i.managed.contains_key(FOO)),
+        rig.saved_state()
+            .installs
+            .values()
+            .any(|i| i.managed.contains_key(FOO)),
         "the record reached state.json"
     );
 
     // A new version is published. The next launch finds it and offers it.
-    rig.site
-        .publish(&catalog_of(vec![publish_addon(&rig.site, FOO, "Foo", "2.0")]));
+    rig.site.publish(&catalog_of(vec![publish_addon(
+        &rig.site, FOO, "Foo", "2.0",
+    )]));
     let mut h = rig.launch_settled();
     assert_eq!(app(&h).tab, Tab::MyAddons, "something's installed now");
     assert_eq!(app(&h).updates, vec![FOO.to_owned()]);
@@ -477,12 +488,25 @@ fn a_player_installs_updates_rolls_back_and_removes_with_real_files() {
     finish_ops(&mut h);
     assert!(!rig.addons().join("Foo").exists());
     assert!(managed(&h, FOO).is_none());
-    assert!(!rig.game.join("_forever_").join("Interface").join(".wiaf").join("j").exists()
-        || fs::read_dir(rig.game.join("_forever_").join("Interface").join(".wiaf").join("j"))
+    assert!(
+        !rig.game
+            .join("_forever_")
+            .join("Interface")
+            .join(".wiaf")
+            .join("j")
+            .exists()
+            || fs::read_dir(
+                rig.game
+                    .join("_forever_")
+                    .join("Interface")
+                    .join(".wiaf")
+                    .join("j")
+            )
             .unwrap()
             .next()
             .is_none(),
-        "no journal left behind");
+        "no journal left behind"
+    );
 }
 
 #[test]
@@ -527,7 +551,10 @@ fn a_failed_install_says_why_and_changes_nothing() {
     assert!(!rig.addons().join("Foo").exists());
     assert!(managed(&h, FOO).is_none());
     let texts = app(&h).messages.texts();
-    assert!(texts.iter().any(|t| t.contains("answered with an error")), "{texts:?}");
+    assert!(
+        texts.iter().any(|t| t.contains("answered with an error")),
+        "{texts:?}"
+    );
 }
 
 #[test]
@@ -562,7 +589,10 @@ fn a_bad_zip_is_refused_and_the_old_version_stays() {
     assert_eq!(rig.version_on_disk("Foo").as_deref(), Some("1.0"));
     assert_eq!(managed(&h, FOO).unwrap().version, "1.0");
     let texts = app(&h).messages.texts();
-    assert!(texts.iter().any(|t| t.contains("anything WoW can load")), "{texts:?}");
+    assert!(
+        texts.iter().any(|t| t.contains("anything WoW can load")),
+        "{texts:?}"
+    );
 }
 
 #[test]
@@ -577,8 +607,9 @@ fn a_folder_from_another_tool_can_be_adopted_and_then_updated() {
     )
     .unwrap();
     fs::write(folder.join("Foo.lua"), "-- 0.5\n").unwrap();
-    rig.site
-        .publish(&catalog_of(vec![publish_addon(&rig.site, FOO, "Foo", "1.0")]));
+    rig.site.publish(&catalog_of(vec![publish_addon(
+        &rig.site, FOO, "Foo", "1.0",
+    )]));
 
     let mut h = rig.launch_settled();
     assert_eq!(app(&h).tab, Tab::MyAddons, "something's on disk");
@@ -592,7 +623,11 @@ fn a_folder_from_another_tool_can_be_adopted_and_then_updated() {
     assert_eq!(record.origin, Origin::Adopted);
     assert_eq!(record.version, "0.5");
     assert_eq!(record.folders, vec!["Foo".to_owned()]);
-    assert_eq!(rig.version_on_disk("Foo").as_deref(), Some("0.5"), "untouched so far");
+    assert_eq!(
+        rig.version_on_disk("Foo").as_deref(),
+        Some("0.5"),
+        "untouched so far"
+    );
     assert_eq!(app(&h).updates, vec![FOO.to_owned()], "and it gets updates");
     assert!(has_label(&h, "Update all (1)"));
 
@@ -602,7 +637,10 @@ fn a_folder_from_another_tool_can_be_adopted_and_then_updated() {
     let record = managed(&h, FOO).unwrap();
     assert_eq!(record.version, "1.0");
     assert_eq!(record.origin, Origin::Adopted);
-    assert_eq!(record.previous_version, None, "there's no zip of the old one to go back to");
+    assert_eq!(
+        record.previous_version, None,
+        "there's no zip of the old one to go back to"
+    );
     assert!(!has_label(&h, "Other folders (1)"));
 }
 
@@ -611,7 +649,11 @@ fn an_unmatched_other_folder_can_only_be_removed_after_asking() {
     let rig = Rig::new();
     let folder = rig.addons().join("Mine");
     fs::create_dir_all(&folder).unwrap();
-    fs::write(folder.join("Mine.toc"), "## Interface: 110000\n## Title: Mine\n").unwrap();
+    fs::write(
+        folder.join("Mine.toc"),
+        "## Interface: 110000\n## Title: Mine\n",
+    )
+    .unwrap();
     rig.site.publish(&catalog_of(Vec::new()));
 
     let mut h = rig.launch_settled();
@@ -647,8 +689,9 @@ fn drop_file(h: &mut Harness<'static, Option<App>>, path: PathBuf) {
 #[test]
 fn a_dropped_zip_installs_safely_and_is_tracked_as_local() {
     let rig = Rig::new();
-    rig.site
-        .publish(&catalog_of(vec![publish_addon(&rig.site, FOO, "Foo", "1.0")]));
+    rig.site.publish(&catalog_of(vec![publish_addon(
+        &rig.site, FOO, "Foo", "1.0",
+    )]));
     let zip = rig.home.path().join("Dropped.zip");
     fs::write(&zip, addon_zip("Dropped", "3.1")).unwrap();
     let not_zip = rig.home.path().join("notes.txt");
@@ -675,16 +718,23 @@ fn a_dropped_zip_installs_safely_and_is_tracked_as_local() {
     // Its page has no main button to press, only Remove.
     click(&mut h, "My Addons");
     click(&mut h, "Dropped, 3.1");
-    assert_eq!(app(&h).page_kind(), PageKind::Addon("local:Dropped".to_owned()));
+    assert_eq!(
+        app(&h).page_kind(),
+        PageKind::Addon("local:Dropped".to_owned())
+    );
     assert!(!has_label(&h, "Install") && !has_label(&h, "Reinstall"));
-    assert!(has_label(&h, "Installed from a zip file, so it doesn't get updates."));
+    assert!(has_label(
+        &h,
+        "Installed from a zip file, so it doesn't get updates."
+    ));
 }
 
 #[test]
 fn a_zip_dropped_over_a_catalog_addon_takes_its_place() {
     let rig = Rig::new();
-    rig.site
-        .publish(&catalog_of(vec![publish_addon(&rig.site, FOO, "Foo", "1.0")]));
+    rig.site.publish(&catalog_of(vec![publish_addon(
+        &rig.site, FOO, "Foo", "1.0",
+    )]));
     let mut h = rig.launch_settled();
     click(&mut h, "Install");
     finish_ops(&mut h);
@@ -694,7 +744,10 @@ fn a_zip_dropped_over_a_catalog_addon_takes_its_place() {
     drop_file(&mut h, zip);
     finish_ops(&mut h);
     assert_eq!(rig.version_on_disk("Foo").as_deref(), Some("9.9"));
-    assert!(managed(&h, FOO).is_none(), "no more updates for what's been replaced");
+    assert!(
+        managed(&h, FOO).is_none(),
+        "no more updates for what's been replaced"
+    );
     assert_eq!(managed(&h, "local:Foo").unwrap().version, "9.9");
 }
 
@@ -703,19 +756,42 @@ fn required_addons_land_first_and_missing_ones_warn() {
     let rig = Rig::new();
     let foo = publish_addon(&rig.site, FOO, "Foo", "1.0");
     let mut bar = publish_addon(&rig.site, BAR, "Bar", "1.0");
-    bar.deps = vec!["Foo".to_owned(), "NotInCatalog".to_owned(), "Blizzard_Thing".to_owned()];
+    bar.deps = vec![
+        "Foo".to_owned(),
+        "NotInCatalog".to_owned(),
+        "Blizzard_Thing".to_owned(),
+    ];
     let mut catalog = catalog_of(vec![bar, foo]);
     catalog.featured = vec![BAR.to_owned()];
     rig.site.publish(&catalog);
 
     let mut h = rig.launch_settled();
     click(&mut h, "Bar Addon, 1.0");
-    assert!(has_label(&h, "Foo Addon"), "Requires shows it by name, as a link");
+    assert!(
+        has_label(&h, "Foo Addon"),
+        "Requires shows it by name, as a link"
+    );
     click(&mut h, "Install");
-    let texts: Vec<String> = app(&h).messages.texts().iter().map(|s| (*s).to_owned()).collect();
-    assert!(texts.iter().any(|t| t.contains("requires NotInCatalog")), "{texts:?}");
-    assert!(texts.iter().any(|t| t.contains("requires Foo Addon, so that installs first")), "{texts:?}");
-    assert!(!texts.iter().any(|t| t.contains("Blizzard")), "the game's own never count");
+    let texts: Vec<String> = app(&h)
+        .messages
+        .texts()
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
+    assert!(
+        texts.iter().any(|t| t.contains("requires NotInCatalog")),
+        "{texts:?}"
+    );
+    assert!(
+        texts
+            .iter()
+            .any(|t| t.contains("requires Foo Addon, so that installs first")),
+        "{texts:?}"
+    );
+    assert!(
+        !texts.iter().any(|t| t.contains("Blizzard")),
+        "the game's own never count"
+    );
     finish_ops(&mut h);
     assert!(rig.addons().join("Foo").exists());
     assert!(rig.addons().join("Bar").exists());
@@ -761,7 +837,10 @@ fn update_all_backs_up_settings_first_and_counts_on_the_bar() {
     assert_eq!(app(&h).casting().unwrap().text, "Installing 1 of 4");
     finish_ops(&mut h);
     let backups = rig.dirs.backups();
-    assert!(!backups.exists(), "installing isn't updating, so no backup yet");
+    assert!(
+        !backups.exists(),
+        "installing isn't updating, so no backup yet"
+    );
     close(h);
 
     let v2: Vec<Addon> = names
@@ -773,7 +852,10 @@ fn update_all_backs_up_settings_first_and_counts_on_the_bar() {
     assert!(has_label(&h, "Update all (4)"));
     click(&mut h, "Update all (4)");
     let cast = app(&h).casting().unwrap();
-    assert_eq!(cast.text, "Backing up your settings", "the bar shows the backup first");
+    assert_eq!(
+        cast.text, "Backing up your settings",
+        "the bar shows the backup first"
+    );
     finish_ops(&mut h);
     for name in names {
         assert_eq!(rig.version_on_disk(name).as_deref(), Some("2.0"));
@@ -790,8 +872,9 @@ fn update_all_backs_up_settings_first_and_counts_on_the_bar() {
 #[test]
 fn no_game_asks_for_a_folder_and_then_carries_on_with_the_install() {
     let rig = Rig::new();
-    rig.site
-        .publish(&catalog_of(vec![publish_addon(&rig.site, FOO, "Foo", "1.0")]));
+    rig.site.publish(&catalog_of(vec![publish_addon(
+        &rig.site, FOO, "Foo", "1.0",
+    )]));
     let launch = Launch {
         game: Some(rig.home.path().join("nowhere")),
         test_rig: true,
@@ -811,35 +894,49 @@ fn no_game_asks_for_a_folder_and_then_carries_on_with_the_install() {
 
     click(&mut h, "Browse");
     click(&mut h, "Install");
-    assert!(matches!(app(&h).popup, Some(Popup::Folder(_))), "asks for a folder first");
+    assert!(
+        matches!(app(&h).popup, Some(Popup::Folder(_))),
+        "asks for a folder first"
+    );
     assert!(!rig.addons().join("Foo").exists());
 
     // Walk to the game with the built-in browser.
     let bad = rig.home.path().to_path_buf();
     app_mut(&mut h).actions.push(Action::BrowseTo(bad));
-    pump(&mut h, "the listing", |a| {
-        matches!(&a.popup, Some(Popup::Folder(b)) if b.waiting_for.is_none())
-    });
+    pump(
+        &mut h,
+        "the listing",
+        |a| matches!(&a.popup, Some(Popup::Folder(b)) if b.waiting_for.is_none()),
+    );
     assert!(has_label(&h, "World of Warcraft"), "subfolders are listed");
     assert!(
-        h.get_by_label("Use this folder").accesskit_node().is_disabled(),
+        h.get_by_label("Use this folder")
+            .accesskit_node()
+            .is_disabled(),
         "this folder isn't the game, so it can't be used"
     );
     click(&mut h, "World of Warcraft");
-    pump(&mut h, "the listing", |a| {
-        matches!(&a.popup, Some(Popup::Folder(b)) if b.waiting_for.is_none())
-    });
+    pump(
+        &mut h,
+        "the listing",
+        |a| matches!(&a.popup, Some(Popup::Folder(b)) if b.waiting_for.is_none()),
+    );
     click(&mut h, "Use this folder");
     finish_ops(&mut h);
-    assert_eq!(rig.version_on_disk("Foo").as_deref(), Some("1.0"), "and the install carried on");
+    assert_eq!(
+        rig.version_on_disk("Foo").as_deref(),
+        Some("1.0"),
+        "and the install carried on"
+    );
     assert!(matches!(app(&h).game_state, GameState::Found { .. }));
 }
 
 #[test]
 fn cancelling_the_folder_browser_drops_the_request() {
     let rig = Rig::new();
-    rig.site
-        .publish(&catalog_of(vec![publish_addon(&rig.site, FOO, "Foo", "1.0")]));
+    rig.site.publish(&catalog_of(vec![publish_addon(
+        &rig.site, FOO, "Foo", "1.0",
+    )]));
     let launch = Launch {
         game: Some(rig.home.path().join("nowhere")),
         test_rig: true,
@@ -859,15 +956,19 @@ fn cancelling_the_folder_browser_drops_the_request() {
 fn a_catalog_that_is_not_published_yet_is_handled_honestly() {
     let rig = Rig::new();
     let mut h = rig.launch_settled();
-    assert_eq!(app(&h).catalog_status, CatalogStatus::Missing { offline: false });
+    assert_eq!(
+        app(&h).catalog_status,
+        CatalogStatus::Missing { offline: false }
+    );
     assert_eq!(app(&h).page_kind(), PageKind::NoCatalog);
     assert!(has_label(&h, "No catalog yet."));
     assert!(app(&h).status_text().ends_with("No catalog yet"));
     assert!(has_label(&h, "Try again"));
 
     // It appears, and Try again finds it.
-    rig.site
-        .publish(&catalog_of(vec![publish_addon(&rig.site, FOO, "Foo", "1.0")]));
+    rig.site.publish(&catalog_of(vec![publish_addon(
+        &rig.site, FOO, "Foo", "1.0",
+    )]));
     click(&mut h, "Try again");
     settle(&mut h);
     assert_eq!(app(&h).catalog_status, CatalogStatus::Fresh);
@@ -890,14 +991,18 @@ fn first_run_offline_says_so_and_a_cached_catalog_keeps_working() {
     };
     let mut h = harness(launch(), rig.dirs.clone(), rig.saved_state());
     settle(&mut h);
-    assert_eq!(app(&h).catalog_status, CatalogStatus::Missing { offline: true });
+    assert_eq!(
+        app(&h).catalog_status,
+        CatalogStatus::Missing { offline: true }
+    );
     assert!(has_label(&h, "You're offline."));
     assert!(app(&h).status_text().ends_with("Offline, no catalog yet"));
     close(h);
 
     // Fetch it once while online, then go offline again.
-    rig.site
-        .publish(&catalog_of(vec![publish_addon(&rig.site, FOO, "Foo", "1.0")]));
+    rig.site.publish(&catalog_of(vec![publish_addon(
+        &rig.site, FOO, "Foo", "1.0",
+    )]));
     let h = rig.launch_settled();
     assert_eq!(app(&h).catalog_status, CatalogStatus::Fresh);
     close(h);
@@ -906,15 +1011,20 @@ fn first_run_offline_says_so_and_a_cached_catalog_keeps_working() {
     let mut h = harness(launch(), rig.dirs.clone(), rig.saved_state());
     settle(&mut h);
     assert_eq!(app(&h).catalog_status, CatalogStatus::Offline);
-    assert!(app(&h).status_text().ends_with("Offline, showing the last catalog"));
+    assert!(
+        app(&h)
+            .status_text()
+            .ends_with("Offline, showing the last catalog")
+    );
     assert!(has_label(&h, "Foo Addon, 1.0"));
 }
 
 #[test]
 fn an_unchanged_catalog_costs_one_answer_and_keeps_the_cache() {
     let rig = Rig::new();
-    rig.site
-        .publish(&catalog_of(vec![publish_addon(&rig.site, FOO, "Foo", "1.0")]));
+    rig.site.publish(&catalog_of(vec![publish_addon(
+        &rig.site, FOO, "Foo", "1.0",
+    )]));
     let h = rig.launch_settled();
     assert_eq!(app(&h).catalog_status, CatalogStatus::Fresh);
     close(h);
@@ -958,7 +1068,11 @@ fn starter_kits_and_gaps_work_end_to_end() {
     click(&mut h, "Bigger Thing, not here");
     assert_eq!(app(&h).page_kind(), PageKind::Gap(0));
     assert!(has_label(&h, "Not available here"));
-    assert!(h.get_by_label("Open its page").accesskit_node().is_disabled());
+    assert!(
+        h.get_by_label("Open its page")
+            .accesskit_node()
+            .is_disabled()
+    );
     click(&mut h, "Foo Addon, installed");
     assert_eq!(app(&h).page_kind(), PageKind::Addon(FOO.to_owned()));
 }
@@ -975,8 +1089,15 @@ fn links_only_reach_the_browser_when_they_are_web_addresses() {
             .filter(|c| matches!(c, OutputCommand::OpenUrl(_)))
             .count()
     };
-    for bad in ["file:///c:/windows", "steam://run/1", "javascript:alert(1)", "example.com"] {
-        app_mut(&mut h).actions.push(Action::OpenLink(bad.to_owned()));
+    for bad in [
+        "file:///c:/windows",
+        "steam://run/1",
+        "javascript:alert(1)",
+        "example.com",
+    ] {
+        app_mut(&mut h)
+            .actions
+            .push(Action::OpenLink(bad.to_owned()));
         // Applied at the end of this frame, so the command goes out with the same output.
         h.step();
         assert_eq!(opened(&h), 0, "{bad} must not open");
@@ -1007,7 +1128,10 @@ fn the_demo_stays_offline_and_writes_nothing() {
     click(&mut h, "Questie, v12.6.2");
     click(&mut h, "Roll back to v12.5.9");
     finish_ops(&mut h);
-    assert_eq!(managed(&h, "gh:Questie/Questie").unwrap().version, "v12.5.9");
+    assert_eq!(
+        managed(&h, "gh:Questie/Questie").unwrap().version,
+        "v12.5.9"
+    );
     click(&mut h, "Remove");
     click_last(&mut h, "Remove");
     finish_ops(&mut h);
@@ -1059,7 +1183,7 @@ fn every_settings_page_draws_and_can_be_operated() {
     click(&mut h, "Settings");
     h.run();
     assert_eq!(app(&h).section, Section::Game);
-    assert!(has_label(&h, "Game folder") && has_label(&h, "Found through Battle.net"));
+    assert!(has_label(&h, "Game folder") && has_label(&h, "Through Battle.net"));
 
     click(&mut h, "Backups");
     assert_eq!(app(&h).section, Section::Backups);
@@ -1083,12 +1207,21 @@ fn every_settings_page_draws_and_can_be_operated() {
     finish_ops(&mut h);
 
     click(&mut h, "Addon lists");
-    assert!(h.get_by_label("Install these").accesskit_node().is_disabled());
+    assert!(
+        h.get_by_label("Install these")
+            .accesskit_node()
+            .is_disabled()
+    );
     click(&mut h, "Copy my list");
-    let copied = h.output().platform_output.commands.iter().any(|c| {
-        matches!(c, OutputCommand::CopyText(text) if text.contains("gh:Questie/Questie"))
-    });
-    let said = app(&h).messages.texts().iter().any(|t| t.starts_with("Copied your list"));
+    let copied =
+        h.output().platform_output.commands.iter().any(
+            |c| matches!(c, OutputCommand::CopyText(text) if text.contains("gh:Questie/Questie")),
+        );
+    let said = app(&h)
+        .messages
+        .texts()
+        .iter()
+        .any(|t| t.starts_with("Copied your list"));
     assert!(copied || said, "the list goes to the clipboard");
 
     app_mut(&mut h).list_text =
@@ -1108,7 +1241,11 @@ fn every_settings_page_draws_and_can_be_operated() {
         )]
     );
     assert_eq!(preview.have, vec!["Questie".to_owned()]);
-    assert_eq!(preview.unknown.len(), 2, "unknown ids and strange lines are shown, not run");
+    assert_eq!(
+        preview.unknown.len(),
+        2,
+        "unknown ids and strange lines are shown, not run"
+    );
     click_last(&mut h, "Install these");
     finish_ops(&mut h);
     assert_eq!(
@@ -1224,7 +1361,9 @@ fn the_keyboard_alone_can_drive_the_list() {
     assert!(app(&h).casting().is_some());
     finish_ops(&mut h);
     assert_eq!(
-        managed(&h, "gh:DeadlyBossMods/DeadlyBossMods").unwrap().version,
+        managed(&h, "gh:DeadlyBossMods/DeadlyBossMods")
+            .unwrap()
+            .version,
         "12.0.4"
     );
 
@@ -1237,10 +1376,16 @@ fn the_keyboard_alone_can_drive_the_list() {
     type_text(&mut h, "pawn");
     assert_eq!(app(&h).query, "pawn");
     assert_eq!(app(&h).rows.len(), 2, "its header, and the one row");
-    assert_eq!(selected(&h), Some(Selection::Addon("gh:VgerMods/Pawn".to_owned())));
+    assert_eq!(
+        selected(&h),
+        Some(Selection::Addon("gh:VgerMods/Pawn".to_owned()))
+    );
     press(&mut h, Key::Enter);
     assert!(h.ctx.memory(|m| m.focused()).is_none());
-    assert!(app(&h).casting().is_none(), "no install from pressing Enter in search");
+    assert!(
+        app(&h).casting().is_none(),
+        "no install from pressing Enter in search"
+    );
     press(&mut h, Key::Escape);
     assert_eq!(app(&h).query, "");
     assert!(app(&h).rows.len() > 5);
@@ -1252,7 +1397,10 @@ fn the_keyboard_alone_can_drive_the_list() {
     press(&mut h, Key::Escape);
     assert_eq!(app(&h).query, "");
     press(&mut h, Key::Escape);
-    assert!(h.ctx.memory(|m| m.focused()).is_none(), "a second Escape lets go");
+    assert!(
+        h.ctx.memory(|m| m.focused()).is_none(),
+        "a second Escape lets go"
+    );
 }
 
 #[test]
@@ -1271,11 +1419,29 @@ fn slash_commands_do_what_they_say_and_clear_the_box() {
     };
 
     command(&mut h, "/help");
-    assert!(app(&h).messages.texts().iter().any(|t| t.starts_with("Commands:")));
+    assert!(
+        app(&h)
+            .messages
+            .texts()
+            .iter()
+            .any(|t| t.starts_with("Commands:"))
+    );
     command(&mut h, "/played");
-    assert!(app(&h).messages.texts().iter().any(|t| t.starts_with("Time spent")));
+    assert!(
+        app(&h)
+            .messages
+            .texts()
+            .iter()
+            .any(|t| t.starts_with("Time spent"))
+    );
     command(&mut h, "/nonsense");
-    assert!(app(&h).messages.texts().iter().any(|t| t.contains("Try /help")));
+    assert!(
+        app(&h)
+            .messages
+            .texts()
+            .iter()
+            .any(|t| t.contains("Try /help"))
+    );
 
     command(&mut h, "/dance");
     assert!(app(&h).fun.is_dancing(Instant::now()));
@@ -1288,7 +1454,10 @@ fn slash_commands_do_what_they_say_and_clear_the_box() {
     assert!(app(&h).messages.texts().contains(&"Ding!"));
     command(&mut h, "/pwnage");
     assert!(app(&h).fun.pwnage_showing(Instant::now()));
-    assert!(has_label(&h, "Watch the video"), "the link is in a yellow message");
+    assert!(
+        has_label(&h, "Watch the video"),
+        "the link is in a yellow message"
+    );
     command(&mut h, "/reload");
     assert!(app(&h).messages.texts().contains(&"Reloading your addons."));
     command(&mut h, "/feeling");
@@ -1314,7 +1483,10 @@ fn sorting_and_collapsing_rebuild_the_list() {
     click(&mut h, "Browse");
     assert!(has_label(&h, "Starter kits (2)"));
     assert!(has_label(&h, "Quests and Leveling (4)"));
-    assert!(!has_label(&h, "RestedXP Guide, 4.9.1"), "categories start closed");
+    assert!(
+        !has_label(&h, "RestedXP Guide, 4.9.1"),
+        "categories start closed"
+    );
     click(&mut h, "Quests and Leveling (4)");
     assert!(has_label(&h, "RestedXP Guide, 4.9.1"));
     click(&mut h, "Quests and Leveling (4)");
@@ -1331,6 +1503,271 @@ fn sorting_and_collapsing_rebuild_the_list() {
     // Sort only shows on Browse.
     click(&mut h, "My Addons");
     assert!(!has_label(&h, "Sort by: A to Z"));
+}
+
+#[test]
+fn escape_closes_an_open_menu_without_touching_the_search() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = demo_harness(Scene::Normal, dir.path());
+    click(&mut h, "Browse");
+    app_mut(&mut h).query = "boss".to_owned();
+    app_mut(&mut h).mark_rows_dirty();
+    h.step();
+    click(&mut h, "Sort by: Most popular");
+    assert!(has_label(&h, "A to Z"));
+    press(&mut h, Key::Escape);
+    assert!(!has_label(&h, "A to Z"), "the menu closed");
+    assert_eq!(app(&h).query, "boss", "and the search is still there");
+}
+
+#[test]
+fn a_long_list_only_draws_what_shows_and_the_arrows_scroll_it() {
+    let rig = Rig::new();
+    let addons: Vec<Addon> = (0..400)
+        .map(|i| {
+            let mut addon = publish_addon(
+                &rig.site,
+                &format!("direct:A{i}"),
+                &format!("A{i:03}"),
+                "1.0",
+            );
+            addon.downloads = 1000 - i;
+            addon
+        })
+        .collect();
+    let mut catalog = catalog_of(addons);
+    catalog.featured.clear();
+    rig.site.publish(&catalog);
+
+    let mut h = rig.launch_settled();
+    click(&mut h, "Everything Else (400)");
+    h.step();
+    assert_eq!(app(&h).rows.len(), 401);
+    let drawn = h
+        .query_all_by_role(egui::accesskit::Role::Button)
+        .filter(|node| {
+            node.accesskit_node()
+                .label()
+                .is_some_and(|l| l.starts_with("A0") || l.starts_with("A1"))
+        })
+        .count();
+    assert!(drawn < 40, "only the visible rows exist, but {drawn} do");
+
+    assert!(
+        !has_label(&h, "A100 Addon, 1.0"),
+        "too far down to be drawn yet"
+    );
+    for _ in 0..100 {
+        h.key_press(Key::ArrowDown);
+        h.step();
+    }
+    h.step();
+    assert_eq!(
+        app(&h).selection(),
+        Some(&Selection::Addon("direct:A100".to_owned()))
+    );
+    assert!(
+        has_label(&h, "A100 Addon, 1.0"),
+        "the list followed the selection"
+    );
+    assert!(app(&h).list_offset > 0.0);
+    assert!(
+        !has_label(&h, "A000 Addon, 1.0"),
+        "and the top has scrolled away"
+    );
+
+    // Back up past where the view starts.
+    for _ in 0..100 {
+        h.key_press(Key::ArrowUp);
+        h.step();
+    }
+    h.step();
+    assert!(has_label(&h, "A000 Addon, 1.0"));
+}
+
+#[test]
+fn switching_a_managed_addon_to_beta_offers_the_beta() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = demo_harness(Scene::Normal, dir.path());
+    click(&mut h, "Questie, update");
+    assert!(has_label(&h, "v12.5.9 installed, v12.6.2 available"));
+    click(&mut h, "Use beta versions");
+    assert_eq!(
+        managed(&h, "gh:Questie/Questie").unwrap().channel,
+        Channel::Beta
+    );
+    h.step();
+    assert!(has_label(&h, "v12.5.9 installed, v12.7.0-beta available"));
+
+    // An addon with no beta at all has nothing to switch to.
+    click(&mut h, "Bartender4, 4.18.4");
+    assert!(
+        h.get_by_label("Use beta versions")
+            .accesskit_node()
+            .is_disabled()
+    );
+}
+
+#[test]
+fn a_new_install_can_choose_beta_first() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = demo_harness(Scene::Empty, dir.path());
+    click(&mut h, "Browse");
+    click(&mut h, "Questie, v12.6.2");
+    assert!(
+        h.get_by_label("Don't update this addon")
+            .accesskit_node()
+            .is_disabled(),
+        "there's nothing to pin until it's installed"
+    );
+    click(&mut h, "Use beta versions");
+    click(&mut h, "Install");
+    finish_ops(&mut h);
+    let record = managed(&h, "gh:Questie/Questie").unwrap();
+    assert_eq!(record.channel, Channel::Beta);
+    assert_eq!(record.version, "v12.7.0-beta");
+}
+
+#[test]
+fn a_kept_zip_that_went_missing_takes_rollback_with_it() {
+    let rig = Rig::new();
+    rig.site.publish(&catalog_of(vec![publish_addon(
+        &rig.site, FOO, "Foo", "1.0",
+    )]));
+    let mut h = rig.launch_settled();
+    click(&mut h, "Install");
+    finish_ops(&mut h);
+    close(h);
+    rig.site.publish(&catalog_of(vec![publish_addon(
+        &rig.site, FOO, "Foo", "2.0",
+    )]));
+    let mut h = rig.launch_settled();
+    click(&mut h, "Foo Addon, update");
+    click(&mut h, "Update");
+    finish_ops(&mut h);
+    assert!(has_label(&h, "Roll back to 1.0"));
+
+    let zip = managed(&h, FOO).unwrap().previous_zip.clone().unwrap();
+    fs::remove_file(zip).unwrap();
+    app_mut(&mut h).run_slash("/reload");
+    settle(&mut h);
+    assert!(!has_label(&h, "Roll back to 1.0"));
+    assert_eq!(managed(&h, FOO).unwrap().previous_version, None);
+}
+
+#[test]
+fn with_keep_previous_off_nothing_is_kept_for_rollback() {
+    let rig = Rig::new();
+    rig.set_up_state(|state| state.settings.keep_previous_version = false);
+    rig.site.publish(&catalog_of(vec![publish_addon(
+        &rig.site, FOO, "Foo", "1.0",
+    )]));
+    let mut h = rig.launch_settled();
+    click(&mut h, "Install");
+    finish_ops(&mut h);
+    close(h);
+    rig.site.publish(&catalog_of(vec![publish_addon(
+        &rig.site, FOO, "Foo", "2.0",
+    )]));
+    let mut h = rig.launch_settled();
+    click(&mut h, "Foo Addon, update");
+    click(&mut h, "Update");
+    finish_ops(&mut h);
+    assert_eq!(rig.version_on_disk("Foo").as_deref(), Some("2.0"));
+    assert!(!has_label(&h, "Roll back to 1.0"));
+    assert!(!rig.dirs.cache.join("zips").exists());
+}
+
+#[test]
+fn worker_reports_reach_the_player_in_the_right_color() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = demo_harness(Scene::Normal, dir.path());
+    let worker = app(&h).worker.clone();
+    worker.send(Event::GameRunning(true));
+    worker.send(Event::Recovered(Ok(vec![
+        "An interrupted install was undone.".to_owned(),
+    ])));
+    worker.send(Event::Recovered(Err("A file stays locked.".to_owned())));
+    h.step();
+    h.step();
+    h.step();
+    let texts = app(&h).messages.texts();
+    assert!(texts.iter().any(|t| {
+        *t == "WoW is running. Type /reload in game to load updates. New addons appear after restarting the game."
+    }));
+    assert!(texts.contains(&"An interrupted install was undone."));
+    assert!(texts.contains(&"A file stays locked."));
+    assert!(
+        has_label(&h, "A file stays locked."),
+        "screen readers hear them too"
+    );
+    worker.send(Event::GameRunning(false));
+    h.step();
+}
+
+#[test]
+fn a_failed_launch_check_says_nothing_and_a_manual_one_says_why() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = demo_harness(Scene::Normal, dir.path());
+    let worker = app(&h).worker.clone();
+    worker.send(Event::UpdateCheck {
+        manual: false,
+        result: Err("Couldn't verify this update's signature.".to_owned()),
+    });
+    h.step();
+    assert!(app(&h).messages.texts().is_empty(), "silent at launch");
+    assert!(app(&h).popup.is_none());
+
+    worker.send(Event::UpdateCheck {
+        manual: true,
+        result: Err("Couldn't verify this update's signature.".to_owned()),
+    });
+    h.step();
+    assert_eq!(
+        app(&h).messages.texts(),
+        vec!["Couldn't verify this update's signature."]
+    );
+
+    // A version the player skipped stays quiet at launch, but Check now still shows it.
+    app_mut(&mut h).state.skip_app_version = Some("0.2.0".to_owned());
+    let found = || Ok(Some(Box::new(demo::update_info())));
+    worker.send(Event::UpdateCheck {
+        manual: false,
+        result: found(),
+    });
+    h.step();
+    assert!(app(&h).popup.is_none());
+    worker.send(Event::UpdateCheck {
+        manual: true,
+        result: found(),
+    });
+    h.step();
+    assert!(matches!(app(&h).popup, Some(Popup::AppUpdate(_))));
+}
+
+#[test]
+fn a_popup_waits_its_turn_behind_another() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = demo_harness(Scene::Normal, dir.path());
+    click(&mut h, "Remove");
+    assert!(matches!(app(&h).popup, Some(Popup::Remove(_))));
+    let worker = app(&h).worker.clone();
+    worker.send(Event::UpdateCheck {
+        manual: false,
+        result: Ok(Some(Box::new(demo::update_info()))),
+    });
+    h.step();
+    h.step();
+    assert!(
+        matches!(app(&h).popup, Some(Popup::Remove(_))),
+        "one at a time"
+    );
+    press(&mut h, Key::Escape);
+    h.step();
+    assert!(
+        matches!(app(&h).popup, Some(Popup::AppUpdate(_))),
+        "then the next"
+    );
 }
 
 #[test]
@@ -1372,11 +1809,14 @@ fn nothing_asks_for_a_frame_while_idle() {
     quiet(&h);
 
     let rig = Rig::new();
-    rig.site
-        .publish(&catalog_of(vec![publish_addon(&rig.site, FOO, "Foo", "1.0")]));
+    rig.site.publish(&catalog_of(vec![publish_addon(
+        &rig.site, FOO, "Foo", "1.0",
+    )]));
     let mut h = rig.launch_settled();
     h.run();
-    pump(&mut h, "the details pause", |a| a.details.next_wake(Instant::now()).is_none());
+    pump(&mut h, "the details pause", |a| {
+        a.details.next_wake(Instant::now()).is_none()
+    });
     h.run();
     quiet(&h);
 }
@@ -1386,7 +1826,8 @@ fn messages_fade_and_only_then_stop_asking_for_frames() {
     let dir = tempfile::tempdir().unwrap();
     let mut h = demo_harness(Scene::Normal, dir.path());
     app_mut(&mut h).yellow("Hello");
-    h.step();
+    // A new message's first frames are busy, and then it should go quiet.
+    h.run();
     let delay = h.output().viewport_output[&ViewportId::ROOT].repaint_delay;
     assert!(
         delay > Duration::from_secs(4) && delay <= Duration::from_secs(5),
@@ -1400,9 +1841,15 @@ fn only_one_copy_can_hold_the_lock() {
     let state_file = dir.path().join("config").join("state.json");
     let first = crate::take_lock(&state_file);
     assert!(first.is_some());
-    assert!(crate::take_lock(&state_file).is_none(), "the second copy is told");
+    assert!(
+        crate::take_lock(&state_file).is_none(),
+        "the second copy is told"
+    );
     drop(first);
-    assert!(crate::take_lock(&state_file).is_some(), "and it's free once the first has gone");
+    assert!(
+        crate::take_lock(&state_file).is_some(),
+        "and it's free once the first has gone"
+    );
 }
 
 #[test]
@@ -1426,7 +1873,11 @@ fn a_second_copy_shows_only_the_already_running_popup() {
         .build_ui_state(
             move |ui, slot: &mut Option<App>| {
                 let app = slot.get_or_insert_with(|| {
-                    App::new(ui.ctx(), launch_slot.take().unwrap(), startup.take().unwrap())
+                    App::new(
+                        ui.ctx(),
+                        launch_slot.take().unwrap(),
+                        startup.take().unwrap(),
+                    )
                 });
                 app.logic();
                 app.draw(ui);
@@ -1438,10 +1889,16 @@ fn a_second_copy_shows_only_the_already_running_popup() {
     assert!(has_label(&h, "WoW is a Feeling is already running."));
     assert!(has_label(&h, "Close"));
     press(&mut h, Key::Escape);
-    assert!(matches!(app(&h).popup, Some(Popup::AlreadyRunning)), "nothing to go back to");
+    assert!(
+        matches!(app(&h).popup, Some(Popup::AlreadyRunning)),
+        "nothing to go back to"
+    );
     drop(h);
     let wrote: Vec<_> = fs::read_dir(dir.path()).unwrap().flatten().collect();
-    assert!(wrote.is_empty(), "a second copy starts no jobs and writes nothing: {wrote:?}");
+    assert!(
+        wrote.is_empty(),
+        "a second copy starts no jobs and writes nothing: {wrote:?}"
+    );
 }
 
 #[test]
@@ -1452,7 +1909,11 @@ fn a_finished_session_saves_its_window_and_its_time() {
     app_mut(&mut h).shut_down();
     let state = rig.saved_state();
     assert!(state.current_install.is_some());
-    assert!(state.installs.contains_key(state.current_install.as_ref().unwrap()));
+    assert!(
+        state
+            .installs
+            .contains_key(state.current_install.as_ref().unwrap())
+    );
 }
 
 #[test]
@@ -1467,7 +1928,12 @@ fn closing_mid_download_cancels_it_without_a_trace() {
     });
     app_mut(&mut h).shut_down();
     assert!(!rig.addons().join("Foo").exists());
-    assert!(rig.saved_state().installs.values().all(|i| i.managed.is_empty()));
+    assert!(
+        rig.saved_state()
+            .installs
+            .values()
+            .all(|i| i.managed.is_empty())
+    );
 }
 
 #[test]

@@ -174,11 +174,7 @@ impl Fun {
                     _ => continue,
                 };
                 let at = origin + vec2(col as f32 * SCALE, row as f32 * SCALE);
-                painter.rect_filled(
-                    Rect::from_min_size(at, vec2(SCALE, SCALE)),
-                    0.0,
-                    color,
-                );
+                painter.rect_filled(Rect::from_min_size(at, vec2(SCALE, SCALE)), 0.0, color);
             }
         }
         let rect = Rect::from_min_size(origin, vec2(w, h));
@@ -213,7 +209,10 @@ fn paint_pwnage(painter: &egui::Painter, full: Rect) {
     let columns = 6.0 * 5.0 + 5.0;
     let cell = (full.width() * 0.8 / columns).floor().clamp(4.0, 24.0);
     let word = vec2(columns * cell, 7.0 * cell);
-    let top_left = pos2(full.center().x - word.x / 2.0, full.center().y - word.y / 2.0);
+    let top_left = pos2(
+        full.center().x - word.x / 2.0,
+        full.center().y - word.y / 2.0,
+    );
     let plate = Rect::from_min_size(top_left, word).expand(cell * 1.5);
     painter.rect_filled(plate, 4.0, Color32::from_black_alpha(225));
     painter.rect_stroke(
@@ -225,12 +224,13 @@ fn paint_pwnage(painter: &egui::Painter, full: Rect) {
     let blocks = || {
         LETTERS.iter().enumerate().flat_map(move |(index, letter)| {
             letter.iter().enumerate().flat_map(move |(row, line)| {
-                line.bytes().enumerate().filter_map(move |(col, block)| {
-                    (block == b'#').then(|| {
+                line.bytes()
+                    .enumerate()
+                    .filter(|(_, block)| *block == b'#')
+                    .map(move |(col, _)| {
                         let x = (index * 6 + col) as f32 * cell;
                         Rect::from_min_size(top_left + vec2(x, row as f32 * cell), vec2(cell, cell))
                     })
-                })
             })
         })
     };

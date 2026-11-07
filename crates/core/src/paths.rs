@@ -87,7 +87,10 @@ mod tests {
                 under_home(Some("test-home".into()), base(), kind),
                 Path::new("test-home").join(kind)
             );
-            assert_eq!(under_home(Some("".into()), base(), kind), app_dir(base(), kind));
+            assert_eq!(
+                under_home(Some("".into()), base(), kind),
+                app_dir(base(), kind)
+            );
             assert_eq!(under_home(None, base(), kind), app_dir(base(), kind));
         }
     }

@@ -218,7 +218,11 @@ mod tests {
         fetched(&mut cache, "a", now);
         cache.select("b", now);
         cache.select("a", now);
-        assert_eq!(cache.next_wake(now), None, "a is ready, and b's wait is over");
+        assert_eq!(
+            cache.next_wake(now),
+            None,
+            "a is ready, and b's wait is over"
+        );
     }
 
     #[test]

@@ -4,9 +4,7 @@ use crate::skin::{self, shadow_text};
 use crate::theme;
 use eframe::egui::{
     self, Align2, Color32, CursorIcon, Rect, Response, Sense, Stroke, StrokeKind, TextFormat, Ui,
-    Vec2, pos2,
-    text::LayoutJob,
-    vec2,
+    Vec2, pos2, text::LayoutJob, vec2,
 };
 
 /// What kind of red button this is. `Quiet` is the brown one beside a main action.
@@ -301,6 +299,12 @@ pub fn tooltip_colored(ui: &mut Ui, text: &str, color: Color32) {
     );
 }
 
+/// Tell a screen reader about text that's only painted.
+pub fn read_aloud(ui: &mut Ui, rect: Rect, id: &str, text: &str) {
+    let response = ui.interact(rect, ui.scope_id().with(("read", id)), Sense::hover());
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Label, true, text));
+}
+
 /// How wide [`button`] would make this label.
 pub fn button_width(ui: &Ui, text: &str) -> f32 {
     let galley = ui.painter().layout_job(mixed_job(text, 14.0, theme::GOLD));
@@ -318,9 +322,15 @@ pub fn toggle_box(painter: &egui::Painter, center: egui::Pos2, open: bool) {
         StrokeKind::Inside,
     );
     let s = Stroke::new(1.5, theme::GOLD);
-    painter.line_segment([b.center() - vec2(3.5, 0.0), b.center() + vec2(3.5, 0.0)], s);
+    painter.line_segment(
+        [b.center() - vec2(3.5, 0.0), b.center() + vec2(3.5, 0.0)],
+        s,
+    );
     if !open {
-        painter.line_segment([b.center() - vec2(0.0, 3.5), b.center() + vec2(0.0, 3.5)], s);
+        painter.line_segment(
+            [b.center() - vec2(0.0, 3.5), b.center() + vec2(0.0, 3.5)],
+            s,
+        );
     }
 }
 
@@ -398,7 +408,11 @@ fn paint_check(ui: &Ui, rect: Rect, on: bool, text: &str, enabled: bool, respons
         vec2(side, side),
     );
     let alpha = if enabled { 200 } else { 90 };
-    painter.rect_filled(boxed, 2.0, Color32::from_rgba_unmultiplied(40, 26, 10, alpha));
+    painter.rect_filled(
+        boxed,
+        2.0,
+        Color32::from_rgba_unmultiplied(40, 26, 10, alpha),
+    );
     let edge = if response.hovered() && enabled {
         theme::INK
     } else {
@@ -527,14 +541,10 @@ pub fn fact_with(ui: &mut Ui, key: &str, value: impl FnOnce(&mut Ui)) {
         vec2(width, 0.0),
         egui::Layout::left_to_right(egui::Align::TOP),
         |ui| {
-            let (key_rect, _) = ui.allocate_exact_size(vec2(KEY_WIDTH, 18.0), Sense::hover());
-            ui.painter().text(
-                key_rect.left_top() + vec2(0.0, 1.0),
-                Align2::LEFT_TOP,
-                key,
-                theme::label(14.5),
-                theme::INK_SOFT,
-            );
+            ui.allocate_ui(vec2(KEY_WIDTH, 18.0), |ui| {
+                ui.set_width(KEY_WIDTH);
+                ink(ui, key, theme::label(14.5), theme::INK_SOFT);
+            });
             ui.vertical(|ui| {
                 ui.set_max_width((width - KEY_WIDTH - 8.0).max(40.0));
                 value(ui);

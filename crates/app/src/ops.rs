@@ -59,11 +59,19 @@ pub enum OpKind {
         old_folders: Vec<String>,
     },
     /// A zip the player dropped on the window.
-    LocalZip { path: PathBuf },
-    Remove { folders: Vec<String> },
+    LocalZip {
+        path: PathBuf,
+    },
+    Remove {
+        folders: Vec<String>,
+    },
     BackupWtf,
-    RestoreWtf { zip: PathBuf },
-    SelfUpdate { update: Box<UpdateInfo> },
+    RestoreWtf {
+        zip: PathBuf,
+    },
+    SelfUpdate {
+        update: Box<UpdateInfo>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -400,7 +408,11 @@ pub fn main_folder(folders: &[String]) -> Option<&String> {
         (
             !core,
             name.len(),
-            folders.iter().filter(|o| o.starts_with(name.as_str())).count() == 0,
+            folders
+                .iter()
+                .filter(|o| o.starts_with(name.as_str()))
+                .count()
+                == 0,
         )
     })
 }
@@ -521,7 +533,11 @@ mod tests {
         q.push(a);
         q.push(backup);
         q.push(b);
-        assert_eq!(names(&q.start_ready()), vec!["a"], "b can't pass the backup");
+        assert_eq!(
+            names(&q.start_ready()),
+            vec!["a"],
+            "b can't pass the backup"
+        );
         q.finish(a_id);
         assert_eq!(names(&q.start_ready()), vec!["backup"]);
         assert!(q.start_ready().is_empty(), "nothing beside it");
@@ -616,7 +632,10 @@ mod tests {
             done: 50,
             total: None,
         };
-        assert!((stage_fraction(unknown, 100) - 0.4).abs() < 0.001, "catalog size");
+        assert!(
+            (stage_fraction(unknown, 100) - 0.4).abs() < 0.001,
+            "catalog size"
+        );
         let huge = Stage::Downloading {
             done: 500_000_000,
             total: None,
@@ -738,7 +757,10 @@ mod tests {
             let list: Vec<String> = list.iter().map(|s| (*s).to_owned()).collect();
             main_folder(&list).unwrap().clone()
         };
-        assert_eq!(name(&["DBM-GUI", "DBM-Core", "DBM-StatusBarTimers"]), "DBM-Core");
+        assert_eq!(
+            name(&["DBM-GUI", "DBM-Core", "DBM-StatusBarTimers"]),
+            "DBM-Core"
+        );
         assert_eq!(name(&["BigWigs", "BigWigs_Options"]), "BigWigs");
         assert_eq!(name(&["Solo"]), "Solo");
     }
@@ -751,7 +773,12 @@ mod tests {
         ]
         .into();
         assert_eq!(
-            stale_records(&managed, "local:Questie", Origin::LocalZip, &["Questie".to_owned()]),
+            stale_records(
+                &managed,
+                "local:Questie",
+                Origin::LocalZip,
+                &["Questie".to_owned()]
+            ),
             vec!["gh:q".to_owned()]
         );
         assert!(

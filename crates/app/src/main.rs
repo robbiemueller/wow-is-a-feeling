@@ -8,6 +8,7 @@ mod demo;
 mod details_cache;
 mod dialogs;
 mod easter;
+mod events;
 #[cfg(test)]
 mod flows;
 mod fun;
@@ -16,6 +17,7 @@ mod model;
 mod ops;
 mod script;
 mod skin;
+mod startup;
 mod theme;
 mod views;
 mod widgets;
@@ -204,7 +206,9 @@ fn tell_player(text: &str) {
 }
 
 fn main() {
+    let started = std::time::Instant::now();
     let mut launch = Launch::parse(std::env::args().skip(1));
+    launch.started = Some(started);
     launch.test_rig = std::env::var_os(TEST_RIG_ENV).is_some_and(|value| value == "1");
 
     let dirs = worker::Dirs::real();

@@ -99,16 +99,12 @@ impl Messages {
             .iter()
             .map(|m| {
                 let age = now.saturating_duration_since(m.born);
-                if age < HOLD {
-                    HOLD - age
-                } else {
-                    FADE_STEP
-                }
+                if age < HOLD { HOLD - age } else { FADE_STEP }
             })
             .min()
     }
 
-    /// Paint over everything else and hand back where a link was clicked.
+    /// Paint over everything else, and tell screen readers the same thing.
     pub fn show(&self, ctx: &egui::Context, full: Rect, now: Instant) {
         if self.list.is_empty() {
             return;
@@ -133,40 +129,43 @@ impl Messages {
             let width_limit = (full.width() - 60.0).max(100.0);
             let galley = painter.layout(text, font.clone(), color, width_limit);
             let size = galley.size();
-            let rect =
-                Rect::from_center_size(pos2(full.center().x, y + size.y / 2.0), size + vec2(24.0, 6.0));
+            let rect = Rect::from_center_size(
+                pos2(full.center().x, y + size.y / 2.0),
+                size + vec2(24.0, 6.0),
+            );
             // A band of dark behind the text, because half of it sits on the parchment.
             painter.rect_filled(rect, 3.0, Color32::from_black_alpha((190.0 * alpha) as u8));
             let at = pos2(rect.min.x + 12.0, rect.min.y + 3.0);
-            painter.galley(
+            painter.galley_with_override_text_color(
                 at + vec2(1.0, 1.0),
-                painter.layout(
-                    galley.job.text.clone(),
-                    font.clone(),
-                    theme::SHADOW.gamma_multiply(alpha),
-                    width_limit,
-                ),
-                theme::SHADOW,
+                galley.clone(),
+                theme::SHADOW.gamma_multiply(alpha),
             );
             painter.galley(at, galley, color);
-
-            if let Some((_, url)) = &message.link {
-                self.link_area(ctx, rect, i, url);
-            }
+            message_area(ctx, rect, i, message);
             y = rect.max.y + (LINE_HEIGHT - 22.0);
         }
     }
+}
 
-    fn link_area(&self, ctx: &egui::Context, rect: Rect, index: usize, url: &str) {
-        egui::Area::new(Id::unique(("message-link", index)))
-            .order(Order::Foreground)
-            .fixed_pos(rect.min)
-            .show(ctx, |ui| {
+/// The invisible part of a message: what a screen reader finds there, and for a message
+/// with a link, what can be clicked.
+fn message_area(ctx: &egui::Context, rect: Rect, index: usize, message: &Message) {
+    egui::Area::new(Id::unique(("message", index)))
+        .order(Order::Foreground)
+        .fixed_pos(rect.min)
+        .interactable(message.link.is_some())
+        .show(ctx, |ui| match &message.link {
+            None => {
+                let (_, response) = ui.allocate_exact_size(rect.size(), Sense::hover());
+                response.widget_info(|| {
+                    egui::WidgetInfo::labeled(egui::Role::Label, true, &message.text)
+                });
+            }
+            Some((label, url)) => {
                 let (_, response) = ui.allocate_exact_size(rect.size(), Sense::click());
                 let response = response.on_hover_cursor(CursorIcon::PointingHand);
-                response.widget_info(|| {
-                    egui::WidgetInfo::labeled(egui::Role::Link, true, "Watch the video")
-                });
+                response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Link, true, label));
                 if response.hovered() {
                     ui.painter().rect_stroke(
                         rect,
@@ -178,8 +177,8 @@ impl Messages {
                 if response.clicked() {
                     ctx.open_url(egui::OpenUrl::new_tab(url));
                 }
-            });
-    }
+            }
+        });
 }
 
 /// Fully there for the hold, then down to nothing.
@@ -226,7 +225,11 @@ mod tests {
         m.push(Kind::System, "a", now);
         assert_eq!(m.texts(), vec!["b", "a"]);
         m.push(Kind::Error, "a", now);
-        assert_eq!(m.texts(), vec!["b", "a", "a"], "another color is another line");
+        assert_eq!(
+            m.texts(),
+            vec!["b", "a", "a"],
+            "another color is another line"
+        );
     }
 
     #[test]

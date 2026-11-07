@@ -12,7 +12,7 @@ use eframe::egui::{
 };
 use feeling_core::catalog::Channel;
 use feeling_core::selfupdate::UpdateInfo;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// What a removal will touch, worked out when the popup opens.
 #[derive(Clone, Debug)]
@@ -53,12 +53,7 @@ pub struct FolderBrowser {
 
 impl FolderBrowser {
     pub fn usable(&self) -> Option<&FoundGame> {
-        self.listing
-            .as_ref()?
-            .verdict
-            .as_ref()?
-            .as_ref()
-            .ok()
+        self.listing.as_ref()?.verdict.as_ref()?.as_ref().ok()
     }
 }
 
@@ -157,7 +152,10 @@ fn button_row(ui: &mut Ui, add: impl FnOnce(&mut Ui)) {
 fn already_running(ui: &mut Ui, ctx: &egui::Context) {
     yellow(ui, "WoW is a Feeling is already running.");
     ui.add_space(4.0);
-    plain(ui, "Look for its window. Only one can run at a time, so nothing gets installed twice.");
+    plain(
+        ui,
+        "Look for its window. Only one can run at a time, so nothing gets installed twice.",
+    );
     button_row(ui, |ui| {
         if widgets::button(ui, "Close", ButtonKind::Main, true).clicked() {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -237,8 +235,7 @@ fn app_update(ui: &mut Ui, app: &mut App, info: &UpdateInfo, keep: &mut bool) {
     }
     button_row(ui, |ui| {
         if widgets::button(ui, "Update now", ButtonKind::Main, true).clicked() {
-            app.actions
-                .push(Action::UpdateNow(Box::new(info.clone())));
+            app.actions.push(Action::UpdateNow(Box::new(info.clone())));
             *keep = false;
         }
         if widgets::button(ui, "Later", ButtonKind::Quiet, true).clicked() {
@@ -251,7 +248,7 @@ fn app_update(ui: &mut Ui, app: &mut App, info: &UpdateInfo, keep: &mut bool) {
     });
 }
 
-fn restore(ui: &mut Ui, app: &mut App, zip: &PathBuf, when: &str, keep: &mut bool) {
+fn restore(ui: &mut Ui, app: &mut App, zip: &Path, when: &str, keep: &mut bool) {
     yellow(ui, &format!("Restore your settings from {when}?"));
     ui.add_space(4.0);
     plain(
@@ -260,7 +257,7 @@ fn restore(ui: &mut Ui, app: &mut App, zip: &PathBuf, when: &str, keep: &mut boo
     );
     button_row(ui, |ui| {
         if widgets::button(ui, "Restore", ButtonKind::Main, true).clicked() {
-            app.actions.push(Action::ConfirmRestore(zip.clone()));
+            app.actions.push(Action::ConfirmRestore(zip.to_path_buf()));
             *keep = false;
         }
         if widgets::button(ui, "Cancel", ButtonKind::Quiet, true).clicked() {
@@ -343,8 +340,7 @@ fn folder(ui: &mut Ui, app: &mut App, browser: &mut FolderBrowser, keep: &mut bo
                             }
                             for name in &listing.folders {
                                 if folder_row(ui, name).clicked() {
-                                    app.actions
-                                        .push(Action::BrowseTo(listing.path.join(name)));
+                                    app.actions.push(Action::BrowseTo(listing.path.join(name)));
                                 }
                             }
                         }

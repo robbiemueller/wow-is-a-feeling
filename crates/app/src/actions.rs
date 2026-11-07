@@ -240,7 +240,6 @@ impl App {
                     model::clean_line(missing, 60)
                 ));
             }
-            let count = resolved.to_install.len();
             for (position, step) in resolved.to_install.iter().enumerate() {
                 if step != id
                     && !ids.contains(step)
@@ -254,7 +253,7 @@ impl App {
                 }
                 if !plan.contains(step) {
                     plan.push(step.clone());
-                    if position > 0 && position + 1 <= count {
+                    if position > 0 {
                         chained.insert(step.clone());
                     }
                 }
@@ -410,10 +409,9 @@ impl App {
     fn remove(&mut self, plan: RemovePlan) {
         let folders = folder_set(&plan.folders);
         // Unmanaged folders still get an id, so the same page can't start it twice.
-        let addon_id = plan
-            .addon_id
-            .clone()
-            .unwrap_or_else(|| format!("other:{}", plan.folders.first().map_or("", String::as_str)));
+        let addon_id = plan.addon_id.clone().unwrap_or_else(|| {
+            format!("other:{}", plan.folders.first().map_or("", String::as_str))
+        });
         self.enqueue(vec![Draft {
             verb: Verb::Remove,
             kind: OpKind::Remove {
@@ -459,7 +457,10 @@ impl App {
         self.mark_local_dirty();
         self.refresh();
         self.set_selection(Some(Selection::Addon(id.to_owned())));
-        self.yellow(format!("Now managing {}. It gets updates from here on.", addon.name));
+        self.yellow(format!(
+            "Now managing {}. It gets updates from here on.",
+            addon.name
+        ));
     }
 
     fn share(&mut self, id: &str) {
@@ -576,9 +577,10 @@ impl App {
         if self.needs_a_folder(Action::ZipDropped(path.clone())) {
             return;
         }
-        let name = path
-            .file_stem()
-            .map_or_else(|| "the zip".to_owned(), |s| s.to_string_lossy().into_owned());
+        let name = path.file_stem().map_or_else(
+            || "the zip".to_owned(),
+            |s| s.to_string_lossy().into_owned(),
+        );
         self.enqueue(vec![Draft {
             verb: Verb::Install,
             kind: OpKind::LocalZip { path },

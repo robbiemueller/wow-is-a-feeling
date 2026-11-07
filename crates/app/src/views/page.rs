@@ -8,8 +8,7 @@ use crate::model::{self, CatalogStatus, MainButton, Selection, Tag, clean_line};
 use crate::theme;
 use crate::widgets::{self, ButtonKind};
 use eframe::egui::{
-    self, Color32, Rect, RichText, ScrollArea, Sense, Stroke, StrokeKind, Ui, UiBuilder, pos2,
-    vec2,
+    self, Color32, Rect, RichText, ScrollArea, Sense, Stroke, StrokeKind, Ui, UiBuilder, pos2, vec2,
 };
 use feeling_core::catalog::{Addon, Channel};
 use feeling_core::state::{ManagedAddon, Origin};
@@ -126,14 +125,23 @@ pub fn framed(
     let check_flow = flow(&check_widths, room, 14.0);
     let check_rows = check_flow.last().map_or(0, |last| last + 1);
 
-    let bar_height = button_rows as f32 * (BUTTON_HEIGHT + ROW_GAP)
-        + check_rows as f32 * (CHECK_HEIGHT + 2.0);
+    let bar_height =
+        button_rows as f32 * (BUTTON_HEIGHT + ROW_GAP) + check_rows as f32 * (CHECK_HEIGHT + 2.0);
     let bar_bottom = rect.max.y - 10.0;
     let bar_top = bar_bottom - bar_height;
     let text_bottom = (bar_top - 4.0).max(rect.min.y + 36.0);
-    let text = Rect::from_min_max(rect.min + vec2(18.0, 14.0), pos2(rect.max.x - 8.0, text_bottom));
+    let text = Rect::from_min_max(
+        rect.min + vec2(18.0, 14.0),
+        pos2(rect.max.x - 8.0, text_bottom),
+    );
 
     ui.scope_builder(UiBuilder::new().max_rect(text), |ui| {
+        // A scrollbar in the paper's own browns: egui's black groove would shout here.
+        let visuals = ui.visuals_mut();
+        visuals.extreme_bg_color = Color32::from_rgb(120, 92, 54);
+        visuals.widgets.inactive.bg_fill = Color32::from_rgb(92, 66, 32);
+        visuals.widgets.hovered.bg_fill = Color32::from_rgb(112, 80, 38);
+        visuals.widgets.active.bg_fill = Color32::from_rgb(70, 48, 22);
         let mut area = ScrollArea::vertical().id_salt("page").auto_shrink(false);
         if std::mem::take(&mut app.page_to_top) {
             area = area.vertical_scroll_offset(0.0);
@@ -263,7 +271,8 @@ fn addon_page(app: &mut App, ui: &mut Ui, rect: Rect, id: &str) {
         app.state.settings.default_channel,
     );
     let has_release = addon.release(channel).is_some();
-    let main_enabled = !busy && main != MainButton::Pinned && (has_release || main == MainButton::Manage);
+    let main_enabled =
+        !busy && main != MainButton::Pinned && (has_release || main == MainButton::Manage);
 
     let mut buttons = vec![
         BarButton::main(main.label(), main_enabled, app.main_action_for(id, main)),
@@ -279,7 +288,11 @@ fn addon_page(app: &mut App, ui: &mut Ui, rect: Rect, id: &str) {
         url.is_some(),
         Action::OpenLink(url.clone().unwrap_or_default()),
     ));
-    buttons.push(BarButton::quiet("Share", true, Action::Share(id.to_owned())));
+    buttons.push(BarButton::quiet(
+        "Share",
+        true,
+        Action::Share(id.to_owned()),
+    ));
     if let Some(button) = rollback_button(record.as_ref(), id, busy) {
         buttons.push(button);
     }
@@ -341,7 +354,10 @@ fn addon_body(
             widgets::fact(
                 ui,
                 "Version:",
-                &format!("{} installed, {} available", record.version, release.version),
+                &format!(
+                    "{} installed, {} available",
+                    record.version, release.version
+                ),
             );
         }
         (Some(record), _) => widgets::fact(ui, "Version:", &record.version),
@@ -445,10 +461,8 @@ fn details_sections(app: &mut App, ui: &mut Ui, addon: &Addon) {
             }
             if let Some(changelog) = details.changelog.clone() {
                 let open = app.changelog_open;
-                let (rect, response) = ui.allocate_exact_size(
-                    vec2(ui.available_width(), 22.0),
-                    Sense::click(),
-                );
+                let (rect, response) =
+                    ui.allocate_exact_size(vec2(ui.available_width(), 22.0), Sense::click());
                 response.widget_info(|| {
                     egui::WidgetInfo::selected(
                         egui::Role::DisclosureTriangle,

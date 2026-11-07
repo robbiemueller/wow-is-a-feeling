@@ -7,8 +7,8 @@ use crate::skin::{self, shadow_text};
 use crate::theme;
 use crate::widgets::{self, ButtonKind};
 use eframe::egui::{
-    self, Align2, Color32, CursorIcon, Frame, Popup, Rect, RichText, Sense, Stroke, TextEdit, Ui,
-    pos2, vec2,
+    self, Align2, Color32, CursorIcon, Frame, Margin, Popup, Rect, RichText, Sense, Stroke,
+    TextEdit, Ui, pos2, vec2,
 };
 use feeling_core::search::SortBy;
 
@@ -54,8 +54,15 @@ pub fn show(app: &mut App, ui: &mut Ui, full: Rect) {
     search_box(app, ui, search);
 
     let enabled = count > 0 && !app.queue.busy_exclusive();
-    if widgets::button_at(ui, update, "update-all", &update_text, ButtonKind::Main, enabled)
-        .clicked()
+    if widgets::button_at(
+        ui,
+        update,
+        "update-all",
+        &update_text,
+        ButtonKind::Main,
+        enabled,
+    )
+    .clicked()
     {
         app.actions.push(Action::UpdateAll);
     }
@@ -72,8 +79,7 @@ fn search_box(app: &mut App, ui: &mut Ui, rect: Rect) {
         )
         .font(theme::body(15.0))
         .text_color(Color32::WHITE)
-        .frame(Frame::NONE)
-        .margin(vec2(8.0, 4.0))
+        .frame(Frame::NONE.inner_margin(Margin::symmetric(8, 4)))
         .min_size(rect.size())
         .desired_width(rect.width())
         .char_limit(200)

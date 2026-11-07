@@ -234,7 +234,11 @@ pub fn updates_available(
     let mut ids: Vec<&ManagedAddon> = managed
         .values()
         .filter(|m| !m.pinned)
-        .filter(|m| bundle.addon(&m.id).is_some_and(|a| update_for(m, a).is_some()))
+        .filter(|m| {
+            bundle
+                .addon(&m.id)
+                .is_some_and(|a| update_for(m, a).is_some())
+        })
         .collect();
     ids.sort_by_cached_key(|m| m.name.to_lowercase());
     ids.into_iter().map(|m| m.id.clone()).collect()
@@ -284,7 +288,12 @@ pub fn browse_rows(
             .map(|(i, _)| i)
             .collect();
         if !gaps.is_empty() {
-            let head = header(HeaderId::NotAvailable, "Not available here", gaps.len(), toggled);
+            let head = header(
+                HeaderId::NotAvailable,
+                "Not available here",
+                gaps.len(),
+                toggled,
+            );
             let open = is_open(&head);
             rows.push(head);
             if open {
@@ -309,7 +318,12 @@ pub fn browse_rows(
         .filter_map(|id| bundle.position(id))
         .collect();
     if !featured.is_empty() {
-        let head = header(HeaderId::Recommended, "Recommended", featured.len(), toggled);
+        let head = header(
+            HeaderId::Recommended,
+            "Recommended",
+            featured.len(),
+            toggled,
+        );
         let open = is_open(&head);
         rows.push(head);
         if open {
@@ -373,7 +387,12 @@ pub fn my_rows(
             rows.extend(list.into_iter().map(|m| Row::Managed(m.id.clone())));
         }
     };
-    push_managed(HeaderId::Updates, "Updates available", update_rows, &mut rows);
+    push_managed(
+        HeaderId::Updates,
+        "Updates available",
+        update_rows,
+        &mut rows,
+    );
     push_managed(HeaderId::Installed, "Installed", plain_rows, &mut rows);
 
     let others: Vec<usize> = groups
@@ -421,9 +440,9 @@ pub fn row_of(
     rows.iter().position(|row| match (row, selection) {
         (Row::Addon(i), Selection::Addon(id)) => bundle.is_some_and(|b| b.position(id) == Some(*i)),
         (Row::Managed(a), Selection::Addon(b)) => a == b,
-        (Row::Other(i), Selection::Other(primary)) => {
-            groups.get(*i as usize).is_some_and(|g| g.primary == *primary)
-        }
+        (Row::Other(i), Selection::Other(primary)) => groups
+            .get(*i as usize)
+            .is_some_and(|g| g.primary == *primary),
         (Row::Kit(a), Selection::Kit(b)) | (Row::Gap(a), Selection::Gap(b)) => *a as usize == *b,
         _ => false,
     })
@@ -681,7 +700,7 @@ pub fn status_line(
     let game = match game {
         GameState::Searching => "Looking for WoW Forever".to_owned(),
         GameState::NotFound => "WoW Forever not found".to_owned(),
-        GameState::Found { version: Some(v) } => format!("Forever {v}"),
+        GameState::Found { version: Some(v) } => format!("Forever {}", short_version(v)),
         GameState::Found { version: None } => "Forever".to_owned(),
     };
     let catalog = match catalog {
@@ -699,6 +718,15 @@ pub fn status_line(
         }
     };
     format!("{game}  |  {catalog}")
+}
+
+/// `1.60.1` out of `1.60.1.12345`. The build number is for the diagnostics, not the status.
+pub fn short_version(version: &str) -> &str {
+    let end = version
+        .match_indices('.')
+        .nth(2)
+        .map_or(version.len(), |(at, _)| at);
+    &version[..end]
 }
 
 fn plural(n: usize, word: &str) -> String {
@@ -851,7 +879,10 @@ mod tests {
             ]
         );
         assert!(rows.contains(&Row::Kit(0)));
-        assert_eq!(rows.iter().filter(|r| matches!(r, Row::Addon(_))).count(), 1);
+        assert_eq!(
+            rows.iter().filter(|r| matches!(r, Row::Addon(_))).count(),
+            1
+        );
     }
 
     #[test]
@@ -861,7 +892,15 @@ mod tests {
         let rows = browse_rows(&b, "", SortBy::Name, &toggled);
         let at = rows
             .iter()
-            .position(|row| matches!(row, Row::Header { id: HeaderId::Category(0), .. }))
+            .position(|row| {
+                matches!(
+                    row,
+                    Row::Header {
+                        id: HeaderId::Category(0),
+                        ..
+                    }
+                )
+            })
             .unwrap();
         assert_eq!(rows[at + 1], Row::Addon(0));
         assert_eq!(rows[at + 2], Row::Addon(1));
@@ -892,7 +931,10 @@ mod tests {
     fn a_command_being_typed_is_not_a_search() {
         let b = bundle();
         let plain = browse_rows(&b, "", SortBy::Popular, &HashSet::new());
-        assert_eq!(browse_rows(&b, "/dan", SortBy::Popular, &HashSet::new()), plain);
+        assert_eq!(
+            browse_rows(&b, "/dan", SortBy::Popular, &HashSet::new()),
+            plain
+        );
     }
 
     #[test]
@@ -1020,13 +1062,26 @@ mod tests {
             "Forever 1.60.1  |  Offline, showing the last catalog"
         );
         assert_eq!(
-            status_line(&GameState::NotFound, 0, 0, CatalogStatus::Missing { offline: true }, 0),
+            status_line(
+                &GameState::NotFound,
+                0,
+                0,
+                CatalogStatus::Missing { offline: true },
+                0
+            ),
             "WoW Forever not found  |  Offline, no catalog yet"
         );
         assert_eq!(
             status_line(&game, 1, 0, CatalogStatus::Cached, 0),
             "Forever 1.60.1  |  1 addon"
         );
+    }
+
+    #[test]
+    fn the_status_shows_the_game_version_without_its_build() {
+        assert_eq!(short_version("1.60.1.12345"), "1.60.1");
+        assert_eq!(short_version("1.60.1"), "1.60.1");
+        assert_eq!(short_version("2"), "2");
     }
 
     #[test]
@@ -1053,7 +1108,11 @@ mod tests {
             addons: vec![nameless, addon("", "No id", "misc", 0)],
             ..Default::default()
         });
-        assert_eq!(b.catalog.addons.len(), 1, "an addon without an id can't be tracked");
+        assert_eq!(
+            b.catalog.addons.len(),
+            1,
+            "an addon without an id can't be tracked"
+        );
         assert_eq!(b.catalog.addons[0].name, "Folder");
     }
 

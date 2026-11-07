@@ -69,6 +69,8 @@ pub struct Launch {
     pub changelog: bool,
     /// How long a simulated demo operation takes.
     pub sim_ms: Option<u64>,
+    /// When the process started, for timing how soon the window appears.
+    pub started: Option<std::time::Instant>,
 }
 
 impl Launch {
@@ -222,7 +224,15 @@ mod tests {
 
     #[test]
     fn unknown_switches_and_bad_values_are_ignored() {
-        let launch = parse(&["--nope", "--progress", "lots", "--tab", "moon", "--size", "big"]);
+        let launch = parse(&[
+            "--nope",
+            "--progress",
+            "lots",
+            "--tab",
+            "moon",
+            "--size",
+            "big",
+        ]);
         assert_eq!(launch.progress, None);
         assert_eq!(launch.tab, None);
         assert_eq!(launch.size, None);

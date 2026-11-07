@@ -138,6 +138,7 @@ pub fn bottom(app: &mut App, ui: &mut Ui, full: Rect, now: Instant) {
         let bar = Rect::from_center_size(bar_center, vec2(width, 22.0));
         app.skin
             .casting_bar(ui.painter(), bar, casting.fraction, &casting.text);
+        widgets::read_aloud(ui, bar, "casting", &casting.text);
         let cancel = Rect::from_min_size(
             pos2(bar.max.x + 7.0, bar.center().y - 9.0),
             vec2(18.0, 18.0),
@@ -149,6 +150,8 @@ pub fn bottom(app: &mut App, ui: &mut Ui, full: Rect, now: Instant) {
         && now < *until
     {
         strip_line(ui.painter(), bar_center, line, theme::USE_GREEN);
+        let spot = Rect::from_center_size(bar_center, vec2(320.0, 20.0));
+        widgets::read_aloud(ui, spot, "loot", line);
     }
 
     let tabs = [
@@ -166,7 +169,7 @@ pub fn bottom(app: &mut App, ui: &mut Ui, full: Rect, now: Instant) {
     }
     let status = app.status_text();
     let room = (full.max.x - 20.0 - x - 12.0).max(40.0);
-    shadow_text_fit(
+    let shown = shadow_text_fit(
         ui.painter(),
         pos2(full.max.x - 20.0, strip_y + 14.0),
         Align2::RIGHT_CENTER,
@@ -175,12 +178,15 @@ pub fn bottom(app: &mut App, ui: &mut Ui, full: Rect, now: Instant) {
         theme::TEXT_DIM,
         room,
     );
+    widgets::read_aloud(ui, shown, "status", &status);
 }
 
 pub fn frame_and_portrait(app: &mut App, ui: &mut Ui, full: Rect, now: Instant) {
     app.skin.gold_frame(ui.painter(), full);
     let center = pos2(full.min.x + 50.0, full.min.y + 50.0);
-    let response = app.fun.portrait(ui, &app.skin, center, PORTRAIT_RADIUS, now);
+    let response = app
+        .fun
+        .portrait(ui, &app.skin, center, PORTRAIT_RADIUS, now);
     if response.clicked() {
         app.actions.push(Action::PortraitClicked);
     }
@@ -193,8 +199,7 @@ pub fn overlays(app: &mut App, ui: &mut Ui, full: Rect, now: Instant) {
     app.fun.overlays(&ctx, full, now);
     app.messages.show(&ctx, full, now);
 
-    let hovering =
-        app.launch.drop_overlay || ctx.input(|i| !i.raw.hovered_files.is_empty());
+    let hovering = app.launch.drop_overlay || ctx.input(|i| !i.raw.hovered_files.is_empty());
     if hovering {
         let painter = ctx.layer_painter(LayerId::new(Order::Foreground, Id::unique("drop")));
         let inner = full.shrink(10.0);

@@ -8,8 +8,8 @@ use crate::ops::{Op, OpKind, stage_fraction};
 use eframe::egui::{self, ColorImage};
 use feeling_core::backup::{self, BackupEntry, BackupProgress};
 use feeling_core::catalog::{CATALOG_SCHEMA, Catalog};
-use feeling_core::detect::{self, FoundBy, Install};
 use feeling_core::details::{self, Details};
+use feeling_core::detect::{self, FoundBy, Install};
 use feeling_core::error::Error;
 use feeling_core::gameproc;
 use feeling_core::install::{self, InstallOutcome, InstallRequest, Layout, Stage};
@@ -78,9 +78,9 @@ impl HowFound {
             HowFound::Chosen => "You chose this folder",
             HowFound::CommandLine => "Given on the command line",
             HowFound::Detected(by) => match by {
-                FoundBy::BattleNet => "Found through Battle.net",
-                FoundBy::Registry => "Found in the Windows registry",
-                FoundBy::CommonPath => "Found in a usual install folder",
+                FoundBy::BattleNet => "Through Battle.net",
+                FoundBy::Registry => "In the Windows registry",
+                FoundBy::CommonPath => "In a usual install folder",
                 FoundBy::WinePrefix(launcher) => launcher,
                 FoundBy::Manual => "You chose this folder",
             },
@@ -320,7 +320,9 @@ impl Worker {
                 w.send(Event::Recovered(result));
             }
             w.send(Event::WriteTest(
-                detect::check_writable(&install).err().map(|e| e.to_string()),
+                detect::check_writable(&install)
+                    .err()
+                    .map(|e| e.to_string()),
             ));
             w.scan_now(&install, &kept);
         });
@@ -622,7 +624,8 @@ impl Worker {
                     ..InstallRequest::default()
                 };
                 let mut report = self.stage_reporter(op.id, 0);
-                let outcome = install::install_from_zip(&layout, zip, &request, &mut report, cancel)?;
+                let outcome =
+                    install::install_from_zip(&layout, zip, &request, &mut report, cancel)?;
                 Ok(self.installed(op, outcome, None))
             }
             OpKind::LocalZip { path } => {
@@ -752,14 +755,17 @@ impl Worker {
     fn stage_reporter(&self, id: u64, size: u64) -> impl FnMut(Stage) + use<'_> {
         let mut throttle = Throttle::default();
         move |stage| {
-            let moving = matches!(
-                stage,
-                Stage::Downloading { .. } | Stage::Extracting { .. }
-            );
+            let moving = matches!(stage, Stage::Downloading { .. } | Stage::Extracting { .. });
             if !moving || throttle.ready() {
                 self.progress(id, stage_fraction(stage, size));
             }
         }
+    }
+
+    /// Startup is over and the app is about to sit idle, usually beside a game that could
+    /// use the memory. Hand back what startup touched and nothing will touch again.
+    pub fn release_idle_memory(&self) {
+        self.spawn("release-memory", |_| release_working_set());
     }
 
     /// Save everything, let go of the lock and start the new version. The app exits next.
@@ -775,6 +781,13 @@ impl Worker {
                 .take();
             drop(held);
             let result = selfupdate::relaunch(applied).map_err(|e| e.to_string());
+            if result.is_err() {
+                // The new version didn't start, so this one carries on holding the lock.
+                *lock
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    crate::take_lock(&w.dirs().state_file);
+            }
             w.send(Event::Relaunch(result));
         });
     }
@@ -907,8 +920,8 @@ pub fn decode_screenshot(bytes: &[u8]) -> Option<ColorImage> {
     reader.limits(limits);
     let decoded = reader.decode().ok()?;
     let scaled = if decoded.width() > MAX_SHOWN_WIDTH {
-        let height = u64::from(decoded.height()) * u64::from(MAX_SHOWN_WIDTH)
-            / u64::from(decoded.width());
+        let height =
+            u64::from(decoded.height()) * u64::from(MAX_SHOWN_WIDTH) / u64::from(decoded.width());
         decoded.thumbnail_exact(MAX_SHOWN_WIDTH, (height as u32).max(1))
     } else {
         decoded
@@ -993,14 +1006,39 @@ fn demo_listing(path: PathBuf) -> DirListing {
                 key: "demo".to_owned(),
             })
         } else {
-            Err("This folder has no _forever_ folder, so WoW Forever isn't installed here. \
+            Err(
+                "This folder has no _forever_ folder, so WoW Forever isn't installed here. \
                  Pick the World of Warcraft folder that holds _forever_."
-                .to_owned())
+                    .to_owned(),
+            )
         }),
         path,
         error: None,
     }
 }
+
+/// Pages move out of the working set but stay in the OS's standby list, so anything that
+/// turns out to be needed after all comes back with a soft fault, not a disk read.
+#[cfg(windows)]
+fn release_working_set() {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetCurrentProcess() -> *mut std::ffi::c_void;
+        fn SetProcessWorkingSetSize(
+            process: *mut std::ffi::c_void,
+            minimum: usize,
+            maximum: usize,
+        ) -> i32;
+    }
+    // SAFETY: the pseudo-handle is always valid for this process, and `usize::MAX` for both
+    // sizes is the documented way to ask for the working set to be trimmed.
+    unsafe {
+        SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX);
+    }
+}
+
+#[cfg(not(windows))]
+fn release_working_set() {}
 
 #[cfg(windows)]
 fn drive_list() -> Vec<PathBuf> {
@@ -1028,9 +1066,7 @@ mod tests {
     fn png(width: u32, height: u32) -> Vec<u8> {
         let image = image::RgbaImage::new(width, height);
         let mut bytes = std::io::Cursor::new(Vec::new());
-        image
-            .write_to(&mut bytes, image::ImageFormat::Png)
-            .unwrap();
+        image.write_to(&mut bytes, image::ImageFormat::Png).unwrap();
         bytes.into_inner()
     }
 
@@ -1087,7 +1123,11 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let forever = temp.path().join("_forever_");
         fs::create_dir_all(&forever).unwrap();
-        fs::write(forever.join(".flavor.info"), "Product Flavor!STRING:0\nwowf\n").unwrap();
+        fs::write(
+            forever.join(".flavor.info"),
+            "Product Flavor!STRING:0\nwowf\n",
+        )
+        .unwrap();
         fs::write(forever.join("Wow.exe"), b"").unwrap();
         let listing = read_listing(temp.path().to_path_buf());
         let found = listing.verdict.unwrap().unwrap();
