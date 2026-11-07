@@ -24,6 +24,9 @@ const MAX_PRODUCT_DB_BYTES: u64 = 16 * 1024 * 1024;
 const PATH_LOOKAHEAD: usize = 4;
 /// Printable bytes a following protobuf field can glue onto the end of a path.
 const MAX_STUCK_BYTES: usize = 8;
+/// A real `product.db` lists a handful of installs at most. Every path found here gets
+/// probed on disk, so a damaged or doctored file stops being read well before that hurts.
+const MAX_RECORDED_PATHS: usize = 16;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FoundBy {
@@ -289,6 +292,9 @@ pub fn paths_from_product_db(bytes: &[u8]) -> Vec<String> {
             && !paths.contains(&path)
         {
             paths.push(path);
+            if paths.len() == MAX_RECORDED_PATHS {
+                break;
+            }
         }
     }
     paths
@@ -408,7 +414,23 @@ fn push_from_product_db(found: &mut Vec<Install>, db: &Path) {
         return;
     };
     for recorded in paths_from_product_db(&bytes) {
-        push_valid(found, Path::new(&recorded), FoundBy::BattleNet);
+        let path = Path::new(&recorded);
+        if is_local_path(path) {
+            push_valid(found, path, FoundBy::BattleNet);
+        } else {
+            log::debug!("Ignored a network path in Battle.net's records: {recorded}");
+        }
+    }
+}
+
+/// Battle.net installs to local drives, and probing a network path can stall on a dead
+/// host. Asks the OS how it reads the path, since spellings like `/\host\share` are UNC too.
+#[cfg(any(windows, target_os = "macos"))]
+fn is_local_path(path: &Path) -> bool {
+    use std::path::{Component, Prefix};
+    match path.components().next() {
+        Some(Component::Prefix(prefix)) => matches!(prefix.kind(), Prefix::Disk(_)),
+        _ => true,
     }
 }
 
@@ -1042,6 +1064,63 @@ us|1|9006ba6948388dd0d4a0578e64b8a92e|0e139f0e95542dbe2a5462d8a6b2ebae|||tpr/wow
         assert!(paths_from_product_db(&[0xff; 4096]).is_empty());
         let bytes: Vec<u8> = (0..=255u8).cycle().take(8192).collect();
         assert!(paths_from_product_db(&bytes).is_empty());
+    }
+
+    #[test]
+    fn a_product_db_stops_being_read_after_a_small_number_of_paths() {
+        let mut db = Vec::new();
+        for i in 0..200 {
+            db.extend(product_record("wowf", "wowf", &format!("D:/Games/{i:03}")));
+        }
+        let paths = paths_from_product_db(&db);
+        assert_eq!(paths.len(), MAX_RECORDED_PATHS);
+        assert_eq!(paths[0], "D:/Games/000");
+    }
+
+    #[test]
+    fn repeating_one_path_does_not_use_up_the_limit() {
+        let mut db = Vec::new();
+        for _ in 0..MAX_RECORDED_PATHS + 4 {
+            db.extend(product_record("wowf", "wowf", "D:/Games/Same"));
+        }
+        db.extend(product_record("wowf", "wowf", "E:/Games/Other"));
+        assert_eq!(
+            paths_from_product_db(&db),
+            ["D:/Games/Same", "E:/Games/Other"]
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn network_and_device_paths_in_a_product_db_are_not_local() {
+        for path in [
+            "//host/share/wow",
+            r"\\host\share\wow",
+            r"/\host\share\wow",
+            "/\\host/share/wow",
+            r"\\?\UNC\host\share\wow",
+            r"\\.\C:\wow",
+            r"\\?\Volume{00000000-0000-0000-0000-000000000000}\wow",
+        ] {
+            assert!(!is_local_path(Path::new(path)), "{path}");
+        }
+        // Long enough that the length byte in front is printable, as in the real attack.
+        let network = "//host/share/games/World of Warcraft";
+        assert_eq!(paths_from_product_db(&product_db_with(network)), [network]);
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn local_install_paths_are_local() {
+        assert!(is_local_path(Path::new("/Applications/World of Warcraft")));
+        assert!(is_local_path(Path::new("/host/share/wow")));
+        #[cfg(windows)]
+        {
+            assert!(is_local_path(Path::new(
+                "C:/Program Files (x86)/World of Warcraft"
+            )));
+            assert!(is_local_path(Path::new(r"D:\Games\World of Warcraft")));
+        }
     }
 
     // ---- validate ----
