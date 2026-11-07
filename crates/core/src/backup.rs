@@ -11,6 +11,7 @@ use std::fs::{self, File};
 use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use zip::write::SimpleFileOptions;
@@ -34,6 +35,9 @@ const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
 const STAGING_PREFIX: &str = "WTF.restoring-";
 /// The folder a restore replaced, kept for good.
 const ASIDE_PREFIX: &str = "WTF.before-restore-";
+/// Held while a restore runs, because to [`recover_restore`] a live restore's folders would
+/// look like an interrupted one's. Only one copy of the app writes, so this process is enough.
+static RESTORE_RUNNING: Mutex<()> = Mutex::new(());
 
 /// What a restore accepts: a player's own files, not a stranger's zip. An addon that saved
 /// one long string compresses better than any zip bomb limit, and a heavy player's WTF can
@@ -182,10 +186,11 @@ pub fn restore_wtf(zip: &Path, wtf_dir: &Path, game_running: bool) -> Result<Opt
             wtf_dir.display()
         ))
     })?;
+    let _only_one = RESTORE_RUNNING
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
     // Otherwise this would lose track of the settings an unfinished restore moved aside.
-    for note in recover_restore(wtf_dir)? {
-        log::info!("{note}");
-    }
+    settle_unfinished_restores(&wtf, parent)?;
     let stamp = free_restore_stamp(parent, unix_now());
     let staging = parent.join(format!("{STAGING_PREFIX}{stamp}"));
     let aside = parent.join(format!("{ASIDE_PREFIX}{stamp}"));
@@ -244,6 +249,13 @@ pub fn recover_restore(wtf_dir: &Path) -> Result<Vec<String>> {
     let Some(parent) = wtf.parent() else {
         return Ok(Vec::new());
     };
+    let _only_one = RESTORE_RUNNING
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    settle_unfinished_restores(&wtf, parent)
+}
+
+fn settle_unfinished_restores(wtf: &Path, parent: &Path) -> Result<Vec<String>> {
     let Ok(items) = fs::read_dir(parent) else {
         return Ok(Vec::new());
     };
@@ -260,7 +272,7 @@ pub fn recover_restore(wtf_dir: &Path) -> Result<Vec<String>> {
     for stamp in stamps {
         let aside = parent.join(format!("{ASIDE_PREFIX}{stamp}"));
         if is_present(&aside).map_err(|e| io_error(&aside, e))? {
-            if is_present(&wtf).map_err(|e| io_error(&wtf, e))? {
+            if is_present(wtf).map_err(|e| io_error(wtf, e))? {
                 // The game made a new one in the meantime, which may have settings of its
                 // own by now, so that's the player's call.
                 notes.push(format!(
@@ -268,7 +280,7 @@ pub fn recover_restore(wtf_dir: &Path) -> Result<Vec<String>> {
                     display_path(&aside).display()
                 ));
             } else {
-                rename_with_retry(&aside, &wtf).map_err(|e| not_put_back(&aside, &e))?;
+                rename_with_retry(&aside, wtf).map_err(|e| not_put_back(&aside, &e))?;
                 notes.push(
                     "A settings restore was interrupted, so your settings were put back the \
                      way they were."
@@ -281,6 +293,8 @@ pub fn recover_restore(wtf_dir: &Path) -> Result<Vec<String>> {
             log::warn!("Couldn't clear what an interrupted restore left: {error}");
         }
     }
+    // These may be shown only once, and the old settings aren't going anywhere.
+    notes.iter().for_each(|note| log::warn!("{note}"));
     Ok(notes)
 }
 
@@ -1168,6 +1182,28 @@ mod tests {
         assert!(!wow.wtf.exists());
         assert!(aside.is_dir());
         assert_eq!(names_beside_wtf(&wow).len(), 1);
+    }
+
+    /// Picking the same game folder again mid-restore runs recovery, and a live restore's
+    /// folders look just like an interrupted one's.
+    #[test]
+    fn recovery_waits_for_a_restore_that_is_still_running() {
+        let wow = Wow::new();
+        let zip = wow.backup(5).unwrap();
+        let saved = tree(&wow.wtf);
+        restore_stopped_between_the_renames(&wow, &zip);
+
+        let running = RESTORE_RUNNING
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let wtf = wow.wtf.clone();
+        let recovery = std::thread::spawn(move || recover_restore(&wtf));
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!wow.wtf.exists(), "recovery must wait its turn");
+        drop(running);
+
+        assert_eq!(recovery.join().unwrap().unwrap().len(), 1);
+        assert_eq!(tree(&wow.wtf), saved);
     }
 
     #[test]
