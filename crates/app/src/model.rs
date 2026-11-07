@@ -677,7 +677,8 @@ pub fn kit_addons<'a>(
         .collect()
 }
 
-/// Ids in a kit that aren't installed yet.
+/// Ids in a kit that aren't installed yet. One whose entry has become another addon counts, as
+/// its row shows it, so installing the kit says why that one is left alone.
 pub fn kit_missing(
     kit: &Kit,
     bundle: &CatalogBundle,
@@ -685,8 +686,13 @@ pub fn kit_missing(
 ) -> Vec<String> {
     kit.addons
         .iter()
-        .filter(|id| bundle.addon(id).is_some())
-        .filter(|id| !managed.is_some_and(|m| m.contains_key(*id)))
+        .filter(|id| {
+            bundle.addon(id).is_some_and(|addon| {
+                managed
+                    .and_then(|m| m.get(*id))
+                    .is_none_or(|record| !same_addon(record, addon))
+            })
+        })
         .cloned()
         .collect()
 }
@@ -1382,6 +1388,20 @@ mod tests {
         let list = map(vec![managed("gh:a/questie", "Questie", "2.0")]);
         assert!(kit_missing(kit, &b, Some(&list)).is_empty());
         assert_eq!(gap_alternatives(&b.catalog.gaps[0], &b).len(), 1);
+    }
+
+    #[test]
+    fn a_kit_counts_an_entry_that_became_another_addon_as_not_installed() {
+        let b = bundle();
+        let kit = &b.catalog.kits[0];
+        // The record's main folder isn't Questie's, so the entry is another addon now.
+        let list = map(vec![managed("gh:a/questie", "QuestHelper", "1.0")]);
+        assert_eq!(kit_addons(kit, &b, Some(&list))[0].1, Tag::Version("2.0"));
+        assert_eq!(
+            kit_missing(kit, &b, Some(&list)),
+            vec!["gh:a/questie".to_owned()],
+            "as its row shows it"
+        );
     }
 
     #[test]

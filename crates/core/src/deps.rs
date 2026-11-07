@@ -12,9 +12,11 @@ use crate::state::State;
 /// live in `Interface/AddOns` and nobody can install them.
 const GAME_ADDON_PREFIX: &str = "blizzard_";
 
-/// The biggest download, in bytes, that installs as another addon's dependency without the
-/// player seeing its size first. Voice packs run to gigabytes, and any addon's TOC can require
-/// one of their folders.
+/// The biggest pack, in bytes, that installs as another addon's dependency without the player
+/// seeing its size first. A pack is an addon a reviewed entry lists under its `packs`, such as
+/// a voice pack: those run to gigabytes, and any addon's TOC can require one of their folders.
+/// Other dependencies aren't held to this, because the addon that requires one won't load
+/// without it.
 pub const BIGGEST_UNASKED_DOWNLOAD: u64 = 100_000_000;
 
 /// Which catalog addons provide each folder.
@@ -58,8 +60,9 @@ pub struct Resolution {
     /// Required folders whose pick is trusted but was never reviewed by a person, so it
     /// isn't installed by itself. The player can open it from the Requires line and decide.
     pub unreviewed: Vec<Unreviewed>,
-    /// Required folders whose pick is a download over [`BIGGEST_UNASKED_DOWNLOAD`], reviewed
-    /// or not, so it isn't installed by itself either. The player hears its size and decides.
+    /// Required folders whose pick is a pack with a download over [`BIGGEST_UNASKED_DOWNLOAD`],
+    /// reviewed or not, so it isn't installed by itself either. The player hears its size and
+    /// decides.
     pub too_big: Vec<TooBig>,
 }
 
@@ -74,7 +77,7 @@ pub struct Unreviewed {
     pub provider: String,
 }
 
-/// A required addon left for the player to install, because its download is big.
+/// A required pack left for the player to install, because its download is big.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TooBig {
     /// The addon whose TOC requires it, which is the page whose Requires line links to it.
@@ -95,9 +98,12 @@ pub struct TooBig {
 ///
 /// A dependency joins the plan only when its pick is reviewed as well as trusted: any addon
 /// can ship a library's folder name long before anything needs it, and a trusted entry only
-/// had to be old enough. The rest are left out and listed in `unreviewed`. Nor does a pick
-/// whose download is over [`BIGGEST_UNASKED_DOWNLOAD`], reviewed or not, because a voice pack
-/// can run to gigabytes: those are listed in `too_big`, with their size.
+/// had to be old enough. The rest are left out and listed in `unreviewed`. A pick that's a
+/// pack, which a reviewed entry lists under its `packs`, never joins when its download is over
+/// [`BIGGEST_UNASKED_DOWNLOAD`], reviewed or not, because a voice pack can run to gigabytes:
+/// those are listed in `too_big`, with their size. That's decided before `reviewed`, since the
+/// catalog publishes big packs unreviewed. Any other pick joins whatever its size, because the
+/// addon that requires it won't load without it.
 pub fn resolve<I, S>(
     addon_id: &str,
     catalog: &Catalog,
@@ -150,13 +156,14 @@ where
         };
         let pick = &catalog.addons[provider];
         let size = download_size(pick, channel(&pick.id));
-        if size <= BIGGEST_UNASKED_DOWNLOAD && pick.reviewed {
+        let too_big = size > BIGGEST_UNASKED_DOWNLOAD && is_pack(&pick.id, catalog);
+        if !too_big && pick.reviewed {
             plan_folders(pick, &mut planned);
             stack.push((provider, 0));
         } else if seen_left.insert((current, folder)) {
             let needed_by = addon.id.clone();
             let provider = pick.id.clone();
-            if size > BIGGEST_UNASKED_DOWNLOAD {
+            if too_big {
                 resolution.too_big.push(TooBig {
                     needed_by,
                     folder: dep.clone(),
@@ -185,11 +192,23 @@ fn download_size(addon: &Addon, channel: Channel) -> u64 {
     addon.release(channel).map_or(0, |release| release.size)
 }
 
+/// Is this addon a pack, such as a voice pack: one that a reviewed entry lists under its
+/// `packs`? Only a reviewed entry's groups count, because a person wrote those down.
+fn is_pack(id: &str, catalog: &Catalog) -> bool {
+    catalog.addons.iter().any(|addon| {
+        addon.reviewed
+            && addon
+                .packs
+                .iter()
+                .any(|group| group.ids.iter().any(|pack| pack == id))
+    })
+}
+
 /// The addon the app would pick for this folder: the trusted one whose main folder it is,
 /// then the most downloaded trusted one. Ties keep catalog order. An untrusted entry is never
 /// picked, even when nothing else provides the folder, because its folder list is only a
 /// claim and its downloads can be inflated. [`resolve`] installs the pick by itself only when
-/// it's reviewed too and its download isn't big, and the Requires line links to it either way.
+/// it's reviewed too and isn't a big pack, and the Requires line links to it either way.
 pub fn best_provider(folder: &str, catalog: &Catalog, index: &FolderIndex) -> Option<usize> {
     let folder = folder.to_lowercase();
     index
@@ -268,7 +287,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::Release;
+    use crate::catalog::{PackGroup, Release};
     use crate::state::ManagedAddon;
     use crate::toc;
 
@@ -343,6 +362,19 @@ mod tests {
             folder: folder.to_string(),
             provider: provider.to_string(),
             size,
+        }
+    }
+
+    /// A hand-picked addon that lists these ids as its packs, the way Spoken lists its voices.
+    fn with_packs(id: &str, folder: &str, packs: &[&str]) -> Addon {
+        Addon {
+            packs: vec![PackGroup {
+                name: "Voices".to_string(),
+                needed: true,
+                ids: packs.iter().map(|p| p.to_string()).collect(),
+                met_by: Vec::new(),
+            }],
+            ..addon(id, &[folder], &[])
         }
     }
 
@@ -691,16 +723,18 @@ mod tests {
     }
 
     #[test]
-    fn a_pick_over_the_size_limit_is_left_for_the_player_with_its_size_even_when_reviewed() {
-        // A voice pack is hand-picked, and any addon's TOC can name one of its folders.
+    fn a_pack_over_the_size_limit_is_left_for_the_player_with_its_size_reviewed_or_not() {
+        // Any addon's TOC can name a voice pack's folders. The catalog publishes the big packs
+        // unreviewed, which says nothing about who made them.
         let catalog = catalog(vec![
             addon(
                 "chatter",
                 &["Chatter"],
-                &["QuestsAudio", "Lib", "Places", "Bosses"],
+                &["QuestsAudio", "Small", "Places", "Bosses"],
             ),
+            with_packs("spoken", "Spoken", &["quests", "small", "places", "bosses"]),
             sized(addon("quests", &["QuestsAudio"], &[]), 1_479_966_451),
-            sized(addon("lib", &["Lib"], &[]), BIGGEST_UNASKED_DOWNLOAD),
+            sized(addon("small", &["Small"], &[]), BIGGEST_UNASKED_DOWNLOAD),
             sized(unreviewed("places", &["Places"], &[]), 456_216_109),
             sized(
                 addon("bosses", &["Bosses"], &[]),
@@ -710,7 +744,7 @@ mod tests {
         let result = resolve_in(&catalog, "chatter", &[]);
         assert_eq!(
             result.to_install,
-            ["lib", "chatter"],
+            ["small", "chatter"],
             "up to the limit is fine"
         );
         assert_eq!(
@@ -726,12 +760,59 @@ mod tests {
     }
 
     #[test]
-    fn a_big_pick_brings_nothing_it_would_have_needed_and_is_named_once() {
+    fn a_big_pick_that_is_no_pack_goes_by_review_alone() {
+        // Musician's plugins require it, and WoW won't load them without it.
+        let catalog = catalog(vec![
+            addon("plugin", &["MusicianList"], &["Musician", "MapData"]),
+            sized(addon("musician", &["Musician"], &[]), 101_799_121),
+            sized(unreviewed("maps", &["MapData"], &[]), 1_350_000_000),
+        ]);
+        let result = resolve_in(&catalog, "plugin", &[]);
+        assert_eq!(
+            result.to_install,
+            ["musician", "plugin"],
+            "reviewed, whatever its size"
+        );
+        assert_eq!(
+            result.unreviewed,
+            [left_out("plugin", "MapData", "maps")],
+            "and nobody reviewed this one, whatever its size"
+        );
+        assert!(result.too_big.is_empty());
+    }
+
+    #[test]
+    fn only_a_reviewed_entrys_groups_make_a_pack() {
+        let mut lister = with_packs("lister", "Lister", &["musician"]);
+        lister.reviewed = false;
+        let mut catalog = catalog(vec![
+            addon("plugin", &["MusicianList"], &["Musician"]),
+            sized(addon("musician", &["Musician"], &[]), 101_799_121),
+            lister,
+        ]);
+        // An entry nobody reviewed has no say in what's a pack, so it can't keep a big
+        // requirement away.
+        assert_eq!(
+            resolve_in(&catalog, "plugin", &[]).to_install,
+            ["musician", "plugin"]
+        );
+        catalog.addons[2].reviewed = true;
+        let result = resolve_in(&catalog, "plugin", &[]);
+        assert_eq!(result.to_install, ["plugin"]);
+        assert_eq!(
+            result.too_big,
+            [too_big("plugin", "Musician", "musician", 101_799_121)]
+        );
+    }
+
+    #[test]
+    fn a_big_pack_brings_nothing_it_would_have_needed_and_is_named_once() {
         let catalog = catalog(vec![
             addon("top", &["Top"], &["Pack", "PACK", "Middle"]),
             addon("middle", &["Middle"], &["Pack"]),
             sized(addon("pack", &["Pack"], &["PackLib"]), 2_000_000_000),
             addon("packlib", &["PackLib"], &[]),
+            with_packs("owner", "Owner", &["pack"]),
         ]);
         let result = resolve_in(&catalog, "top", &[]);
         assert_eq!(result.to_install, ["middle", "top"]);
@@ -756,7 +837,11 @@ mod tests {
             date: 1,
             ..Default::default()
         });
-        let catalog = catalog(vec![addon("top", &["Top"], &["Pack"]), pack]);
+        let catalog = catalog(vec![
+            addon("top", &["Top"], &["Pack"]),
+            pack,
+            with_packs("owner", "Owner", &["pack"]),
+        ]);
         let index = FolderIndex::build(&catalog);
         let stable = resolve("top", &catalog, &index, NOTHING, |_| Channel::Stable);
         assert_eq!(stable.to_install, ["pack", "top"]);
@@ -776,10 +861,14 @@ mod tests {
 
     #[test]
     fn the_requested_addon_is_never_too_big_to_install() {
-        let catalog = catalog(vec![sized(addon("pack", &["Pack"], &[]), 2_000_000_000)]);
+        // A big pack, as the catalog publishes one: not reviewed.
+        let catalog = catalog(vec![
+            sized(unreviewed("pack", &["Pack"], &[]), 2_000_000_000),
+            with_packs("owner", "Owner", &["pack"]),
+        ]);
         let result = resolve_in(&catalog, "pack", &[]);
         assert_eq!(result.to_install, ["pack"], "the player asked for it");
-        assert!(result.too_big.is_empty());
+        assert!(result.too_big.is_empty() && result.unreviewed.is_empty());
     }
 
     // ---- dependents ----

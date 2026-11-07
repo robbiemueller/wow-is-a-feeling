@@ -2,7 +2,7 @@
 //! halfway through being drawn.
 
 use crate::app::App;
-use crate::dialogs::{ListPreview, PackPlan, Popup, RemovePlan, ReplacePlan};
+use crate::dialogs::{ListAddon, ListPreview, PackPlan, Popup, RemovePlan, ReplacePlan};
 use crate::easter;
 use crate::model::{self, CatalogBundle, HeaderId, Section, Selection, Tab};
 use crate::ops::{self, FolderConflict, Op, OpKind, Verb, folder_set};
@@ -72,7 +72,7 @@ pub enum Action {
     SetScale(f32),
     CopyList,
     PreviewList,
-    ConfirmList(Vec<(String, String, Channel)>),
+    ConfirmList(Vec<ListAddon>),
     CheckUpdateNow,
     UpdateNow(Box<UpdateInfo>),
     SkipVersion(String),
@@ -190,9 +190,9 @@ impl App {
             Action::PreviewList => self.preview_list(),
             Action::ConfirmList(add) => {
                 let mut ids = Vec::with_capacity(add.len());
-                for (id, _, channel) in add {
-                    self.channel_choice.insert(id.clone(), channel);
-                    ids.push(id);
+                for addon in add {
+                    self.channel_choice.insert(addon.id.clone(), addon.channel);
+                    ids.push(addon.id);
                 }
                 self.install_addons(ids);
             }
@@ -355,7 +355,7 @@ impl App {
 
     /// The question to ask before a first install of an addon with a needed pack group that
     /// nothing meets: nothing in AddOns or in a record, nothing this install brings with it,
-    /// and nothing already on its way. It offers each such group's first pack. A requirement
+    /// and nothing already on its way. It offers each such group's first pack. A required pack
     /// too big to come along by itself doesn't count as brought.
     fn pack_plan(&self, id: &str) -> Option<PackPlan> {
         if self.managed(id).is_some() || self.queue.busy_with(id) {
@@ -889,7 +889,9 @@ impl App {
     }
 
     /// A list is data from a stranger: it can only name addons the catalog already has,
-    /// and the player sees exactly what it would add before anything happens.
+    /// and the player sees exactly what it would add, and how big each one is, before anything
+    /// happens. An installed addon whose entry has become another addon is listed to add, as
+    /// its row shows that one isn't installed, and installing the list says why it's left alone.
     fn preview_list(&mut self) {
         let Some(bundle) = self.bundle.clone() else {
             return;
@@ -897,12 +899,18 @@ impl App {
         let parsed = listfile::parse(&self.list_text);
         let mut preview = ListPreview::default();
         for (id, channel) in parsed.entries {
+            let record = self.managed(&id);
             match bundle.addon(&id) {
                 None => preview.unknown.push(model::clean_line(&id, 80)),
-                Some(addon) if self.managed(&id).is_some() => {
+                Some(addon) if record.is_some_and(|record| model::same_addon(record, addon)) => {
                     preview.have.push(addon.name.clone());
                 }
-                Some(addon) => preview.add.push((id, addon.name.clone(), channel)),
+                Some(addon) => preview.add.push(ListAddon {
+                    name: addon.name.clone(),
+                    size: addon.release(channel).map_or(0, |release| release.size),
+                    id,
+                    channel,
+                }),
             }
         }
         preview.unknown.extend(
@@ -994,8 +1002,8 @@ fn unreviewed_line(bundle: &CatalogBundle, left: &Unreviewed) -> String {
     )
 }
 
-/// Why a required addon with a big download wasn't added, and how big it is, so getting it is
-/// the player's own choice.
+/// Why a required pack with a big download wasn't added, and how big it is, so getting it is
+/// the player's own choice. The addon that requires it won't load until they do.
 fn too_big_line(bundle: &CatalogBundle, left: &TooBig) -> String {
     let named = |id: &str, fallback: &str| {
         bundle
@@ -1003,7 +1011,7 @@ fn too_big_line(bundle: &CatalogBundle, left: &TooBig) -> String {
             .map_or_else(|| model::clean_line(fallback, 60), |a| a.name.clone())
     };
     format!(
-        "{} requires {}, a {} download. Install it from its page if you want it.",
+        "{} won't load without {}, a {} download. Install it from its page.",
         named(&left.needed_by, &left.needed_by),
         named(&left.provider, &left.folder),
         model::size_text(left.size)

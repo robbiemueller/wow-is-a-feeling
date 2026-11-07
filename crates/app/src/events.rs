@@ -415,15 +415,13 @@ impl App {
                     }
                 }
             }
-            // Main folder first, the order the catalog lists them in. A main folder it vouches
-            // the addon had before comes next, so a rollback to a build from before a rename
-            // still starts with that build's main folder, and is still this addon.
-            let known: Vec<String> = addon
-                .folders
-                .iter()
-                .chain(&addon.formerly)
-                .cloned()
-                .collect();
+            // The catalog's main folder first, then the main folders it vouches the addon had
+            // before, then the rest in the order it lists them. A rollback to a build from
+            // before a rename then starts with that build's own main folder, even when the two
+            // builds share a module, and is still this addon.
+            let main = addon.folders.iter().take(1);
+            let rest = addon.folders.iter().skip(1);
+            let known: Vec<String> = main.chain(&addon.formerly).chain(rest).cloned().collect();
             folders.sort_by_key(|folder| ops::listed_position(&known, folder));
         }
         if self.demo {

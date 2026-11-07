@@ -6,7 +6,7 @@ use crate::actions::Action;
 use crate::app::{App, PageKind, Startup};
 use crate::args::{Launch, Scene};
 use crate::demo;
-use crate::dialogs::Popup;
+use crate::dialogs::{ListAddon, Popup};
 use crate::easter;
 use crate::model::{CatalogStatus, GameState, Section, Selection, Tab, size_text};
 use crate::worker::{Dirs, Event};
@@ -2394,12 +2394,16 @@ fn every_settings_page_draws_and_can_be_operated() {
     };
     assert_eq!(
         preview.add,
-        vec![(
-            "gh:Nevcairiel/GatherMate2".to_owned(),
-            "GatherMate2".to_owned(),
-            Channel::Beta
-        )]
+        vec![ListAddon {
+            id: "gh:Nevcairiel/GatherMate2".to_owned(),
+            name: "GatherMate2".to_owned(),
+            channel: Channel::Beta,
+            // It has no beta, so its stable build is what the beta channel installs.
+            size: 3_050_000,
+        }]
     );
+    assert!(has_label(&h, "GatherMate2 (beta, 3.1 MB)"));
+    assert!(has_label(&h, "3.1 MB to download in all."));
     assert_eq!(preview.have, vec!["Questie".to_owned()]);
     assert_eq!(
         preview.unknown.len(),
@@ -3420,8 +3424,8 @@ fn a_big_pack_the_addon_itself_requires_is_asked_about_and_never_comes_along_una
     click(&mut h, "Just Spoken");
     assert!(said(
         &h,
-        "Spoken requires Spoken Audio: Quests, a 1.5 GB download. Install it from its page if \
-         you want it."
+        "Spoken won't load without Spoken Audio: Quests, a 1.5 GB download. Install it from its \
+         page."
     ));
     assert!(!app(&h).queue.busy_with(QUEST_VOICES));
     finish_ops(&mut h);
@@ -3442,7 +3446,7 @@ fn installing_both_brings_a_big_pack_the_addon_requires_without_saying_to_fetch_
     };
     app_mut(&mut h).apply(plan.with_packs());
     assert!(app(&h).queue.busy_with(SPOKEN) && app(&h).queue.busy_with(QUEST_VOICES));
-    assert!(!said(&h, "Install it from its page if you want it."));
+    assert!(!said(&h, "won't load without"));
     app_mut(&mut h).apply(Action::CancelOps);
     finish_ops(&mut h);
 }
@@ -3478,6 +3482,109 @@ fn a_big_pack_is_offered_in_gb_and_escape_installs_nothing() {
 
     click(&mut h, "Spoken Audio: Quests");
     assert!(has_label(&h, "1.5 GB"));
+}
+
+#[test]
+fn a_pack_nobody_reviewed_is_still_offered_and_install_both_brings_it() {
+    let rig = Rig::new();
+    // As the catalog publishes a pack over 100 MB: trusted, but not reviewed. An install the
+    // player asks for never looks at that.
+    let voices = |size: Option<u64>| {
+        let mut pack = named(
+            quest_voices(&rig.site, "v2.5.0"),
+            "Spoken Audio: Quests (English)",
+        );
+        pack.reviewed = false;
+        if let Some(size) = size {
+            pack.stable.as_mut().unwrap().size = size;
+        }
+        pack
+    };
+    // First as big as the real one, which is never downloaded here.
+    rig.site.publish(&catalog_of(vec![
+        spoken(&rig.site, "v3.8.3"),
+        voices(Some(1_479_966_451)),
+    ]));
+    let mut h = rig.launch_settled();
+    click(&mut h, "Spoken, v3.8.3");
+    click(&mut h, "Install");
+    assert!(matches!(app(&h).popup, Some(Popup::Packs(_))));
+    assert!(has_label(&h, "Spoken needs quest voices to work."));
+    assert!(has_label(
+        &h,
+        "Spoken Audio: Quests (English) is a 1.5 GB download. Install it too?"
+    ));
+    assert!(has_label(&h, "Install both") && has_label(&h, "Just Spoken"));
+    press(&mut h, Key::Escape);
+    assert!(app(&h).queue.is_idle());
+    close(h);
+
+    // Then at the size of the zip the site really serves, so Install both can finish.
+    rig.site
+        .publish(&catalog_of(vec![spoken(&rig.site, "v3.8.3"), voices(None)]));
+    let mut h = rig.launch_settled();
+    click(&mut h, "Spoken, v3.8.3");
+    click(&mut h, "Install");
+    click(&mut h, "Install both");
+    assert!(app(&h).popup.is_none());
+    finish_ops(&mut h);
+    assert!(managed(&h, SPOKEN).is_some());
+    assert_eq!(
+        managed(&h, QUEST_VOICES).unwrap().folders,
+        QUEST_VOICE_FOLDERS
+    );
+    for folder in QUEST_VOICE_FOLDERS {
+        assert_eq!(rig.version_on_disk(folder).as_deref(), Some("v2.5.0"));
+    }
+}
+
+#[test]
+fn a_pasted_list_shows_what_each_addon_downloads_and_the_total_before_anything_installs() {
+    let rig = Rig::new();
+    let mut voices = named(
+        quest_voices(&rig.site, "v2.5.0"),
+        "Spoken Audio: Quests (English)",
+    );
+    // Never downloaded here, so it can be as big as the real one.
+    voices.stable.as_mut().unwrap().size = 1_479_966_451;
+    let foo = publish_addon(&rig.site, FOO, "Foo", "1.0");
+    let spoken = spoken(&rig.site, "v3.8.3");
+    let size_of = |addon: &Addon| size_text(addon.stable.as_ref().unwrap().size);
+    let expected = [
+        format!("Foo Addon ({})", size_of(&foo)),
+        format!("Spoken ({})", size_of(&spoken)),
+        "Spoken Audio: Quests (English) (1.5 GB)".to_owned(),
+    ];
+    rig.site.publish(&catalog_of(vec![spoken, voices, foo]));
+    let mut h = rig.launch_settled();
+    // A friend's list, as Copy my list writes it, that brings 1.5 GB of voices along.
+    app_mut(&mut h).list_text =
+        format!("# WoW is a Feeling addon list\n{FOO}\n{SPOKEN}\n{QUEST_VOICES}\n");
+    app_mut(&mut h).apply(Action::PreviewList);
+    h.step();
+    h.step();
+    h.step();
+    let Some(Popup::List(preview)) = &app(&h).popup else {
+        panic!("the list is shown first");
+    };
+    let lines: Vec<String> = preview.add.iter().map(ListAddon::line).collect();
+    assert_eq!(lines, expected);
+    let total = preview.total();
+    assert_eq!(total.as_deref(), Some("1.5 GB to download in all."));
+    // That's what the popup shows, not just the page behind it.
+    let popup = h
+        .ctx
+        .memory(|m| m.area_rect(egui::Id::unique("static-popup")))
+        .expect("a popup is open");
+    for line in lines.iter().chain(&total) {
+        assert!(
+            h.query_all_by_label(line)
+                .any(|node| popup.contains(node.rect().center())),
+            "{line} isn't on the popup"
+        );
+    }
+    click_last(&mut h, "Cancel");
+    assert!(app(&h).popup.is_none() && app(&h).queue.is_idle());
 }
 
 #[test]
@@ -3947,6 +4054,52 @@ fn a_rollback_to_a_build_from_before_a_rename_is_still_the_same_addon() {
 }
 
 #[test]
+fn a_rollback_past_a_rename_that_kept_a_module_starts_with_that_builds_main_folder() {
+    // Most renames keep the modules: 1.0 is [Foo, Foo_Options] and 2.0 [FooCore, Foo_Options].
+    let rig = Rig::new();
+    rig.site
+        .publish(&catalog_of(vec![foo_before_the_rename(&rig.site)]));
+    let mut h = rig.launch_settled();
+    app_mut(&mut h).apply(Action::Install(vec![RENAMED.to_owned()]));
+    finish_ops(&mut h);
+    close(h);
+
+    rig.site
+        .publish(&catalog_of(vec![foo_after_the_rename(&rig.site, &["Foo"])]));
+    let mut h = rig.launch_settled();
+    click(&mut h, "Update all (1)");
+    finish_ops(&mut h);
+    click(&mut h, "Foo, 2.0");
+    click(&mut h, "Roll back to 1.0");
+    finish_ops(&mut h);
+    assert_eq!(
+        managed(&h, RENAMED).unwrap().folders,
+        ["Foo", "Foo_Options"],
+        "1.0's own main folder first, not the module both builds share"
+    );
+    // As the rollback line tells the player to.
+    app_mut(&mut h).apply(Action::SetPin(RENAMED.to_owned(), true));
+    close(h);
+
+    // 3.0 folds the options into FooCore, and the catalog still vouches for Foo.
+    let mut folded = named(publish_addon(&rig.site, RENAMED, "FooCore", "3.0"), "Foo");
+    folded.formerly = vec!["Foo".to_owned()];
+    rig.site.publish(&catalog_of(vec![folded]));
+    let mut h = rig.launch_settled();
+    app_mut(&mut h).apply(Action::SetPin(RENAMED.to_owned(), false));
+    h.step();
+    h.step();
+    assert_eq!(app(&h).updates, [RENAMED], "1.0 is still Foo");
+    click(&mut h, "Update all (1)");
+    finish_ops(&mut h);
+    assert_eq!(managed(&h, RENAMED).unwrap().folders, ["FooCore"]);
+    assert_eq!(rig.version_on_disk("FooCore").as_deref(), Some("3.0"));
+    for folder in ["Foo", "Foo_Options"] {
+        assert!(!rig.addons().join(folder).exists(), "{folder} is left over");
+    }
+}
+
+#[test]
 fn a_rename_the_catalog_does_not_vouch_for_is_never_updated_and_its_page_says_how_to_switch() {
     // A WoWInterface file holds one addon, so nothing stops its main folder changing.
     const SHORT: &str = "wowi:424242";
@@ -4013,6 +4166,70 @@ fn a_rename_the_catalog_does_not_vouch_for_is_never_updated_and_its_page_says_ho
     click(&mut h, "Fun, 1 addons");
     assert!(has_label(&h, "ShortRoyalty, v0.3.1"));
     assert!(!has_label(&h, "ShortRoyalty, installed"));
+    close(h);
+    assert_eq!(rig.version_on_disk("ShortKings").as_deref(), Some("v0.3.0"));
+    assert!(!rig.addons().join("ShortRoyalty").exists());
+}
+
+#[test]
+fn a_kit_or_a_list_that_names_an_entry_now_another_addon_says_why_it_is_left_alone() {
+    const SHORT: &str = "wowi:424242";
+    const REFUSED: &str = "ShortKings doesn't get updates: the catalog now lists a different \
+                           addon in its place, ShortRoyalty.";
+    let rig = Rig::new();
+    rig.site.publish(&catalog_of(vec![named(
+        publish_addon(&rig.site, SHORT, "ShortKings", "v0.3.0"),
+        "ShortKings",
+    )]));
+    let mut h = rig.launch_settled();
+    app_mut(&mut h).apply(Action::Install(vec![SHORT.to_owned()]));
+    finish_ops(&mut h);
+    close(h);
+
+    // A rename nobody vouched for, so the listing is another addon now.
+    let mut catalog = catalog_of(vec![named(
+        publish_addon(&rig.site, SHORT, "ShortRoyalty", "v0.3.1"),
+        "ShortRoyalty",
+    )]);
+    catalog.kits = vec![Kit {
+        name: "Fun".to_owned(),
+        description: "Fun things.".to_owned(),
+        addons: vec![SHORT.to_owned()],
+    }];
+    rig.site.publish(&catalog);
+    let mut h = rig.launch_settled();
+    click(&mut h, "Browse");
+    click(&mut h, "Fun, 1 addons");
+    assert!(
+        has_label(&h, "ShortRoyalty, v0.3.1"),
+        "the row says it isn't installed"
+    );
+    // So Install all counts it, and pressing it says why nothing happens.
+    assert!(
+        !h.get_by_label("Install all (1)")
+            .accesskit_node()
+            .is_disabled()
+    );
+    click(&mut h, "Install all (1)");
+    assert!(app(&h).queue.is_idle());
+    assert!(said(&h, REFUSED));
+    app_mut(&mut h).messages = Default::default();
+    press(&mut h, Key::Enter);
+    assert!(app(&h).queue.is_idle());
+    assert!(said(&h, REFUSED), "Enter is the same button");
+
+    // A pasted list that names it lists it to add, and installing the list says the same.
+    app_mut(&mut h).messages = Default::default();
+    app_mut(&mut h).list_text = format!("{SHORT}\n");
+    app_mut(&mut h).apply(Action::PreviewList);
+    let Some(Popup::List(preview)) = app_mut(&mut h).popup.take() else {
+        panic!("the list is shown first");
+    };
+    assert!(preview.have.is_empty());
+    assert_eq!(preview.add.len(), 1);
+    app_mut(&mut h).apply(Action::ConfirmList(preview.add));
+    assert!(app(&h).queue.is_idle());
+    assert!(said(&h, REFUSED));
     close(h);
     assert_eq!(rig.version_on_disk("ShortKings").as_deref(), Some("v0.3.0"));
     assert!(!rig.addons().join("ShortRoyalty").exists());
@@ -4125,25 +4342,35 @@ fn a_community_voice_pack_from_the_catalog_meets_the_group_too() {
         "Spoken Hebrew (Ivrit)",
     );
     hebrew.reviewed = false;
+    // The Quest voices group as catalog/curated.toml writes it.
     let mut spoken = spoken(&rig.site, "v3.8.3");
     spoken.packs[0].met_by = vec![
         "SpokenQuestsAudio".to_owned(),
         "SpokenCommunity_".to_owned(),
     ];
-    rig.site.publish(&catalog_of(vec![
-        spoken,
+    // And the English pack as the catalog publishes one that big: trusted, not reviewed.
+    let mut english = named(
         quest_voices(&rig.site, "v2.5.0"),
-        hebrew,
-    ]));
+        "Spoken Audio: Quests (English)",
+    );
+    english.reviewed = false;
+    english.stable.as_mut().unwrap().size = 1_479_966_451;
+    rig.site.publish(&catalog_of(vec![spoken, english, hebrew]));
     let mut h = rig.launch_settled();
     app_mut(&mut h).apply(Action::InstallFromPage(IVRIT.to_owned()));
     finish_ops(&mut h);
     assert!(managed(&h, IVRIT).is_some());
     click(&mut h, "Browse");
     click(&mut h, "Spoken, v3.8.3");
+    assert!(has_label(&h, "Quest voices:"), "the pack is still offered");
     assert!(!has_label(&h, NEEDS_A_PACK));
+
+    // A first install has nothing to ask, so Spoken comes alone.
     click(&mut h, "Install");
     assert!(app(&h).popup.is_none());
+    finish_ops(&mut h);
+    assert!(managed(&h, SPOKEN).is_some() && managed(&h, QUEST_VOICES).is_none());
+    assert!(!has_label(&h, NEEDS_A_PACK));
 }
 
 #[test]
@@ -4158,6 +4385,14 @@ fn an_addon_that_requires_big_packs_installs_without_them_and_says_how_big_they_
         "Spoken Audio: Places",
     );
     places.stable.as_mut().unwrap().size = 456_216_109;
+    // Both are packs because Spoken lists them, as catalog/curated.toml does.
+    let mut spoken = spoken(&rig.site, "v3.8.3");
+    spoken.packs.push(PackGroup {
+        name: "Place voices".to_owned(),
+        needed: false,
+        ids: vec![PLACES.to_owned()],
+        met_by: Vec::new(),
+    });
     // A stranger's new repository whose TOC requires the packs' folders.
     let mut stranger = publish_addon(&rig.site, FOO, "Foo", "1.0");
     stranger.trusted = false;
@@ -4166,12 +4401,8 @@ fn an_addon_that_requires_big_packs_installs_without_them_and_says_how_big_they_
         "SpokenQuestsAudioAlliance".to_owned(),
         "SpokenPlacesAudio".to_owned(),
     ];
-    rig.site.publish(&catalog_of(vec![
-        stranger,
-        spoken(&rig.site, "v3.8.3"),
-        quests,
-        places,
-    ]));
+    rig.site
+        .publish(&catalog_of(vec![stranger, spoken, quests, places]));
     let mut h = rig.launch_settled();
     click(&mut h, "Foo Addon, 1.0");
     assert!(has_label(&h, crate::model::UNTRUSTED_NOTE));
@@ -4186,13 +4417,13 @@ fn an_addon_that_requires_big_packs_installs_without_them_and_says_how_big_they_
     assert!(app(&h).popup.is_none());
     assert!(said(
         &h,
-        "Foo Addon requires Spoken Audio: Quests, a 1.5 GB download. Install it from its page \
-         if you want it."
+        "Foo Addon won't load without Spoken Audio: Quests, a 1.5 GB download. Install it from \
+         its page."
     ));
     assert!(said(
         &h,
-        "Foo Addon requires Spoken Audio: Places, a 456.2 MB download. Install it from its \
-         page if you want it."
+        "Foo Addon won't load without Spoken Audio: Places, a 456.2 MB download. Install it \
+         from its page."
     ));
     assert!(!app(&h).queue.busy_with(QUEST_VOICES) && !app(&h).queue.busy_with(PLACES));
     finish_ops(&mut h);
@@ -4203,6 +4434,144 @@ fn an_addon_that_requires_big_packs_installs_without_them_and_says_how_big_they_
             .iter()
             .all(|folder| !rig.addons().join(folder).exists())
     );
+}
+
+/// A stranger's new addon whose TOC requires a folder of the quest voices, published the way
+/// the catalog publishes a pack that big: trusted, but not reviewed. `listed` says whether
+/// Spoken lists them as its Quest voices, which is what makes them a pack.
+fn a_stranger_requiring_the_quest_voices(rig: &Rig, listed: bool) -> Catalog {
+    let mut voices = named(
+        quest_voices(&rig.site, "v2.5.0"),
+        "Spoken Audio: Quests (English)",
+    );
+    voices.reviewed = false;
+    // Never downloaded here, so it can be as big as the real one.
+    voices.stable.as_mut().unwrap().size = 1_479_966_451;
+    let mut spoken = spoken(&rig.site, "v3.8.3");
+    if !listed {
+        spoken.packs.clear();
+    }
+    let mut stranger = publish_addon(&rig.site, FOO, "Foo", "1.0");
+    stranger.trusted = false;
+    stranger.reviewed = false;
+    stranger.deps = vec!["SpokenQuestsAudioAlliance".to_owned()];
+    catalog_of(vec![stranger, spoken, voices])
+}
+
+#[test]
+fn a_big_pack_nobody_reviewed_is_left_out_with_its_size_not_as_unreviewed() {
+    let rig = Rig::new();
+    rig.site
+        .publish(&a_stranger_requiring_the_quest_voices(&rig, true));
+    let mut h = rig.launch_settled();
+    click(&mut h, "Foo Addon, 1.0");
+    assert!(has_label(&h, crate::views::page::INSTALL_IT_YOURSELF));
+    click(&mut h, "Install");
+    assert!(app(&h).popup.is_none());
+    assert!(said(
+        &h,
+        "Foo Addon won't load without Spoken Audio: Quests (English), a 1.5 GB download. \
+         Install it from its page."
+    ));
+    assert!(!said(&h, "nobody has reviewed it"));
+    assert!(!app(&h).queue.busy_with(QUEST_VOICES));
+    finish_ops(&mut h);
+    assert!(managed(&h, FOO).is_some() && managed(&h, QUEST_VOICES).is_none());
+    assert!(
+        QUEST_VOICE_FOLDERS
+            .iter()
+            .all(|folder| !rig.addons().join(folder).exists())
+    );
+}
+
+#[test]
+fn the_same_big_addon_is_no_pack_when_nothing_lists_it_so_it_is_left_out_as_unreviewed() {
+    let rig = Rig::new();
+    rig.site
+        .publish(&a_stranger_requiring_the_quest_voices(&rig, false));
+    let mut h = rig.launch_settled();
+    click(&mut h, "Foo Addon, 1.0");
+    assert!(has_label(&h, crate::views::page::INSTALL_IT_YOURSELF));
+    click(&mut h, "Install");
+    assert!(said(
+        &h,
+        "Foo Addon requires Spoken Audio: Quests (English), which wasn't added because nobody \
+         has reviewed it. Click it under Requires on the Foo Addon page to see who made it, and \
+         install it yourself."
+    ));
+    assert!(!said(&h, "won't load without"));
+    assert!(!app(&h).queue.busy_with(QUEST_VOICES));
+    finish_ops(&mut h);
+    assert!(managed(&h, FOO).is_some() && managed(&h, QUEST_VOICES).is_none());
+}
+
+#[test]
+fn a_big_requirement_nobody_reviewed_that_is_no_pack_says_nobody_reviewed_it() {
+    const MAPS: &str = "gh:nutiler/dandymapdata";
+    let rig = Rig::new();
+    // Old enough to trust, never reviewed, and no addon lists it as a pack.
+    let mut maps = named(
+        publish_addon(&rig.site, MAPS, "DandyMapData", "1.0"),
+        "Dandy Map Data",
+    );
+    maps.reviewed = false;
+    // Never downloaded here, so it can be as big as a map pack.
+    maps.stable.as_mut().unwrap().size = 1_350_000_000;
+    let mut bar = publish_addon(&rig.site, BAR, "Bar", "1.0");
+    bar.deps = vec!["DandyMapData".to_owned()];
+    let mut catalog = catalog_of(vec![bar, maps]);
+    catalog.featured = vec![BAR.to_owned()];
+    rig.site.publish(&catalog);
+    let mut h = rig.launch_settled();
+    click(&mut h, "Bar Addon, 1.0");
+    assert!(has_label(&h, crate::views::page::INSTALL_IT_YOURSELF));
+    click(&mut h, "Install");
+    assert!(said(
+        &h,
+        "Bar Addon requires Dandy Map Data, which wasn't added because nobody has reviewed it. \
+         Click it under Requires on the Bar Addon page to see who made it, and install it \
+         yourself."
+    ));
+    assert!(!said(&h, "won't load without"));
+    assert!(!app(&h).queue.busy_with(MAPS));
+    finish_ops(&mut h);
+    assert!(managed(&h, BAR).is_some() && managed(&h, MAPS).is_none());
+}
+
+#[test]
+fn a_plugin_brings_the_big_addon_it_requires_when_that_is_no_pack() {
+    // Musician is reviewed and 101.8 MB in the live catalog, and four plugins require it. WoW
+    // won't load them without it, and no addon lists it as a pack, so it comes along.
+    const MUSICIAN: &str = "gh:LenweSaralonde/Musician";
+    const LIST: &str = "gh:LenweSaralonde/MusicianList";
+    let rig = Rig::new();
+    let mut musician = named(
+        publish_addon(&rig.site, MUSICIAN, "Musician", "1.9.18.0"),
+        "Musician",
+    );
+    // Never downloaded at that size here.
+    musician.stable.as_mut().unwrap().size = 101_799_121;
+    let mut list = named(
+        publish_addon(&rig.site, LIST, "MusicianList", "1.17.0"),
+        "Musician List",
+    );
+    list.reviewed = false;
+    list.deps = vec!["Musician".to_owned()];
+    rig.site.publish(&catalog_of(vec![list, musician]));
+    let mut h = rig.launch_settled();
+    click(&mut h, "Musician List, 1.17.0");
+    assert!(has_label(&h, "Musician"), "Requires names it");
+    assert!(!has_label(&h, crate::views::page::INSTALL_IT_YOURSELF));
+
+    // Asked without drawing a frame, so nothing has finished yet when it's looked at.
+    app_mut(&mut h).apply(Action::InstallFromPage(LIST.to_owned()));
+    assert!(said(
+        &h,
+        "Musician List requires Musician, so that installs first."
+    ));
+    assert!(app(&h).queue.busy_with(MUSICIAN) && app(&h).queue.busy_with(LIST));
+    app_mut(&mut h).apply(Action::CancelOps);
+    finish_ops(&mut h);
 }
 
 #[test]

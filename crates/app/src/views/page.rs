@@ -22,7 +22,8 @@ const CHECK_HEIGHT: f32 = 20.0;
 const NOTE_GAP: f32 = 6.0;
 const NOTE_SIZE: f32 = 14.5;
 
-/// Beside a required addon that an install leaves out, because nobody has reviewed it.
+/// Beside a required addon that an install leaves out, because nobody has reviewed it or it's
+/// a big pack.
 pub const INSTALL_IT_YOURSELF: &str = "(install it yourself)";
 
 pub fn show(app: &mut App, ui: &mut Ui, rect: Rect) {
@@ -459,7 +460,7 @@ fn requires(app: &mut App, ui: &mut Ui, addon: &Addon) {
     }
     let bundle = app.bundle.clone();
     // What an install would leave for the player to add, decided the same way it decides:
-    // nobody reviewed it, or it's a big download.
+    // nobody reviewed it, or it's a pack with a big download.
     let yourself: Vec<String> = bundle.as_deref().map_or_else(Vec::new, |b| {
         let installed = app.installed_folders();
         let resolved = deps::resolve(&addon.id, &b.catalog, &b.folders, installed.iter(), |id| {

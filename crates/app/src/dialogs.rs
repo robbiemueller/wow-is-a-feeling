@@ -72,7 +72,7 @@ impl PackPlan {
         format!("{} needs {} to work.", self.name, ops::short_list(&needs))
     }
 
-    /// "Spoken Audio: Quests is a 1.5 GB download. Install it too?"
+    /// "Spoken Audio: Quests (English) is a 1.5 GB download. Install it too?"
     pub fn question(&self) -> String {
         let names: Vec<&str> = self.packs.iter().map(|(_, name)| name.as_str()).collect();
         let packs = ops::short_list(&names);
@@ -140,10 +140,56 @@ fn in_sentence(name: &str) -> String {
 /// What a pasted list would do.
 #[derive(Clone, Debug, Default)]
 pub struct ListPreview {
-    /// `(id, name, channel)`.
-    pub add: Vec<(String, String, Channel)>,
+    pub add: Vec<ListAddon>,
     pub have: Vec<String>,
     pub unknown: Vec<String>,
+}
+
+impl ListPreview {
+    /// What the addons it adds download together, for under the list: "1.6 GB to download in
+    /// all." One whose size the catalog doesn't give makes it "At least". `None` when no size
+    /// is known.
+    pub fn total(&self) -> Option<String> {
+        // Sizes come from the catalog, so a silly one mustn't overflow the sum.
+        let total = self
+            .add
+            .iter()
+            .fold(0u64, |total, addon| total.saturating_add(addon.size));
+        if total == 0 {
+            return None;
+        }
+        let total = size_text(total);
+        Some(if self.add.iter().all(|addon| addon.size > 0) {
+            format!("{total} to download in all.")
+        } else {
+            format!("At least {total} to download in all.")
+        })
+    }
+}
+
+/// One addon a pasted list would add.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ListAddon {
+    pub id: String,
+    pub name: String,
+    /// The channel the list asks for, which is the one it installs from.
+    pub channel: Channel,
+    /// What that channel's build downloads, in bytes. 0 when the catalog doesn't say.
+    pub size: u64,
+}
+
+impl ListAddon {
+    /// Its line in the list: "Spoken Audio: Quests (English) (1.5 GB)", or "(beta, 1.5 GB)"
+    /// from the beta channel.
+    pub fn line(&self) -> String {
+        let size = (self.size > 0).then(|| size_text(self.size));
+        match (self.channel, size) {
+            (Channel::Stable, None) => self.name.clone(),
+            (Channel::Stable, Some(size)) => format!("{} ({size})", self.name),
+            (Channel::Beta, None) => format!("{} (beta)", self.name),
+            (Channel::Beta, Some(size)) => format!("{} (beta, {size})", self.name),
+        }
+    }
 }
 
 pub enum Popup {
@@ -621,13 +667,8 @@ fn list(ui: &mut Ui, app: &mut App, preview: &ListPreview, keep: &mut bool) {
         .id_salt("list-preview")
         .max_height(200.0)
         .show(ui, |ui| {
-            for (_, name, channel) in &preview.add {
-                let beta = if *channel == Channel::Beta {
-                    " (beta)"
-                } else {
-                    ""
-                };
-                plain(ui, &format!("{name}{beta}"));
+            for addon in &preview.add {
+                plain(ui, &addon.line());
             }
             if !preview.have.is_empty() {
                 ui.add_space(6.0);
@@ -644,6 +685,11 @@ fn list(ui: &mut Ui, app: &mut App, preview: &ListPreview, keep: &mut bool) {
                 );
             }
         });
+    // Outside the scrolling part, so a long list can't hide it.
+    if let Some(total) = preview.total() {
+        ui.add_space(6.0);
+        plain(ui, &total);
+    }
     button_row(ui, |ui| {
         if widgets::button(ui, "Install these", ButtonKind::Main, count > 0).clicked() {
             app.actions.push(Action::ConfirmList(preview.add.clone()));
@@ -738,6 +784,62 @@ mod tests {
             "Spoken Audio: Quests and Spoken Audio: Bosses are separate downloads. \
              Install them too?"
         );
+    }
+
+    fn listed(name: &str, channel: Channel, size: u64) -> ListAddon {
+        ListAddon {
+            id: format!("gh:someone/{name}"),
+            name: name.to_owned(),
+            channel,
+            size,
+        }
+    }
+
+    #[test]
+    fn a_list_shows_each_addons_download_after_its_name() {
+        let pack = listed(
+            "Spoken Audio: Quests (English)",
+            Channel::Stable,
+            1_479_966_451,
+        );
+        assert_eq!(pack.line(), "Spoken Audio: Quests (English) (1.5 GB)");
+        let beta = listed("GatherMate2", Channel::Beta, 3_050_000);
+        assert_eq!(beta.line(), "GatherMate2 (beta, 3.1 MB)");
+        // A size the catalog doesn't give says nothing, rather than "1 KB".
+        assert_eq!(listed("Foo", Channel::Stable, 0).line(), "Foo");
+        assert_eq!(listed("Foo", Channel::Beta, 0).line(), "Foo (beta)");
+    }
+
+    #[test]
+    fn a_list_adds_up_what_it_downloads_and_says_when_that_is_only_part_of_it() {
+        let mut preview = ListPreview {
+            add: vec![
+                listed("Spoken", Channel::Stable, 72_000_000),
+                listed(
+                    "Spoken Audio: Quests (English)",
+                    Channel::Stable,
+                    1_479_966_451,
+                ),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            preview.total().as_deref(),
+            Some("1.6 GB to download in all.")
+        );
+        preview.add.push(listed("Foo", Channel::Stable, 0));
+        assert_eq!(
+            preview.total().as_deref(),
+            Some("At least 1.6 GB to download in all.")
+        );
+        preview.add.push(listed("Silly", Channel::Stable, u64::MAX));
+        assert!(preview.total().is_some(), "a silly size can't overflow");
+        assert_eq!(ListPreview::default().total(), None);
+        let unknown = ListPreview {
+            add: vec![listed("Foo", Channel::Stable, 0)],
+            ..Default::default()
+        };
+        assert_eq!(unknown.total(), None, "nothing to add up");
     }
 
     #[test]
