@@ -93,6 +93,18 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libxkbcommon-dev libgl1-mesa-dev libwayland-dev libfuse2
+      - name: Fetch appimagetool and its runtime
+        run: |
+          # Fixed releases, checked before anything runs them. The runtime becomes the first
+          # bytes of the AppImage, and the tool can touch everything in this job, so whatever
+          # arrives here gets signed and reaches players. Bump these on purpose.
+          curl -fsSL --retry 3 --retry-all-errors -o appimagetool https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage
+          curl -fsSL --retry 3 --retry-all-errors -o runtime-x86_64 https://github.com/AppImage/type2-runtime/releases/download/20251108/runtime-x86_64
+          sha256sum --check --strict <<'EOF'
+          ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0  appimagetool
+          2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d  runtime-x86_64
+          EOF
+          chmod +x appimagetool
       - run: cargo build --release --locked -p wow-is-a-feeling
       - name: Package
         run: |
@@ -118,9 +130,8 @@ jobs:
           cp assets/icon/png/icon-256.png "$appdir/usr/share/icons/hicolor/256x256/apps/wow-is-a-feeling.png"
           printf '#!/bin/sh\nexec "$(dirname "$(readlink -f "$0")")/usr/bin/wow-is-a-feeling" "$@"\n' > "$appdir/AppRun"
           chmod +x "$appdir/AppRun"
-          curl -fsSL -o appimagetool https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
-          chmod +x appimagetool
-          ARCH=x86_64 ./appimagetool --appimage-extract-and-run "$appdir" dist/wow-is-a-feeling-linux-x64.AppImage
+          # --appimage-extract-and-run has to come first, or the AppImage's runtime won't see it.
+          ARCH=x86_64 ./appimagetool --appimage-extract-and-run --runtime-file runtime-x86_64 "$appdir" dist/wow-is-a-feeling-linux-x64.AppImage
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: linux

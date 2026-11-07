@@ -265,6 +265,11 @@ while [ $# -gt 0 ]; do
     *) shift ;;
   esac
 done
+if [ -n "$BAD_DOWNLOADS" ]; then
+  # What a bad upstream release would serve, which leaves a mark if anything ever runs it.
+  printf '#!/bin/bash\ntouch ran-the-bad-download\n' > "$out"
+  exit 0
+fi
 cp "../../github/${url##*/}" "$out"
 if [ "${url##*/}" = "$TAMPER_PUBLIC" ]; then echo changed >> "$out"; fi
 "#;
@@ -371,10 +376,22 @@ impl Rig {
 
     /// Run a job's steps in order, like a runner would, stopping at the first that fails.
     fn run_job(&self, name: &str, extra_env: &[(&str, &str)]) -> Result<(), Failure> {
+        self.run_job_except(name, "", extra_env)
+    }
+
+    fn run_job_except(
+        &self,
+        name: &str,
+        skip: &str,
+        extra_env: &[(&str, &str)],
+    ) -> Result<(), Failure> {
         let text = workflow("release.yml");
         let jobs = jobs(&text);
         let work = self.work(name);
         for step in find_job(&jobs, name).steps() {
+            if step.label() == skip {
+                continue;
+            }
             let result = match step.field("uses") {
                 Some(action) => self.run_action(action, &step, &work),
                 None => self.run_step(&step, &work, extra_env, true),
@@ -953,4 +970,75 @@ fn gather_refuses_anything_but_the_expected_files() {
         assert_eq!(failure.step, "Gather assets", "{what}: {failure:?}");
         assert!(!rig.store("manifest").exists(), "{what}");
     }
+}
+
+#[test]
+fn appimagetool_and_its_runtime_come_from_fixed_releases_with_checked_hashes() {
+    let text = workflow("release.yml");
+    assert!(!text.contains("continuous"), "that release moves");
+    let jobs = jobs(&text);
+    let steps = find_job(&jobs, "linux").steps();
+    let fetch = steps
+        .iter()
+        .find(|step| step.label() == "Fetch appimagetool and its runtime")
+        .unwrap()
+        .script()
+        .unwrap();
+    for (release, name) in [
+        ("/AppImage/appimagetool/releases/download/", "appimagetool"),
+        (
+            "/AppImage/type2-runtime/releases/download/",
+            "runtime-x86_64",
+        ),
+    ] {
+        assert!(fetch.contains(release), "{fetch}");
+        let hash = fetch
+            .lines()
+            .find_map(|line| line.strip_suffix(&format!("  {name}")))
+            .unwrap_or_else(|| panic!("no hash for {name}: {fetch}"));
+        assert_eq!(hash.len(), 64, "{hash}");
+        assert!(hash.bytes().all(|b| b.is_ascii_hexdigit()), "{hash}");
+    }
+}
+
+/// The stand-in plays a bad upstream release: it gets caught before anything runs it, and
+/// before the slow build starts.
+#[test]
+fn a_bad_download_stops_the_linux_job_before_anything_runs_it() {
+    let Some(rig) = Rig::new() else { return };
+    let failure = rig.run_job("linux", &[("BAD_DOWNLOADS", "1")]).unwrap_err();
+    assert_eq!(failure.step, "Fetch appimagetool and its runtime");
+    assert!(!rig.work("linux").join("ran-the-bad-download").exists());
+    assert!(!rig.log().contains("cargo build"), "{}", rig.log());
+    assert!(!rig.store("linux").exists());
+}
+
+/// The rest of the Linux job, with a stand-in for the tool, makes exactly what Gather takes
+/// and hands the tool the checked runtime.
+#[test]
+fn the_linux_job_packages_with_the_checked_runtime() {
+    let Some(rig) = Rig::new() else { return };
+    write_program(
+        &rig.work("linux").join("appimagetool"),
+        "#!/bin/bash\necho \"appimagetool ARCH=$ARCH $*\" >> ../../log\nfor last; do :; done\necho an-appimage > \"$last\"\n",
+    );
+    rig.run_job_except("linux", "Fetch appimagetool and its runtime", &[])
+        .unwrap();
+
+    let expected: BTreeSet<String> = BUILDS
+        .iter()
+        .find(|(artifact, _)| *artifact == "linux")
+        .unwrap()
+        .1
+        .iter()
+        .map(|name| name.to_string())
+        .collect();
+    assert_eq!(file_names(&rig.store("linux")), expected);
+    let args = "--appimage-extract-and-run --runtime-file runtime-x86_64 AppDir dist/wow-is-a-feeling-linux-x64.AppImage";
+    assert!(
+        rig.log()
+            .contains(&format!("appimagetool ARCH=x86_64 {args}")),
+        "{}",
+        rig.log()
+    );
 }
