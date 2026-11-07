@@ -208,11 +208,19 @@ pub fn tag_is_prerelease(tag: &str) -> bool {
     })
 }
 
-/// Changes when a release's files change.
+/// Changes when a release's files change. The digest is what catches a file replaced
+/// by another of exactly the same size, which would otherwise keep the old file's scan.
 pub fn assets_signature(assets: &[GhAsset]) -> String {
     let mut parts: Vec<String> = assets
         .iter()
-        .map(|a| format!("{}:{}", a.name, a.size))
+        .map(|a| {
+            format!(
+                "{}:{}:{}",
+                a.name,
+                a.size,
+                a.sha256.as_deref().unwrap_or_default()
+            )
+        })
         .collect();
     parts.sort();
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
@@ -709,6 +717,31 @@ mod tests {
         releases[0].assets[0].size = 2000;
         let chosen = choose_builds("A", &releases, &mut cache, &mut fake, &|| false);
         assert!(chosen.stable.is_some());
+    }
+
+    #[test]
+    fn replacing_an_asset_with_one_of_the_same_size_is_noticed_by_its_digest() {
+        let mut fake = Fake::default();
+        fake.zips.insert("A-1.zip".into(), Ok(forever_scan("Cool")));
+        let mut releases = [release("v1", 1, &["A-1.zip"])];
+        releases[0].assets[0].sha256 = Some("a".repeat(64));
+        let mut cache = BTreeMap::new();
+        choose_builds("A", &releases, &mut cache, &mut fake, &|| false);
+        assert_eq!(fake.zip_reads.len(), 1);
+
+        // Same name and size, different bytes: the old folders must not stay paired
+        // with the new digest.
+        fake.zips
+            .insert("A-1.zip".into(), Ok(forever_scan("Other")));
+        releases[0].assets[0].sha256 = Some("b".repeat(64));
+        let chosen = choose_builds("A", &releases, &mut cache, &mut fake, &|| false);
+        assert_eq!(fake.zip_reads.len(), 2, "the new file was read");
+        let stable = chosen.stable.unwrap();
+        assert_eq!(stable.scan.folders, ["Other"]);
+        assert_eq!(stable.asset.sha256, Some("b".repeat(64)));
+
+        choose_builds("A", &releases, &mut cache, &mut fake, &|| false);
+        assert_eq!(fake.zip_reads.len(), 2, "and it's cached like any other");
     }
 
     #[test]

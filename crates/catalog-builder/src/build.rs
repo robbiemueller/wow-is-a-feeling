@@ -358,8 +358,10 @@ pub fn needs_full_look(record: &RepoState, head: &RepoInfo, now: i64) -> bool {
     if record.incomplete || record.newest_tag.as_deref() != newest {
         return true;
     }
+    // No releases, yet something is listed: the tag comparison can't see this when a
+    // rename and a deleted release fall between two runs, so the entry would stay for good.
     let Some(newest) = newest else {
-        return false;
+        return record.entry.is_some();
     };
     if is_rolling_tag(newest) {
         return true;
@@ -1196,6 +1198,29 @@ mod tests {
             ..recent
         };
         assert!(needs_full_look(&old, &head(Some("v1")), now));
+    }
+
+    #[test]
+    fn a_renamed_repository_with_no_releases_left_gets_looked_at_instead_of_staying_listed() {
+        let now = 10_000_000;
+        let mut state = State::empty();
+        let old = state.note_repo("stranger/TomTom", "topic");
+        old.entry = Some(Candidate::default());
+        old.newest_tag = Some("v1".into());
+        old.looked_at = now - 60;
+
+        // Both happen between two runs: the name changes and the releases are deleted.
+        state.rename_repo("stranger/TomTom", "stranger/Gone");
+        let moved = &state.repos["stranger/Gone"];
+        assert!(moved.entry.is_some());
+        assert_eq!(
+            moved.newest_tag, None,
+            "the record forgets its tag, so the comparison alone can't see it"
+        );
+        assert!(needs_full_look(moved, &head(None), now));
+
+        // Nothing listed and nothing to read stays free, however often it's asked.
+        assert!(!needs_full_look(&RepoState::default(), &head(None), now));
     }
 
     #[test]
