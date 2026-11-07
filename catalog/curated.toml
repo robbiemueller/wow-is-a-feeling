@@ -1,0 +1,165 @@
+# Hand-picked parts of the catalog. See docs/DESIGN.md.
+# Ids look like gh:owner/repo, wowi:1234 or direct:name. The builder drops any
+# reference that isn't in the catalog and warns about it.
+
+# Shown first, in this order. Roughly what a new player sets up first.
+featured = [
+  "gh:Questie/Questie",
+  "gh:RestedXP/RXPGuides",
+  "gh:Tercioo/Details-Damage-Meter",
+  "gh:DeadlyBossMods/DeadlyBossMods",
+  "gh:BigWigsMods/BigWigs",
+  "gh:tukui-org/ElvUI",
+  "gh:Nevcairiel/Bartender4",
+  "gh:Tercioo/Plater-Nameplates",
+  "gh:openmap-world/openmap",
+  "wowi:7032",
+  "gh:funkydude/BugSack",
+  "gh:fusionpit/WhatsTraining",
+  "gh:Nevcairiel/GatherMate2",
+  "gh:EllesmereGaming/EllesmereUI",
+  "gh:tullamods/Dominos",
+  "gh:VgerMods/Pawn",
+  "gh:Cidan/BetterBags",
+  "wowi:24165",
+  "gh:cjber/shortest-path-forever",
+  "wowi:8092",
+]
+
+[[kits]]
+name = "New to Forever"
+description = "Everything you need for your first week: quest help, a map that knows where to go, gear advice and a damage meter."
+addons = [
+  "gh:Questie/Questie",
+  "gh:openmap-world/openmap",
+  "wowi:7032",
+  "gh:fusionpit/WhatsTraining",
+  "gh:VgerMods/Pawn",
+  "gh:Tercioo/Details-Damage-Meter",
+]
+
+[[kits]]
+name = "Raid night"
+description = "Boss timers, nameplates you can read, numbers for afterward, and a warning when you're standing in the bad stuff."
+addons = [
+  "gh:DeadlyBossMods/DeadlyBossMods",
+  "gh:BigWigsMods/BigWigs",
+  "gh:Tercioo/Plater-Nameplates",
+  "gh:Tercioo/Details-Damage-Meter",
+  "wowi:17996",
+]
+
+[[gaps]]
+name = "Leatrix Plus"
+reason = "It's only published on CurseForge, whose rules don't let a free app like this one offer it."
+website = "https://www.curseforge.com/wow/addons/leatrix-plus"
+alternatives = ["gh:funkydude/SexyMap", "gh:Peterodox/Plumber"]
+
+[[gaps]]
+name = "Leatrix Maps"
+reason = "It's only published on CurseForge, whose rules don't let a free app like this one offer it."
+website = "https://www.curseforge.com/wow/addons/leatrix-maps"
+alternatives = ["gh:openmap-world/openmap", "gh:Nevcairiel/Mapster"]
+
+[[gaps]]
+name = "Bagnon"
+reason = "Its packaged builds are only on CurseForge, whose rules don't let a free app like this one offer them."
+website = "https://www.curseforge.com/wow/addons/bagnon"
+alternatives = ["gh:Cidan/BetterBags", "wowi:6488"]
+
+[[gaps]]
+name = "Baganator"
+reason = "It's only published on CurseForge and Wago, whose rules don't let a free app like this one offer it."
+website = "https://www.curseforge.com/wow/addons/baganator"
+alternatives = ["gh:Cidan/BetterBags", "wowi:6488"]
+
+[[gaps]]
+name = "Auctionator"
+reason = "It's only published on CurseForge and Wago, whose rules don't let a free app like this one offer it."
+website = "https://www.curseforge.com/wow/addons/auctionator"
+alternatives = ["wowi:24165"]
+
+[[gaps]]
+name = "Platynator"
+reason = "It's only published on CurseForge and Wago, whose rules don't let a free app like this one offer it."
+website = "https://www.curseforge.com/wow/addons/platynator"
+alternatives = ["gh:Tercioo/Plater-Nameplates", "gh:Backupiseasy/ThreatPlates"]
+
+[[gaps]]
+name = "AtlasLoot"
+reason = "Its Forever build is only on CurseForge, whose rules don't let a free app like this one offer it."
+website = "https://www.curseforge.com/wow/addons/atlasloot-forever"
+alternatives = ["wowi:3896"]
+
+[[gaps]]
+name = "DungeonJournal"
+reason = "It's only published on CurseForge, whose rules don't let a free app like this one offer it."
+website = "https://www.curseforge.com/wow/addons/dungeonjournal"
+alternatives = ["wowi:3896"]
+
+[[gaps]]
+name = "RareScanner"
+reason = "Its Forever build is only on CurseForge and Wago, whose rules don't let a free app like this one offer it."
+website = "https://www.curseforge.com/wow/addons/rarescanner"
+alternatives = ["gh:kemayo/wow-silverdragon"]
+
+[[gaps]]
+name = "BugGrabber"
+reason = "It's only published on CurseForge and Wago, whose rules don't let a free app like this one offer it."
+website = "https://www.curseforge.com/wow/addons/bug-grabber"
+alternatives = ["gh:funkydude/BugSack"]
+
+[[gaps]]
+name = "ForeverPlus"
+reason = "The original is only published on CurseForge, whose rules don't let a free app like this one offer it."
+website = "https://www.curseforge.com/wow/addons/foreverplus"
+alternatives = ["gh:fallenguards/classicuiforever"]
+unrelated = ["gh:7hedubz/ForeverPlus"]
+
+[[gaps]]
+name = "ForeverUI"
+reason = "The original is only published on CurseForge, whose rules don't let a free app like this one offer it."
+website = "https://www.curseforge.com/wow/addons/foreverui"
+alternatives = ["gh:fallenguards/classicuiforever", "gh:EllesmereGaming/EllesmereUI"]
+unrelated = ["gh:morderous/foreverui"]
+
+[[gaps]]
+name = "ElvUI"
+reason = "Its ready-to-install build is only on Tukui's own site, which needs staff permission, and its GitHub tags are missing libraries."
+website = "https://github.com/tukui-org/ElvUI"
+alternatives = ["gh:EllesmereGaming/EllesmereUI", "gh:fallenguards/classicuiforever"]
+
+# Tags but no packaged zips. The app installs GitHub's source archive using the
+# moves worked out here. A .pkgmeta with externals is refused, because the archive
+# wouldn't include those libraries. That is ElvUI's situation today: it stays
+# listed so it appears by itself if that ever changes.
+[[source]]
+repo = "tukui-org/ElvUI"
+folders = ["ElvUI", "ElvUI_Libraries", "ElvUI_Options"]
+
+[[source]]
+repo = "Tercioo/Details-Damage-Meter"
+
+[[source]]
+repo = "CaptainBritish/GnomeLevelUp"
+
+# Their own manifest, with a checksum. GPL-3.0, attribution in the summary.
+[[direct]]
+id = "direct:foreverdb"
+manifest = "https://foreverdb.net/downloads/addon-manifest.json"
+key = "addon"
+site = "https://foreverdb.net"
+name = "ForeverDB"
+author = "ForeverDB"
+website = "https://foreverdb.net"
+
+[exclude]
+# These accounts mirror other people's addons. Authors have filed DMCA notices
+# against mirrors, and we never want to send players to one.
+owners = ["hippuli", "curseforge-mirror"]
+repos = ["andi-74/foreverdungeonjournal-mirror"]
+ids = []
+
+[overrides."gh:Tercioo/Details-Damage-Meter"]
+category = "combat"
+boost = 4.0

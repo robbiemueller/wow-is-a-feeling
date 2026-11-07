@@ -1028,6 +1028,13 @@ name = "feeling-catalog"
 version = "0.1.0"
 dependencies = [
  "feeling-core",
+ "flate2",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "toml",
+ "ureq",
+ "zip",
 ]
 
 [[package]]
