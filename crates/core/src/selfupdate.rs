@@ -7,6 +7,7 @@
 
 use std::collections::BTreeMap;
 use std::env;
+use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -18,7 +19,7 @@ use minisign_verify::{PublicKey, Signature};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
-use crate::extract::{Limits, TreeOptions, extract_tree, mark_executable};
+use crate::extract::{Limits, TreeOptions, display_path, extract_tree, mark_executable};
 use crate::install::{rename_with_retry, sha256_file};
 use crate::net::{Http, Progress};
 
@@ -59,7 +60,7 @@ pub struct ManifestAsset {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AssetKind {
-    /// A Windows executable, swapped with self-replace.
+    /// A Windows executable, swapped in by renames beside the running one.
     Exe,
     /// One gzipped binary, swapped with self-replace.
     BinGz,
@@ -138,8 +139,32 @@ pub fn asset_key() -> Option<&'static str> {
     asset_key_for(
         env::consts::OS,
         env::consts::ARCH,
-        env::var_os("APPIMAGE").is_some(),
+        running_appimage().is_some(),
     )
+}
+
+/// The AppImage this program is running from. The AppImage runtime exports `$APPIMAGE` and
+/// `$APPDIR`, and whatever it starts inherits them, so a bare binary launched from a terminal
+/// inside some other AppImage sees that one's. Treating those as ours would replace that
+/// other program. Only our own file being inside `$APPDIR` shows they're about us.
+fn running_appimage() -> Option<PathBuf> {
+    confirmed_appimage(
+        &env::var_os("APPIMAGE")?,
+        &env::var_os("APPDIR")?,
+        &env::current_exe().ok()?,
+    )
+}
+
+fn confirmed_appimage(appimage: &OsStr, appdir: &OsStr, exe: &Path) -> Option<PathBuf> {
+    let appimage = PathBuf::from(appimage);
+    let is_file =
+        appimage.is_absolute() && fs::symlink_metadata(&appimage).is_ok_and(|meta| meta.is_file());
+    // The runtime builds `$APPDIR` from `$TMPDIR` as it stands, links and all.
+    let exe_inside = match (fs::canonicalize(appdir), fs::canonicalize(exe)) {
+        (Ok(appdir), Ok(exe)) => exe.starts_with(appdir),
+        _ => false,
+    };
+    (is_file && exe_inside).then_some(appimage)
 }
 
 /// Download and verify an update, then swap it in. Nothing is touched until the bytes
@@ -151,10 +176,8 @@ pub fn apply(
     cancel: &AtomicBool,
 ) -> Result<Applied> {
     let target = match update.asset.kind {
-        AssetKind::Exe | AssetKind::BinGz => {
-            env::current_exe().map_err(|e| Error::io("the running program", e))?
-        }
-        AssetKind::AppImage => env::var_os("APPIMAGE").map(PathBuf::from).ok_or_else(|| {
+        AssetKind::Exe | AssetKind::BinGz => running_exe()?,
+        AssetKind::AppImage => running_appimage().ok_or_else(|| {
             Error::Other(
                 "This update is for the AppImage, but the app isn't running as one.".into(),
             )
@@ -168,10 +191,81 @@ pub fn apply(
         http,
         &update.asset,
         &target,
-        &|new| self_replace::self_replace(new),
+        &|new| replace_running(new, &target),
         progress,
         cancel,
     )
+}
+
+/// The program to replace. On Windows that's the real file behind any link, because
+/// renaming a link away would leave the real program old, and the swap has to stay on the
+/// real file's drive. On Unix, self-replace follows links itself.
+fn running_exe() -> Result<PathBuf> {
+    let exe = env::current_exe().map_err(|e| Error::io("the running program", e))?;
+    if cfg!(windows) {
+        real_program_path(&exe).map_err(|e| Error::io(&exe, e))
+    } else {
+        Ok(exe)
+    }
+}
+
+fn real_program_path(exe: &Path) -> io::Result<PathBuf> {
+    fs::canonicalize(exe).map(|real| display_path(&real))
+}
+
+#[cfg(windows)]
+fn replace_running(new: &Path, exe: &Path) -> io::Result<()> {
+    swap_running_exe(new, exe, &|old| self_replace::self_delete_at(old))
+}
+
+/// Copies, then renames over the target in one step, so it can't leave a gap.
+#[cfg(not(windows))]
+fn replace_running(new: &Path, _exe: &Path) -> io::Result<()> {
+    self_replace::self_replace(new)
+}
+
+/// Swap a new program in for the running one, so a working program stays at `exe` whatever
+/// goes wrong. Windows won't overwrite a program that's running but will let it be renamed,
+/// so it steps aside and the new one takes its name. The new one is already beside it, so
+/// these are plain renames: no disk space needed, and retries for a scanner holding a file.
+/// Deleting the old one is put off until the new one is in place, and it's fine if that fails.
+#[cfg(any(windows, test))]
+fn swap_running_exe(
+    new: &Path,
+    exe: &Path,
+    throw_away: &dyn Fn(&Path) -> io::Result<()>,
+) -> io::Result<()> {
+    let mut old = exe.as_os_str().to_owned();
+    old.push(".old");
+    let old = PathBuf::from(old);
+    rename_with_retry(exe, &old)?;
+    if let Err(error) = rename_with_retry(new, exe) {
+        return match put_back(&old, exe) {
+            Ok(()) => Err(error),
+            Err(back) => {
+                log::error!("Couldn't swap in an update ({error}) or undo it ({back})");
+                Err(io::Error::other(format!(
+                    "the update couldn't go in ({error}) and the old program couldn't go back \
+                     ({back}). Nothing was deleted, so rename {} to {} to get it back",
+                    old.display(),
+                    exe.display()
+                )))
+            }
+        };
+    }
+    if let Err(error) = throw_away(&old) {
+        log::warn!("Couldn't delete the old program: {error}");
+    }
+    Ok(())
+}
+
+/// By whichever way works. A rename needs nothing holding the file open against it, a hard
+/// link doesn't mind that, and a copy only needs the disk space.
+#[cfg(any(windows, test))]
+fn put_back(old: &Path, exe: &Path) -> io::Result<()> {
+    rename_with_retry(old, exe)
+        .or_else(|_| fs::hard_link(old, exe))
+        .or_else(|_| fs::copy(old, exe).map(drop))
 }
 
 /// Start the new version and return, so the caller can exit.
@@ -284,8 +378,8 @@ fn bundle_of(exe: &Path) -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
-/// Everything after picking the target. `replace_running` is self-replace in the real
-/// app, and a plain swap of a fake target in tests.
+/// Everything after picking the target. `replace_running` swaps the running program in the
+/// real app, and a fake target in tests.
 fn apply_to(
     http: &Http,
     asset: &UpdateAsset,
@@ -429,6 +523,7 @@ fn swap_app_bundle(zip: &Path, app: &Path, cancel: &AtomicBool) -> Result<()> {
 mod tests {
     use super::*;
     use crate::extract::test_zips::zip_bytes;
+    use crate::install::fault::{self, Plan};
     use crate::install::to_hex;
     use crate::net::test_server::{respond, serve};
     use flate2::Compression;
@@ -966,6 +1061,380 @@ mod tests {
         assert!(matches!(result, Err(Error::Io { .. })), "{result:?}");
         assert_eq!(fs::read(&app.target).unwrap(), b"original binary");
         app.only_file_is_target();
+    }
+
+    fn delete(old: &Path) -> io::Result<()> {
+        fs::remove_file(old)
+    }
+
+    /// A program file and a verified new one beside it.
+    fn app_with_update() -> (FakeApp, PathBuf) {
+        let app = FakeApp::new();
+        let new = app.dir.path().join(TEMP_NAME);
+        fs::write(&new, b"new binary").unwrap();
+        (app, new)
+    }
+
+    fn names_in(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|item| item.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn a_swap_puts_the_new_program_in_and_only_then_throws_the_old_one_away() {
+        let (app, new) = app_with_update();
+        let seen = Mutex::new(Vec::new());
+        let throw_away = |old: &Path| {
+            // By now the new one has to be in place, and the old one still intact.
+            *seen.lock().unwrap() = vec![fs::read(&app.target)?, fs::read(old)?];
+            fs::remove_file(old)
+        };
+        swap_running_exe(&new, &app.target, &throw_away).unwrap();
+        assert_eq!(fs::read(&app.target).unwrap(), b"new binary");
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [&b"new binary"[..], b"original binary"]
+        );
+        app.only_file_is_target();
+    }
+
+    #[test]
+    fn failing_to_throw_the_old_program_away_is_only_clutter() {
+        let (app, new) = app_with_update();
+        let refuse = |_: &Path| -> io::Result<()> { Err(io::Error::other("no helper allowed")) };
+        swap_running_exe(&new, &app.target, &refuse).unwrap();
+        assert_eq!(fs::read(&app.target).unwrap(), b"new binary");
+    }
+
+    #[test]
+    fn when_the_new_program_wont_go_in_the_old_one_goes_straight_back() {
+        let (app, new) = app_with_update();
+        fault::set(Plan {
+            fail_at: vec![1],
+            ..Plan::default()
+        });
+        let result = swap_running_exe(&new, &app.target, &delete);
+        fault::take();
+        assert!(result.is_err());
+        assert_eq!(fs::read(&app.target).unwrap(), b"original binary");
+        assert_eq!(
+            names_in(app.dir.path()),
+            [TEMP_NAME, "wow-is-a-feeling"],
+            "only the download is left to clean up"
+        );
+    }
+
+    #[test]
+    fn when_the_old_program_wont_rename_back_it_gets_there_another_way() {
+        let (app, new) = app_with_update();
+        fault::set(Plan {
+            fail_at: vec![1, 2],
+            ..Plan::default()
+        });
+        let result = swap_running_exe(&new, &app.target, &delete);
+        fault::take();
+        assert!(result.is_err());
+        assert_eq!(fs::read(&app.target).unwrap(), b"original binary");
+    }
+
+    #[test]
+    fn when_nothing_can_put_it_back_the_error_says_where_it_is() {
+        // A folder takes a rename, and refuses a hard link and a copy.
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("program");
+        fs::create_dir(&target).unwrap();
+        let new = dir.path().join(TEMP_NAME);
+        fs::write(&new, b"new").unwrap();
+        fault::set(Plan {
+            fail_at: vec![1, 2],
+            ..Plan::default()
+        });
+        let text = swap_running_exe(&new, &target, &delete)
+            .unwrap_err()
+            .to_string();
+        fault::take();
+        let old = dir.path().join("program.old");
+        assert!(old.is_dir(), "nothing may be deleted");
+        assert!(text.contains(&*old.to_string_lossy()), "{text}");
+        assert!(text.contains("rename"), "{text}");
+    }
+
+    #[test]
+    fn a_leftover_from_an_earlier_update_doesnt_get_in_the_way() {
+        let (app, new) = app_with_update();
+        fs::write(app.dir.path().join("wow-is-a-feeling.old"), b"even older").unwrap();
+        swap_running_exe(&new, &app.target, &delete).unwrap();
+        assert_eq!(fs::read(&app.target).unwrap(), b"new binary");
+        app.only_file_is_target();
+    }
+
+    #[test]
+    fn the_real_swap_through_a_real_download_leaves_only_the_new_program() {
+        let app = FakeApp::new();
+        let body = b"new binary".to_vec();
+        let server = file_server(body.clone());
+        let asset = asset_for(server.base.clone() + "/a.exe", &body, AssetKind::Exe);
+        apply_to(
+            &Http::allowing_loopback(),
+            &asset,
+            &app.target,
+            &|new| swap_running_exe(new, &app.target, &delete),
+            &mut |_| {},
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(fs::read(&app.target).unwrap(), body);
+        app.only_file_is_target();
+    }
+
+    #[test]
+    fn the_real_swap_failing_after_a_real_download_leaves_only_the_old_program() {
+        let app = FakeApp::new();
+        let body = b"new binary".to_vec();
+        let server = file_server(body.clone());
+        let asset = asset_for(server.base.clone() + "/a.exe", &body, AssetKind::Exe);
+        let swap = |new: &Path| {
+            // The download has had its rename by now, so count from here.
+            fault::set(Plan {
+                fail_at: vec![1],
+                ..Plan::default()
+            });
+            let result = swap_running_exe(new, &app.target, &delete);
+            fault::take();
+            result
+        };
+        let result = apply_to(
+            &Http::allowing_loopback(),
+            &asset,
+            &app.target,
+            &swap,
+            &mut |_| {},
+            &AtomicBool::new(false),
+        );
+        assert!(matches!(result, Err(Error::Io { .. })), "{result:?}");
+        assert_eq!(fs::read(&app.target).unwrap(), b"original binary");
+        app.only_file_is_target();
+    }
+
+    /// A scanner or sync tool with the download open and not sharing it, past the retries.
+    #[cfg(windows)]
+    #[test]
+    fn a_held_download_fails_the_swap_with_the_old_program_back_in_place() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let (app, new) = app_with_update();
+        let held = File::options().read(true).share_mode(0).open(&new).unwrap();
+        let result = swap_running_exe(&new, &app.target, &delete);
+        drop(held);
+        assert!(result.is_err());
+        assert_eq!(fs::read(&app.target).unwrap(), b"original binary");
+        assert_eq!(names_in(app.dir.path()), [TEMP_NAME, "wow-is-a-feeling"]);
+    }
+
+    /// Not a test of its own: the test below runs this inside a copy of this test program,
+    /// so that the file being swapped is one that's really running.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "only runs as a child of the test below"]
+    fn swap_this_running_program() {
+        let Some(new) = env::var_os("FEELING_SWAP_TO") else {
+            return;
+        };
+        let should_fail = env::var_os("FEELING_SWAP_FAILS").is_some();
+        if should_fail {
+            fault::set(Plan {
+                fail_at: vec![1],
+                ..Plan::default()
+            });
+        }
+        let exe = running_exe().unwrap();
+        let result = replace_running(Path::new(&new), &exe);
+        fault::take();
+        assert_eq!(result.is_err(), should_fail, "{result:?}");
+    }
+
+    /// The swap with nothing faked but the failure: a running program, the real way of getting
+    /// rid of its old file, and the result launched afterward.
+    #[cfg(windows)]
+    #[test]
+    fn a_running_program_really_gets_replaced_and_really_comes_back() {
+        let run_swap = |exe: &Path, new: &Path, fails: bool| {
+            let mut child = Command::new(exe);
+            child
+                .args(["--exact", "selfupdate::tests::swap_this_running_program"])
+                .args(["--ignored", "--nocapture"])
+                .env("FEELING_SWAP_TO", new);
+            if fails {
+                child.env("FEELING_SWAP_FAILS", "1");
+            }
+            let output = child.output().unwrap();
+            assert!(output.status.success(), "{output:?}");
+        };
+        let launches = |exe: &Path| {
+            Command::new(exe)
+                .arg("--list")
+                .output()
+                .unwrap()
+                .status
+                .success()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("running.exe");
+        let new = dir.path().join(TEMP_NAME);
+        fs::copy(env::current_exe().unwrap(), &exe).unwrap();
+        let mut new_bytes = fs::read(&exe).unwrap();
+        // Windows ignores what's past the end of a program, so this still runs.
+        new_bytes.extend_from_slice(b"the new version");
+        fs::write(&new, &new_bytes).unwrap();
+
+        let old_size = fs::metadata(&exe).unwrap().len();
+        run_swap(&exe, &new, true);
+        assert_eq!(fs::metadata(&exe).unwrap().len(), old_size);
+        assert!(
+            new.exists(),
+            "a failed swap leaves the download for its caller"
+        );
+        assert!(launches(&exe), "the old program has to still work");
+
+        run_swap(&exe, &new, false);
+        assert_eq!(fs::metadata(&exe).unwrap().len(), new_bytes.len() as u64);
+        assert!(!new.exists());
+        assert!(launches(&exe), "the new program has to work");
+    }
+
+    /// The program stays reachable through the link, and the real file is what gets replaced.
+    #[cfg(windows)]
+    #[test]
+    fn a_program_behind_a_link_is_replaced_where_it_really_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let real_dir = dir.path().join("real");
+        fs::create_dir(&real_dir).unwrap();
+        let real_exe = real_dir.join("app.exe");
+        fs::write(&real_exe, b"old").unwrap();
+        let link = dir.path().join("link");
+        let output = Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(&real_dir)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "mklink failed");
+
+        let target = real_program_path(&link.join("app.exe")).unwrap();
+        assert_eq!(
+            fs::canonicalize(&target).unwrap(),
+            fs::canonicalize(&real_exe).unwrap()
+        );
+        assert!(!target.to_string_lossy().starts_with(r"\\?\"), "{target:?}");
+
+        let new = real_dir.join(TEMP_NAME);
+        fs::write(&new, b"new").unwrap();
+        swap_running_exe(&new, &target, &delete).unwrap();
+        assert_eq!(fs::read(&real_exe).unwrap(), b"new");
+        assert_eq!(fs::read(link.join("app.exe")).unwrap(), b"new");
+        assert_eq!(names_in(&real_dir), ["app.exe"]);
+    }
+
+    /// An AppImage's folder layout, with a place for a bare binary beside it.
+    struct AppImageRig {
+        _dir: tempfile::TempDir,
+        appimage: PathBuf,
+        appdir: PathBuf,
+        exe_inside: PathBuf,
+        bare_exe: PathBuf,
+    }
+
+    fn appimage_rig() -> AppImageRig {
+        let dir = tempfile::tempdir().unwrap();
+        let appimage = dir.path().join("Feeling.AppImage");
+        fs::write(&appimage, b"appimage").unwrap();
+        let appdir = dir.path().join(".mount_abc");
+        let exe_inside = appdir.join("usr/bin/wow-is-a-feeling");
+        fs::create_dir_all(exe_inside.parent().unwrap()).unwrap();
+        fs::write(&exe_inside, b"exe").unwrap();
+        let bare_exe = dir.path().join("wow-is-a-feeling");
+        fs::write(&bare_exe, b"exe").unwrap();
+        AppImageRig {
+            _dir: dir,
+            appimage,
+            appdir,
+            exe_inside,
+            bare_exe,
+        }
+    }
+
+    #[test]
+    fn our_own_exe_inside_appdir_means_we_are_the_appimage() {
+        let rig = appimage_rig();
+        assert_eq!(
+            confirmed_appimage(
+                rig.appimage.as_os_str(),
+                rig.appdir.as_os_str(),
+                &rig.exe_inside
+            ),
+            Some(rig.appimage.clone())
+        );
+    }
+
+    /// The review's case: a bare binary started from a terminal inside Cursor.AppImage, whose
+    /// variables it inherits. Believing them would rename an update over Cursor.
+    #[test]
+    fn another_appimages_variables_dont_make_a_bare_binary_an_appimage() {
+        let rig = appimage_rig();
+        assert_eq!(
+            confirmed_appimage(
+                rig.appimage.as_os_str(),
+                rig.appdir.as_os_str(),
+                &rig.bare_exe
+            ),
+            None
+        );
+        assert_eq!(fs::read(&rig.appimage).unwrap(), b"appimage");
+    }
+
+    #[test]
+    fn a_doubtful_appimage_path_isnt_believed() {
+        let rig = appimage_rig();
+        let (appdir, exe) = (rig.appdir.as_os_str(), rig.exe_inside.as_path());
+        let confirmed = |appimage: &Path| confirmed_appimage(appimage.as_os_str(), appdir, exe);
+        assert_eq!(confirmed(Path::new("Feeling.AppImage")), None, "relative");
+        assert_eq!(confirmed(&rig.appimage.with_extension("gone")), None);
+        assert_eq!(confirmed(&rig.appdir), None, "a folder");
+        assert_eq!(
+            confirmed_appimage(
+                rig.appimage.as_os_str(),
+                rig.appdir.join("gone").as_os_str(),
+                exe
+            ),
+            None
+        );
+        assert_eq!(
+            confirmed_appimage(rig.appimage.as_os_str(), OsStr::new(""), exe),
+            None
+        );
+    }
+
+    /// The runtime builds `$APPDIR` from `$TMPDIR` without resolving links, and the path of a
+    /// running program always comes back resolved.
+    #[cfg(unix)]
+    #[test]
+    fn an_appdir_reached_through_a_link_still_counts() {
+        let rig = appimage_rig();
+        let linked = rig.appdir.with_file_name("linked-mount");
+        std::os::unix::fs::symlink(&rig.appdir, &linked).unwrap();
+        assert_eq!(
+            confirmed_appimage(
+                rig.appimage.as_os_str(),
+                linked.as_os_str(),
+                &rig.exe_inside
+            ),
+            Some(rig.appimage.clone())
+        );
     }
 
     #[test]
