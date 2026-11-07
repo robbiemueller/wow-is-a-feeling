@@ -159,36 +159,24 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
 {
-    let managed = lowercase_set(managed_folders);
-    let unmanaged: Vec<&LocalFolder> = folders
-        .iter()
-        .filter(|f| !managed.contains(&f.name.to_lowercase()))
-        .collect();
-    let by_name: HashMap<String, usize> = unmanaged
-        .iter()
-        .enumerate()
-        .map(|(i, f)| (f.name.to_lowercase(), i))
-        .collect();
-
-    let mut members: Vec<Vec<usize>> = vec![Vec::new(); unmanaged.len()];
-    let mut grouped = vec![false; unmanaged.len()];
-    for (i, folder) in unmanaged.iter().enumerate() {
-        if let Some(primary) = group_primary(&folder.name.to_lowercase(), &by_name)
-            && primary != i
-            && !tocs_contradict(&unmanaged[primary].toc, &folder.toc)
+    let leaders = group_leaders(folders, &lowercase_set(managed_folders));
+    let mut members: Vec<Vec<usize>> = vec![Vec::new(); folders.len()];
+    for (i, leader) in leaders.iter().enumerate() {
+        if let Some(leader) = *leader
+            && leader != i
         {
-            members[primary].push(i);
-            grouped[i] = true;
+            members[leader].push(i);
         }
     }
 
-    let mut groups: Vec<AddonGroup> = unmanaged
+    let mut groups: Vec<AddonGroup> = leaders
         .iter()
         .enumerate()
-        .filter(|&(i, _)| !grouped[i])
-        .map(|(i, primary)| {
-            let group: Vec<&LocalFolder> = std::iter::once(*primary)
-                .chain(members[i].iter().map(|&m| unmanaged[m]))
+        .filter(|&(i, leader)| *leader == Some(i))
+        .map(|(i, _)| {
+            let primary = &folders[i];
+            let group: Vec<&LocalFolder> = std::iter::once(primary)
+                .chain(members[i].iter().map(|&m| &folders[m]))
                 .collect();
             AddonGroup {
                 primary: primary.name.clone(),
@@ -206,6 +194,33 @@ where
         .collect();
     groups.sort_by_cached_key(|g| g.primary.to_lowercase());
     groups
+}
+
+/// For each folder, the one leading its group under Other folders: itself, or the folder it
+/// hangs off. `None` for a managed folder, which isn't in any group.
+fn group_leaders(folders: &[LocalFolder], managed: &HashSet<String>) -> Vec<Option<usize>> {
+    let lower: Vec<String> = folders.iter().map(|f| f.name.to_lowercase()).collect();
+    let by_name: HashMap<String, usize> = lower
+        .iter()
+        .enumerate()
+        .filter(|(_, name)| !managed.contains(*name))
+        .map(|(i, name)| (name.clone(), i))
+        .collect();
+    lower
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            if managed.contains(name) {
+                return None;
+            }
+            let leader = group_primary(name, &by_name)
+                .filter(|&primary| {
+                    primary != i && !tocs_contradict(&folders[primary].toc, &folders[i].toc)
+                })
+                .unwrap_or(i);
+            Some(leader)
+        })
+        .collect()
 }
 
 /// The folder that leads this folder's group, trying the shortest prefix first so
@@ -232,6 +247,16 @@ fn tocs_contradict(a: &Toc, b: &Toc) -> bool {
 
 fn differ(a: Option<&str>, b: Option<&str>) -> bool {
     matches!((a, b), (Some(a), Some(b)) if a != b)
+}
+
+/// Two TOCs naming the same project on some site, with none saying otherwise.
+fn share_an_id(a: &Toc, b: &Toc) -> bool {
+    let same =
+        |x: &Option<String>, y: &Option<String>| matches!((x, y), (Some(x), Some(y)) if x == y);
+    let shared = same(&a.wowi_id, &b.wowi_id)
+        || same(&a.curse_id, &b.curse_id)
+        || same(&a.wago_id, &b.wago_id);
+    shared && !tocs_contradict(a, b)
 }
 
 /// How a local folder was recognized as a catalog addon.
@@ -261,6 +286,11 @@ pub struct Adoption {
 /// updates, and a stranger's ids and folder names are only claims. A match by id also needs
 /// the entry to list the folder, so copying an id can't take over a folder the entry has
 /// nothing to do with. Whatever doesn't match stays with the player, under Other folders.
+///
+/// One adoption only ever takes folders the disk ties together: the same group under Other
+/// folders, or TOCs carrying the same id. An entry listing a folder doesn't make it part of
+/// the addon, so a separate addon the player has under its own name stays theirs, and the
+/// first update asks about it.
 pub fn match_to_catalog<I, S>(
     folders: &[LocalFolder],
     catalog: &Catalog,
@@ -276,11 +306,13 @@ where
         .enumerate()
         .map(|(i, f)| (f.name.to_lowercase(), i))
         .collect();
+    let claimed = lowercase_set(managed_folders);
     let mut matcher = Adopter {
         folders,
         addons: &catalog.addons,
         local_by_name,
-        claimed: lowercase_set(managed_folders),
+        leaders: group_leaders(folders, &claimed),
+        claimed,
         found: BTreeMap::new(),
     };
 
@@ -298,8 +330,8 @@ where
     for (i, folder) in folders.iter().enumerate() {
         if matcher.can_adopt(folder)
             && let Some(addon) = index.by_main_folder(folder, &catalog.addons)
+            && matcher.adopt(addon, i, MatchHow::MainFolder)
         {
-            matcher.adopt(addon, i, MatchHow::MainFolder);
             matcher.claim_listed_folders(addon);
         }
     }
@@ -404,6 +436,8 @@ struct Adopter<'a> {
     folders: &'a [LocalFolder],
     addons: &'a [Addon],
     local_by_name: HashMap<String, usize>,
+    /// By folder: the folder leading its group under Other folders.
+    leaders: Vec<Option<usize>>,
     /// Lowercased names of folders already spoken for.
     claimed: HashSet<String>,
     /// By addon index: how it was matched and the local folders it owns.
@@ -416,7 +450,26 @@ impl Adopter<'_> {
         folder.toc_file.is_some() && !self.claimed.contains(&folder.name.to_lowercase())
     }
 
-    fn adopt(&mut self, addon: usize, folder: usize, how: MatchHow) {
+    /// Does the disk say this folder belongs with what the addon already has? Its group under
+    /// Other folders, or an id its TOC shares with one of them. What the entry lists isn't
+    /// evidence: that's only its claim.
+    fn tied_to(&self, addon: usize, folder: usize) -> bool {
+        let Some((_, owned)) = self.found.get(&addon) else {
+            return true;
+        };
+        owned.iter().any(|&mine| {
+            let same_group =
+                self.leaders[mine].is_some() && self.leaders[mine] == self.leaders[folder];
+            same_group || share_an_id(&self.folders[mine].toc, &self.folders[folder].toc)
+        })
+    }
+
+    /// False when the addon already matched something on disk this folder has nothing to do
+    /// with. The first match settles which of the two it is.
+    fn adopt(&mut self, addon: usize, folder: usize, how: MatchHow) -> bool {
+        if !self.tied_to(addon, folder) {
+            return false;
+        }
         self.claimed
             .insert(self.folders[folder].name.to_lowercase());
         self.found
@@ -424,20 +477,31 @@ impl Adopter<'_> {
             .or_insert((how, Vec::new()))
             .1
             .push(folder);
+        true
     }
 
-    /// The addon's other folders come along, so a later update replaces all of them.
+    /// The addon's other folders come along, so a later update replaces all of them, as long
+    /// as the disk ties them to what matched. One that's tied only through another listed
+    /// folder still comes, so this goes round until nothing more joins.
     fn claim_listed_folders(&mut self, addon: usize) {
-        for listed in &self.addons[addon].folders {
-            let lower = listed.to_lowercase();
-            let Some(&i) = self.local_by_name.get(&lower) else {
-                continue;
-            };
-            let local = &self.folders[i];
-            if self.can_adopt(local) && !contradicts(&local.toc, &self.addons[addon]) {
-                self.claimed.insert(lower);
-                if let Some((_, owned)) = self.found.get_mut(&addon) {
+        let addons = self.addons;
+        let mut joined = true;
+        while joined {
+            joined = false;
+            for listed in &addons[addon].folders {
+                let lower = listed.to_lowercase();
+                let Some(&i) = self.local_by_name.get(&lower) else {
+                    continue;
+                };
+                let local = &self.folders[i];
+                if self.can_adopt(local)
+                    && !contradicts(&local.toc, &addons[addon])
+                    && self.tied_to(addon, i)
+                    && let Some((_, owned)) = self.found.get_mut(&addon)
+                {
                     owned.push(i);
+                    self.claimed.insert(lower);
+                    joined = true;
                 }
             }
         }
@@ -450,11 +514,11 @@ impl Adopter<'_> {
             .map(|(&addon, (how, owned))| {
                 let addon = &self.addons[addon];
                 let listed_position = |i: &usize| {
-                    let name = &self.folders[*i].name;
+                    let name = self.folders[*i].name.to_lowercase();
                     addon
                         .folders
                         .iter()
-                        .position(|f| f.eq_ignore_ascii_case(name))
+                        .position(|f| f.to_lowercase() == name)
                         .unwrap_or(usize::MAX)
                 };
                 let mut owned = owned.clone();
@@ -1204,6 +1268,89 @@ mod tests {
             match_to_catalog(&by_name, &both, NO_MANAGED)[0].addon_id,
             "gh:tercioo/details"
         );
+    }
+
+    #[test]
+    fn a_listed_folder_the_disk_does_not_tie_to_the_match_stays_the_players() {
+        // Side is its own row under Other folders, maybe an addon from somewhere else. The
+        // entry listing it is only a claim, and the entry's own id is no evidence either.
+        let mut foo = addon("gh:a/foo", &["Foo", "Side", "Foo_Options"], 1);
+        foo.ids.wowi = Some("5".to_string());
+        let by_name = vec![
+            folder("Foo", "## Interface: 16001\n"),
+            folder("Foo_Options", "## Interface: 16001\n"),
+            folder("Side", "## Interface: 16001\n"),
+        ];
+        let by_id = vec![
+            folder("Foo", "## X-WoWI-ID: 5\n"),
+            folder("Foo_Options", "## Interface: 16001\n"),
+            folder("Side", "## Interface: 16001\n"),
+        ];
+        for local in [by_name, by_id] {
+            let found = match_to_catalog(&local, &catalog(vec![foo.clone()]), NO_MANAGED);
+            assert_eq!(found.len(), 1);
+            assert_eq!(
+                found[0].folders,
+                ["Foo", "Foo_Options"],
+                "its own group only"
+            );
+            assert_eq!(
+                group_names(&group_unmanaged(&local, NO_MANAGED)),
+                [("Foo", vec!["Foo", "Foo_Options"]), ("Side", vec!["Side"])],
+                "what the Other folders page shows"
+            );
+        }
+    }
+
+    #[test]
+    fn a_listed_folder_comes_along_when_its_toc_shares_an_id_with_the_match() {
+        let sack = addon("gh:a/bugsack", &["BugSack", "!BugGrabber"], 1);
+        let shared = vec![
+            folder("!BugGrabber", "## X-Curse-Project-ID: 7\n"),
+            folder("BugSack", "## X-Curse-Project-ID: 7\n"),
+        ];
+        let found = match_to_catalog(&shared, &catalog(vec![sack.clone()]), NO_MANAGED);
+        assert_eq!(found[0].folders, ["BugSack", "!BugGrabber"]);
+
+        let its_own = vec![
+            folder("!BugGrabber", "## X-Curse-Project-ID: 8\n"),
+            folder("BugSack", "## X-Curse-Project-ID: 7\n"),
+        ];
+        let found = match_to_catalog(&its_own, &catalog(vec![sack]), NO_MANAGED);
+        assert_eq!(
+            found[0].folders,
+            ["BugSack"],
+            "asked about at the first update"
+        );
+    }
+
+    #[test]
+    fn an_entry_matching_two_separate_addons_on_disk_only_gets_the_first() {
+        // The entry claims Side's real id and Foo's name. Side's id matched first, so it's
+        // Side, and the player's Foo isn't swept in with it.
+        let mut entry = addon("gh:a/both", &["Foo", "Side"], 1);
+        entry.ids.curse = Some("999".to_string());
+        let local = vec![
+            folder("Foo", "## Interface: 16001\n"),
+            folder("Side", "## X-Curse-Project-ID: 999\n"),
+        ];
+        let found = match_to_catalog(&local, &catalog(vec![entry]), NO_MANAGED);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].folders, ["Side"]);
+        assert_eq!(found[0].how, MatchHow::CurseId);
+    }
+
+    #[test]
+    fn the_main_folder_leads_an_adoption_whatever_case_the_disk_uses() {
+        // Folded the way the installer folds, so a letter outside ASCII still matches.
+        let mut entry = addon("gh:a/aerger", &["Ärger", "Ärger_Optionen"], 1);
+        entry.ids.wowi = Some("3".to_string());
+        let local = vec![
+            folder("ärger", "## Interface: 16001\n"),
+            folder("ärger_Optionen", "## X-WoWI-ID: 3\n"),
+        ];
+        let found = match_to_catalog(&local, &catalog(vec![entry]), NO_MANAGED);
+        assert_eq!(found[0].folders, ["ärger", "ärger_Optionen"]);
     }
 
     #[test]
