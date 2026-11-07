@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Blizzard addon policy
+    url: https://us.forums.blizzard.com/en/wow/t/ui-add-on-development-policy/24534
+    about: For questions about what addons are allowed to do in the game.

@@ -1,0 +1,163 @@
+name: Release
+
+# Push a tag like v0.2.0 to build every platform and publish a GitHub release.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release -p wow-is-a-feeling
+      - name: Collect
+        shell: bash
+        run: |
+          mkdir dist
+          cp target/release/wow-is-a-feeling.exe dist/wow-is-a-feeling-windows-x64.exe
+      - uses: actions/upload-artifact@v5
+        with:
+          name: windows
+          path: dist/*
+          if-no-files-found: error
+
+  linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libgl1-mesa-dev libwayland-dev libfuse2
+      - run: cargo build --release -p wow-is-a-feeling
+      - name: Package
+        run: |
+          mkdir dist
+          bin=target/release/wow-is-a-feeling
+
+          # A gzipped binary, for the in-app updater.
+          gzip -9 -c "$bin" > dist/wow-is-a-feeling-linux-x64.gz
+
+          # A tarball, for people who like to unpack things themselves.
+          mkdir -p pkg/wow-is-a-feeling
+          cp "$bin" packaging/linux/wow-is-a-feeling.desktop README.md LICENSE pkg/wow-is-a-feeling/
+          cp assets/icon/png/icon-256.png pkg/wow-is-a-feeling/wow-is-a-feeling.png
+          tar -C pkg -czf dist/wow-is-a-feeling-linux-x64.tar.gz wow-is-a-feeling
+
+          # An AppImage, the one-file way to run it.
+          appdir=AppDir
+          mkdir -p "$appdir/usr/bin" "$appdir/usr/share/applications" "$appdir/usr/share/icons/hicolor/256x256/apps"
+          cp "$bin" "$appdir/usr/bin/"
+          cp packaging/linux/wow-is-a-feeling.desktop "$appdir/"
+          cp packaging/linux/wow-is-a-feeling.desktop "$appdir/usr/share/applications/"
+          cp assets/icon/png/icon-256.png "$appdir/wow-is-a-feeling.png"
+          cp assets/icon/png/icon-256.png "$appdir/usr/share/icons/hicolor/256x256/apps/wow-is-a-feeling.png"
+          printf '#!/bin/sh\nexec "$(dirname "$(readlink -f "$0")")/usr/bin/wow-is-a-feeling" "$@"\n' > "$appdir/AppRun"
+          chmod +x "$appdir/AppRun"
+          curl -fsSL -o appimagetool https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x appimagetool
+          ARCH=x86_64 ./appimagetool --appimage-extract-and-run "$appdir" dist/wow-is-a-feeling-linux-x64.AppImage
+      - uses: actions/upload-artifact@v5
+        with:
+          name: linux
+          path: dist/*
+          if-no-files-found: error
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - name: Build both architectures
+        run: |
+          cargo build --release -p wow-is-a-feeling --target aarch64-apple-darwin
+          cargo build --release -p wow-is-a-feeling --target x86_64-apple-darwin
+      - name: Bundle
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          app="dist-app/WoW is a Feeling.app"
+          mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+          lipo -create -output "$app/Contents/MacOS/wow-is-a-feeling" \
+            target/aarch64-apple-darwin/release/wow-is-a-feeling \
+            target/x86_64-apple-darwin/release/wow-is-a-feeling
+          cp assets/icon/icon.icns "$app/Contents/Resources/icon.icns"
+          sed "s/@VERSION@/$version/g" packaging/macos/Info.plist > "$app/Contents/Info.plist"
+          # Apple silicon refuses to run anything with no signature at all. This is
+          # an ad-hoc signature, not a notarized one, so first launch needs Open Anyway.
+          codesign --force --deep -s - "$app"
+          mkdir dist
+          ditto -c -k --keepParent "$app" dist/wow-is-a-feeling-macos-universal.zip
+          hdiutil create -volname "WoW is a Feeling" -srcfolder dist-app -ov -format UDZO dist/wow-is-a-feeling-macos-universal.dmg
+      - uses: actions/upload-artifact@v5
+        with:
+          name: macos
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    needs: [windows, linux, macos]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/download-artifact@v5
+        with:
+          path: artifacts
+      - name: Gather assets
+        run: |
+          mkdir release
+          find artifacts -type f -exec mv {} release/ \;
+          ls -l release
+      - name: Write release notes
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          # The section of CHANGELOG.md for this version becomes the notes the app shows.
+          awk -v v="$version" '
+            $0 ~ "^## \\[?"v"\\]?" { found=1; next }
+            found && /^## / { exit }
+            found { print }
+          ' CHANGELOG.md > notes.md
+          test -s notes.md || echo "Release $version." > notes.md
+      - name: Make and sign the update manifest
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}"
+          cargo run --quiet -p xtask -- make-latest --version "$version" --notes-file notes.md --assets-dir release --base-url "$base"
+          cargo run --quiet -p xtask -- sign release/latest.json
+          test -f release/latest.json.minisig
+      - name: Checksums
+        run: |
+          cd release
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+      - uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: release/*
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" release/* \
+            --title "WoW is a Feeling $GITHUB_REF_NAME" \
+            --notes-file notes.md

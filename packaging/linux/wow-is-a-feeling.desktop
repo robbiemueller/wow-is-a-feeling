@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=WoW is a Feeling
+Comment=A lightweight addon manager for World of Warcraft: Forever
+Exec=wow-is-a-feeling
+Icon=wow-is-a-feeling
+Terminal=false
+Categories=Game;Utility;
+Keywords=wow;world of warcraft;forever;addons;addon manager;

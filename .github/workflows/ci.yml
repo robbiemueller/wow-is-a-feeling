@@ -29,7 +29,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libxkbcommon-dev libgl1-mesa-dev libwayland-dev xvfb libgl1-mesa-dri
+          sudo apt-get install -y libxkbcommon-dev libgl1-mesa-dev libwayland-dev libxkbcommon-x11-0 xvfb libgl1-mesa-dri
       - name: Check formatting
         if: runner.os == 'Linux'
         run: cargo fmt --all --check
@@ -53,7 +53,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libxkbcommon-dev libgl1-mesa-dev libwayland-dev xvfb libgl1-mesa-dri
+          sudo apt-get install -y libxkbcommon-dev libgl1-mesa-dev libwayland-dev libxkbcommon-x11-0 xvfb libgl1-mesa-dri
       - name: Build
         run: cargo build --release -p wow-is-a-feeling
       - name: Run and screenshot (Linux)

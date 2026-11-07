@@ -1,0 +1,56 @@
+name: Bug report
+description: Something went wrong with the app.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Settings has a **Copy diagnostics** button. Pasting that here answers most of these for you.
+  - type: input
+    id: version
+    attributes:
+      label: App version
+      description: Shown in Settings.
+      placeholder: "0.1.0"
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Windows
+        - macOS
+        - Linux
+    validations:
+      required: true
+  - type: dropdown
+    id: how
+    attributes:
+      label: How do you run the game?
+      options:
+        - Natively (Windows or macOS)
+        - Lutris
+        - Bottles
+        - Steam / Proton
+        - Faugus
+        - Plain Wine
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: addon
+    attributes:
+      label: Which addon, if any?
+      placeholder: "Questie"
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostics
+      description: Paste from Settings > Copy diagnostics.
+      render: text

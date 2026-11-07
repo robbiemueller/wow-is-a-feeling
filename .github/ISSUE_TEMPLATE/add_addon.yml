@@ -1,0 +1,27 @@
+name: Add an addon to the catalog
+description: An addon with a Forever build that isn't showing up in Browse.
+labels: [catalog]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The catalog can list addons published on GitHub or WoWInterface. Addons published only on CurseForge or Wago can't be listed, because their rules don't allow it without approval. Addon authors can get listed by publishing GitHub releases built with the BigWigs packager.
+  - type: input
+    id: name
+    attributes:
+      label: Addon name
+      placeholder: "Questie"
+    validations:
+      required: true
+  - type: input
+    id: url
+    attributes:
+      label: Where is it published?
+      description: A GitHub repository or WoWInterface page.
+      placeholder: "https://github.com/Questie/Questie"
+    validations:
+      required: true
+  - type: textarea
+    id: notes
+    attributes:
+      label: Anything else?
