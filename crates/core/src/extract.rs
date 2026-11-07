@@ -115,6 +115,27 @@ pub fn extract(
     )
 }
 
+/// What [`extract`] would do with a zip holding these entries, worked out from their
+/// names alone: the folders it would write, sorted, or why it would refuse. Each name
+/// comes with whether it's a directory. For the catalog builder, which reads zips without
+/// downloading them, so what it says about a zip can't drift from what an install does.
+pub fn planned_folders(names: &[(String, bool)]) -> Result<Vec<String>> {
+    let mut entries = Vec::with_capacity(names.len());
+    for (index, (name, is_dir)) in names.iter().enumerate() {
+        let path = clean_entry_path(name).map_err(Error::UnsafeZip)?;
+        if !path.is_empty() {
+            entries.push(ZipEntry {
+                index,
+                path,
+                is_dir: *is_dir,
+                size: 0,
+                compressed_size: 0,
+            });
+        }
+    }
+    Ok(plan_addons(&entries, &[])?.folders)
+}
+
 /// How [`extract_tree`] treats what it finds.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct TreeOptions {
@@ -361,7 +382,7 @@ const S_IFDIR: u32 = 0o040000;
 /// Normalize an entry name to `/`-separated clean segments, or say why it's unsafe.
 /// Backslashes count as separators on every OS, because the same zip must never mean
 /// `..\..\evil` on Windows and an innocent file name on Linux.
-fn clean_entry_path(name: &str) -> std::result::Result<String, String> {
+pub fn clean_entry_path(name: &str) -> std::result::Result<String, String> {
     if name.contains('\0') {
         return Err(format!(
             "it has a file name with a hidden NUL ({}).",

@@ -6,6 +6,7 @@
 use std::io::Cursor;
 
 use feeling_core::catalog::{Addon, ExternalIds, Release, Source};
+use feeling_core::extract::clean_entry_path;
 use serde::{Deserialize, Serialize};
 
 use crate::detect::FOREVER_EPOCH;
@@ -130,7 +131,10 @@ pub fn select_rows(rows: Vec<Row>, seeds: &[u64], limit: Option<usize>) -> Vec<R
 /// From a zip listing: is there any folder with a TOC the client could load?
 /// Saves downloading zips that only ship, say, `_Vanilla` TOCs.
 pub fn has_loadable_toc(files: &[String]) -> bool {
-    let paths: Vec<(String, usize)> = files.iter().map(|f| (f.replace('\\', "/"), 0)).collect();
+    let paths: Vec<(String, usize)> = files
+        .iter()
+        .filter_map(|f| Some((clean_entry_path(f).ok()?, 0)))
+        .collect();
     !addon_folders(&paths).is_empty()
 }
 
@@ -417,6 +421,10 @@ mod tests {
         assert!(has_loadable_toc(&list(&["Foo/Foo_Camelot.toc"])));
         assert!(has_loadable_toc(&list(&["Foo/Foo_Mainline.toc"])));
         assert!(has_loadable_toc(&list(&["Foo\\Foo.toc"])));
+        assert!(
+            has_loadable_toc(&list(&["Foo//Foo.toc"])),
+            "names are cleaned the way the installer cleans them"
+        );
         assert!(!has_loadable_toc(&list(&[
             "Foo/Foo_Vanilla.toc",
             "Foo/Foo_TBC.toc"

@@ -1778,6 +1778,33 @@ mod tests {
     }
 
     #[test]
+    fn a_wowi_zip_with_too_many_folders_is_remembered_not_downloaded_every_run() {
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for at in 0..=crate::zipscan::MAX_FOLDERS {
+            writer
+                .start_file(
+                    format!("Pack{at}/Pack{at}.toc"),
+                    zip::write::SimpleFileOptions::default(),
+                )
+                .unwrap();
+            writer.write_all(b"## Interface: 16001\n").unwrap();
+        }
+        let mut state = State::empty();
+        let mut tally = Tally::default();
+        let mut probe = ScriptedWowi {
+            result: Ok(writer.finish().unwrap().into_inner()),
+            calls: 0,
+        };
+        let row = [wowi_row("1.0", 1)];
+        assert!(scan_rows(&row, &mut state, &mut probe, false, &mut tally).is_empty());
+        let calls = probe.calls;
+        assert!(calls > 0);
+        assert!(scan_rows(&row, &mut state, &mut probe, false, &mut tally).is_empty());
+        assert_eq!(probe.calls, calls, "the same version costs nothing again");
+        assert_eq!(state.wowi[&42].entry, None);
+    }
+
+    #[test]
     fn a_wowi_failure_keeps_the_entry_without_its_old_checksum_and_retries_later() {
         let mut state = State::empty();
         let mut tally = Tally::default();
