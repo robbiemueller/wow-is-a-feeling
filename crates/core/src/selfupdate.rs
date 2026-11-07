@@ -20,6 +20,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 use crate::extract::{Limits, TreeOptions, display_path, extract_tree, mark_executable};
+#[cfg(any(windows, test))]
+use crate::install::{rename_once, retry_transient};
 use crate::install::{rename_with_retry, sha256_file};
 use crate::net::{Http, Progress};
 
@@ -227,8 +229,10 @@ fn replace_running(new: &Path, _exe: &Path) -> io::Result<()> {
 /// Swap a new program in for the running one, so a working program stays at `exe` whatever
 /// goes wrong. Windows won't overwrite a program that's running but will let it be renamed,
 /// so it steps aside and the new one takes its name. The new one is already beside it, so
-/// these are plain renames: no disk space needed, and retries for a scanner holding a file.
-/// Deleting the old one is put off until the new one is in place, and it's fine if that fails.
+/// these are plain renames, which need no disk space. The pair is retried as one, with the
+/// old program back in place between tries, so waiting for a scanner to let go of a file
+/// never leaves nothing at `exe` for the app to be closed on. Deleting the old one waits
+/// until the new one is in, and it's fine if that fails.
 #[cfg(any(windows, test))]
 fn swap_running_exe(
     new: &Path,
@@ -238,12 +242,16 @@ fn swap_running_exe(
     let mut old = exe.as_os_str().to_owned();
     old.push(".old");
     let old = PathBuf::from(old);
-    rename_with_retry(exe, &old)?;
-    if let Err(error) = rename_with_retry(new, exe) {
-        return match put_back(&old, exe) {
+    retry_transient(|| {
+        rename_once(exe, &old)?;
+        let Err(error) = rename_once(new, exe) else {
+            return Ok(());
+        };
+        match put_back(&old, exe) {
             Ok(()) => Err(error),
             Err(back) => {
                 log::error!("Couldn't swap in an update ({error}) or undo it ({back})");
+                // Not something to wait out, so this ends the retries.
                 Err(io::Error::other(format!(
                     "the update couldn't go in ({error}) and the old program couldn't go back \
                      ({back}). Nothing was deleted, so rename {} to {} to get it back",
@@ -251,8 +259,8 @@ fn swap_running_exe(
                     exe.display()
                 )))
             }
-        };
-    }
+        }
+    })?;
     if let Err(error) = throw_away(&old) {
         log::warn!("Couldn't delete the old program: {error}");
     }
@@ -1127,6 +1135,22 @@ mod tests {
             [TEMP_NAME, "wow-is-a-feeling"],
             "only the download is left to clean up"
         );
+    }
+
+    /// Waiting for a scanner with nothing at the program's path is when closing the app would
+    /// lose it, so each wait happens with the old program back where it was.
+    #[test]
+    fn a_lock_on_the_new_program_is_waited_out_with_the_old_one_in_place() {
+        let (app, new) = app_with_update();
+        fault::set(Plan {
+            lock_at: vec![1],
+            ..Plan::default()
+        });
+        swap_running_exe(&new, &app.target, &delete).unwrap();
+        // Aside, in (locked), back, then the pair again.
+        assert_eq!(fault::take().log, ["rename"; 5]);
+        assert_eq!(fs::read(&app.target).unwrap(), b"new binary");
+        app.only_file_is_target();
     }
 
     #[test]

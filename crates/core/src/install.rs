@@ -276,10 +276,13 @@ pub fn kept_zips(cache_dir: &Path, addon_id: &str) -> Vec<PathBuf> {
 /// A rename that waits out transient locks. Renames are all this module ever uses to
 /// move folders, because copies aren't atomic.
 pub(crate) fn rename_with_retry(from: &Path, to: &Path) -> io::Result<()> {
-    retry_transient(|| {
-        fault::hit("rename")?;
-        fs::rename(from, to)
-    })
+    retry_transient(|| rename_once(from, to))
+}
+
+/// One try at a rename, for when several have to be retried together.
+pub(crate) fn rename_once(from: &Path, to: &Path) -> io::Result<()> {
+    fault::hit("rename")?;
+    fs::rename(from, to)
 }
 
 /// SHA-256 of a file as lowercase hex.
@@ -287,7 +290,7 @@ pub(crate) fn sha256_file(path: &Path, cancel: &AtomicBool) -> Result<String> {
     hash_file::<Sha256>(path, cancel)
 }
 
-fn retry_transient(mut op: impl FnMut() -> io::Result<()>) -> io::Result<()> {
+pub(crate) fn retry_transient(mut op: impl FnMut() -> io::Result<()>) -> io::Result<()> {
     let mut delays = RETRY_DELAYS_MS.iter();
     loop {
         match op() {
@@ -328,6 +331,8 @@ pub(crate) mod fault {
         pub fail_at: Vec<usize>,
         /// The next this-many renames report that a file is in use.
         pub lock_errors: usize,
+        /// These steps report that a file is in use, once each.
+        pub lock_at: Vec<usize>,
         /// Every step reached so far.
         pub log: Vec<&'static str>,
     }
@@ -362,6 +367,9 @@ pub(crate) mod fault {
             }
             if plan.fail_at.contains(&index) {
                 return Err(io::Error::other("injected failure"));
+            }
+            if plan.lock_at.contains(&index) {
+                return Err(lock_error());
             }
             if op == "rename" && plan.lock_errors > 0 {
                 plan.lock_errors -= 1;

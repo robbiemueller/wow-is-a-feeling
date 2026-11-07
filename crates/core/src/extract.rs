@@ -128,8 +128,8 @@ impl Default for Limits {
             max_total_bytes: 2 * GB,
             max_file_bytes: 512 * MB,
             max_entries: 200_000,
-            // The biggest in the catalog is 11 MB, for 104,000 files. The catalog scan gives
-            // up at this same size, so nothing it could read trips this.
+            // The biggest in the catalog is 11 MB, for 104,000 files. The catalog scan of a
+            // GitHub release gives up at this same size.
             max_directory_bytes: 64 * MB,
             // The most in the catalog is 1,700.
             max_folders: 20_000,

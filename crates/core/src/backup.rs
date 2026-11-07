@@ -22,7 +22,7 @@ use crate::extract::{
     Limits, TreeOptions, check_tree, display_path, entry_name_fits, extract_tree, io_error,
     is_safe_folder_name, long_path,
 };
-use crate::install::{is_present, rename_with_retry};
+use crate::install::{is_present, rename_once, rename_with_retry, retry_transient};
 
 /// SavedVariables never get this big. Anything that does isn't worth a slow backup.
 pub const MAX_BACKUP_FILE_BYTES: u64 = 256 * 1024 * 1024;
@@ -211,26 +211,36 @@ pub fn restore_wtf(zip: &Path, wtf_dir: &Path, game_running: bool) -> Result<Opt
         ));
     }
 
-    let had_folder = match fs::symlink_metadata(&wtf) {
-        Ok(_) => {
-            if let Err(e) = rename_with_retry(&wtf, &aside) {
-                let _ = fs::remove_dir_all(&staging);
-                return Err(io_error(&wtf, e));
-            }
-            true
-        }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => false,
+    let had_folder = match is_present(&wtf) {
+        Ok(present) => present,
         Err(e) => {
             let _ = fs::remove_dir_all(&staging);
             return Err(io_error(&wtf, e));
         }
     };
-    if let Err(e) = rename_with_retry(&staging, &wtf) {
-        if had_folder && let Err(back) = rename_with_retry(&aside, &wtf) {
-            // Staging stays, because it's what tells the next start this restore never ended.
-            log::error!("Couldn't restore WTF ({e}) or put it back ({back})");
-            return Err(not_put_back(&aside, &back));
+    // The two renames are retried as a pair, with the old folder put back between tries, so
+    // waiting for something to let go of a file never leaves the player without a WTF.
+    let mut stranded = None;
+    let swapped = retry_transient(|| {
+        if had_folder {
+            rename_once(&wtf, &aside)?;
         }
+        let Err(error) = rename_once(&staging, &wtf) else {
+            return Ok(());
+        };
+        if had_folder && let Err(back) = rename_with_retry(&aside, &wtf) {
+            log::error!("Couldn't restore WTF ({error}) or put it back ({back})");
+            stranded = Some(back);
+            // Not something to wait out, so this ends the retries.
+            return Err(io::Error::other("the old settings couldn't be put back"));
+        }
+        Err(error)
+    });
+    if let Some(back) = stranded {
+        // Staging stays, because it's what tells the next start this restore never ended.
+        return Err(not_put_back(&aside, &back));
+    }
+    if let Err(e) = swapped {
         let _ = fs::remove_dir_all(&staging);
         return Err(io_error(&wtf, e));
     }
@@ -276,7 +286,9 @@ fn settle_unfinished_restores(wtf: &Path, parent: &Path) -> Result<Vec<String>> 
                 // The game made a new one in the meantime, which may have settings of its
                 // own by now, so that's the player's call.
                 notes.push(format!(
-                    "A settings restore was interrupted. The settings you had before it are in {}.",
+                    "A settings restore was interrupted. The settings you had before it are in \
+                     {}. To go back to them, close WoW, move the new WTF folder out of the way \
+                     and rename that one to WTF.",
                     display_path(&aside).display()
                 ));
             } else {
@@ -1074,6 +1086,27 @@ mod tests {
         assert_eq!(tree(&aside), saved, "the old settings must be intact");
         assert!(text.contains(&*aside.to_string_lossy()), "{text}");
         assert!(text.contains("rename that folder to WTF"), "{text}");
+    }
+
+    /// Closing the app while a restore waits for a locked file used to be able to leave no
+    /// WTF at all, so each wait happens with the old folder back in place.
+    #[test]
+    fn a_lock_on_the_restored_folder_is_waited_out_with_the_old_settings_in_place() {
+        let wow = Wow::new();
+        let zip = wow.backup(5).unwrap();
+        let saved = tree(&wow.wtf);
+        fs::write(wow.wtf.join("Config.wtf"), b"changed since that backup").unwrap();
+        let current = tree(&wow.wtf);
+        fault::set(Plan {
+            lock_at: vec![1],
+            ..Plan::default()
+        });
+        let aside = restore_wtf(&zip, &wow.wtf, false).unwrap().unwrap();
+        // Aside, in (locked), back, then the pair again.
+        assert_eq!(fault::take().log, ["rename"; 5]);
+        assert_eq!(tree(&wow.wtf), saved);
+        assert_eq!(tree(&aside), current);
+        assert_eq!(names_beside_wtf(&wow).len(), 2);
     }
 
     #[test]
