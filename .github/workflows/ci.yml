@@ -36,6 +36,9 @@ jobs:
         run: cargo fmt --all --check
       - name: Lint
         run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Lint the signing tool, built the way a release builds it
+        if: runner.os == 'Linux'
+        run: cargo clippy --locked -p xtask --no-default-features --bin xtask-sign -- -D warnings
       - name: Test
         run: cargo test --workspace
 

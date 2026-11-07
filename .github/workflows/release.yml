@@ -1,6 +1,22 @@
 name: Release
 
-# Push a tag like v0.2.0 to build every platform and publish a GitHub release.
+# To release: set the version in Cargo.toml, merge that, then push the matching tag, like
+# v0.2.0.
+#
+# Every installed app trusts the signing key and can't stop trusting it, so the jobs keep it
+# away from as much as they can, and each job holds only what it needs:
+#
+#   check-tag              Stops here unless the tag is a plain version matching Cargo.toml.
+#   windows, linux, macos  Build the app.
+#   signer                 Builds xtask-sign, alone, so only minisign's crates compile there.
+#   manifest               Checks what the builds made and writes latest.json.
+#   sign                   The only job with the key. No token, no source and no compiler.
+#   verify                 Checks the signature with the key built into the app.
+#   publish                The only job that can write to the repository. Runs nothing built here.
+#
+# Only GitHub's own actions run in this workflow, each pinned to a commit. When bumping a pin,
+# use a commit on the action's default branch, and the commit rather than an annotated tag's
+# own id. Nothing here restores a cache, because pushes to main write caches tag runs can read.
 on:
   push:
     tags: ["v*"]
@@ -8,21 +24,51 @@ on:
 permissions:
   contents: read
 
+defaults:
+  run:
+    shell: bash
+
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # The first thing that runs. Every other job waits for this one.
+  check-tag:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Check the tag looks like a release
+        run: |
+          if [[ ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::$GITHUB_REF_NAME isn't a release tag, so nothing was built. Release tags look like v1.2.3. Pre-releases aren't published, because every player would be offered them."
+            exit 1
+          fi
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check the tag matches Cargo.toml
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 |
+            jq -r '.packages[] | select(.name == "wow-is-a-feeling") | .version')
+          if [[ "$GITHUB_REF_NAME" != "v$version" ]]; then
+            echo "::error::Tag $GITHUB_REF_NAME doesn't match version $version in Cargo.toml, so nothing was built. The app would keep offering players the build they already have. Set the version in Cargo.toml, then delete this tag and tag that commit."
+            exit 1
+          fi
+
   windows:
+    needs: check-tag
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master on 2026-10-16
         with:
-          toolchain: stable
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-      - run: cargo build --release -p wow-is-a-feeling
+          persist-credentials: false
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+      # PowerShell, the shell CI builds with on Windows.
+      - run: cargo build --release --locked -p wow-is-a-feeling
+        shell: pwsh
       - name: Collect
-        shell: bash
         run: |
           mkdir dist
           cp target/release/wow-is-a-feeling.exe dist/wow-is-a-feeling-windows-x64.exe
@@ -33,18 +79,21 @@ jobs:
           if-no-files-found: error
 
   linux:
+    needs: check-tag
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master on 2026-10-16
         with:
-          toolchain: stable
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+          persist-credentials: false
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
       - name: Install build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y libxkbcommon-dev libgl1-mesa-dev libwayland-dev libfuse2
-      - run: cargo build --release -p wow-is-a-feeling
+      - run: cargo build --release --locked -p wow-is-a-feeling
       - name: Package
         run: |
           mkdir dist
@@ -79,18 +128,20 @@ jobs:
           if-no-files-found: error
 
   macos:
+    needs: check-tag
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master on 2026-10-16
         with:
-          toolchain: stable
-          targets: aarch64-apple-darwin,x86_64-apple-darwin
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+          persist-credentials: false
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update --target aarch64-apple-darwin --target x86_64-apple-darwin
+          rustup default stable
       - name: Build both architectures
         run: |
-          cargo build --release -p wow-is-a-feeling --target aarch64-apple-darwin
-          cargo build --release -p wow-is-a-feeling --target x86_64-apple-darwin
+          cargo build --release --locked -p wow-is-a-feeling --target aarch64-apple-darwin
+          cargo build --release --locked -p wow-is-a-feeling --target x86_64-apple-darwin
       - name: Bundle
         run: |
           version="${GITHUB_REF_NAME#v}"
@@ -113,26 +164,69 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
-  publish:
-    needs: [windows, linux, macos]
+  # A job of its own, so a build script from the rest of the tree can't touch this binary.
+  signer:
+    needs: check-tag
     runs-on: ubuntu-22.04
-    permissions:
-      contents: write
-      id-token: write
-      attestations: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master on 2026-10-16
         with:
-          toolchain: stable
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+          persist-credentials: false
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+      - run: cargo build --locked -p xtask --no-default-features --bin xtask-sign
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: signer
+          path: target/debug/xtask-sign
+          if-no-files-found: error
+
+  manifest:
+    needs: [windows, linux, macos]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+      - run: cargo build --locked -p xtask
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          path: artifacts
+          name: windows
+          path: artifacts/windows
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: linux
+          path: artifacts/linux
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: macos
+          path: artifacts/macos
       - name: Gather assets
         run: |
+          # Each build's files by name, and then nothing may be left. So a build can't add a
+          # file to the release, or replace another build's file by naming its own the same.
           mkdir release
-          find artifacts -type f -exec mv {} release/ \;
+          take() {
+            local from=$1
+            shift
+            for name in "$@"; do
+              mv "artifacts/$from/$name" release/
+            done
+          }
+          take windows wow-is-a-feeling-windows-x64.exe
+          take linux wow-is-a-feeling-linux-x64.gz wow-is-a-feeling-linux-x64.tar.gz wow-is-a-feeling-linux-x64.AppImage
+          take macos wow-is-a-feeling-macos-universal.zip wow-is-a-feeling-macos-universal.dmg
+          if [ -n "$(find artifacts ! -type d)" ]; then
+            echo "::error::A build made files that aren't part of a release, so nothing was published:"
+            find artifacts ! -type d
+            exit 1
+          fi
           ls -l release
       - name: Write release notes
         run: |
@@ -144,17 +238,105 @@ jobs:
             found { print }
           ' CHANGELOG.md > notes.md
           test -s notes.md || echo "Release $version." > notes.md
-      - name: Make and sign the update manifest
-        env:
-          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+      - name: Write latest.json
         run: |
           version="${GITHUB_REF_NAME#v}"
           base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}"
-          cargo run --quiet -p xtask -- make-latest --version "$version" --notes-file notes.md --assets-dir release --base-url "$base"
-          cargo run --quiet -p xtask -- sign release/latest.json
-          test -f release/latest.json.minisig
+          target/debug/xtask make-latest --version "$version" --notes-file notes.md --assets-dir release --base-url "$base"
+          mkdir manifest
+          mv release/latest.json manifest/
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: assets
+          path: release/*
+          if-no-files-found: error
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: manifest
+          path: manifest/latest.json
+          if-no-files-found: error
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: tool
+          path: target/debug/xtask
+          if-no-files-found: error
+
+  # The only job with the signing key, and the key is only in the one step that uses it. It
+  # has no token, no source and no compiler. The download and upload actions have no post
+  # steps, and no other code runs here.
+  sign:
+    needs: [signer, manifest]
+    runs-on: ubuntu-22.04
+    permissions: {}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: signer
+          path: signer
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: manifest
+          path: manifest
+      - name: Sign latest.json
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+        run: |
+          chmod +x signer/xtask-sign
+          signer/xtask-sign manifest/latest.json
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: signature
+          path: manifest/latest.json.minisig
+          if-no-files-found: error
+
+  # Apart from publish, because the full xtask links far more crates than a job holding the
+  # write token should run.
+  verify:
+    needs: sign
+    runs-on: ubuntu-22.04
+    permissions: {}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: tool
+          path: tool
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: manifest
+          path: release
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: signature
+          path: release
       - name: Check the signature with the key built into the app
-        run: cargo run --quiet -p xtask -- verify-latest release/latest.json
+        run: |
+          chmod +x tool/xtask
+          tool/xtask verify-latest release/latest.json
+
+  publish:
+    needs: verify
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: assets
+          path: release
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: manifest
+          path: release
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: signature
+          path: release
+      - name: Check each asset against the signed hashes
+        run: |
+          jq -r '.assets[] | "\(.sha256)  \(.url | split("/") | last)"' release/latest.json > signed-hashes
+          (cd release && sha256sum --check --strict ../signed-hashes)
       - name: Checksums
         run: |
           cd release
@@ -166,7 +348,32 @@ jobs:
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
-          gh release create "$GITHUB_REF_NAME" release/* \
+          jq -r .notes release/latest.json > notes.md
+          gh release create "$GITHUB_REF_NAME" release/* --draft --verify-tag \
             --title "WoW is a Feeling $GITHUB_REF_NAME" \
             --notes-file notes.md
+
+          # Players can't see a draft, so nothing is public until GitHub's copy has been read
+          # back and found to be byte for byte what was checked above.
+          gh release download "$GITHUB_REF_NAME" --dir stored
+          if ! diff -r release stored; then
+            echo "::error::GitHub's copy of the release isn't what was signed, so it stays a draft and players can't see it. Delete the draft, then run this job again."
+            exit 1
+          fi
+          gh release edit "$GITHUB_REF_NAME" --draft=false --latest
+
+          # The links the app will follow, the way anyone reaches them. If one is wrong, the
+          # release goes back to being a draft rather than offering an update that can't work.
+          base="https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME"
+          public_ok=true
+          for url in $(jq -r '.assets[].url' release/latest.json) "$base/latest.json" "$base/latest.json.minisig"; do
+            curl -fsSL --retry 5 --retry-all-errors -o public-copy "$url" &&
+              cmp public-copy "release/${url##*/}" || public_ok=false
+          done
+          if [ "$public_ok" != true ]; then
+            gh release edit "$GITHUB_REF_NAME" --draft=true
+            echo "::error::A public link in this release doesn't give what was signed, so it's a draft again and players can't see it. See which link in the lines above. Delete the draft, then run this job again."
+            exit 1
+          fi
