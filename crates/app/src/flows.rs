@@ -1256,7 +1256,8 @@ fn every_settings_page_draws_and_can_be_operated() {
     click(&mut h, "Display");
     assert_eq!(app(&h).section, Section::Display);
     // The slider itself, the way a screen reader or the keyboard would move it.
-    h.get_by_label("UI scale").increment_accesskit();
+    h.get_by_role_and_label(egui::accesskit::Role::Slider, "UI scale")
+        .increment_accesskit();
     h.step();
     h.step();
     assert!((app(&h).state.settings.ui_scale - 1.05).abs() < 0.001);

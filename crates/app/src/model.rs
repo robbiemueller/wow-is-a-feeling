@@ -41,6 +41,20 @@ pub const SECTIONS: [(Section, &str); 6] = [
     (Section::About, "About"),
 ];
 
+/// The section the arrow keys land on. They stop at the ends, as the lists do.
+pub fn next_section(current: Section, down: bool) -> Section {
+    let at = SECTIONS
+        .iter()
+        .position(|(section, _)| *section == current)
+        .unwrap_or(0);
+    let next = if down {
+        (at + 1).min(SECTIONS.len() - 1)
+    } else {
+        at.saturating_sub(1)
+    };
+    SECTIONS[next].0
+}
+
 /// What the parchment shows. Holds ids rather than positions, so it survives a rebuild.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Selection {
@@ -1013,6 +1027,14 @@ mod tests {
         assert_eq!(step_selection(&rows, Some(3), false), Some(1));
         assert_eq!(step_selection(&rows, Some(1), false), None);
         assert_eq!(first_row(&rows), Some(3), "an addon beats a kit");
+    }
+
+    #[test]
+    fn the_arrows_walk_the_settings_sections_and_stop_at_the_ends() {
+        assert_eq!(next_section(Section::Game, true), Section::Backups);
+        assert_eq!(next_section(Section::Backups, false), Section::Game);
+        assert_eq!(next_section(Section::Game, false), Section::Game);
+        assert_eq!(next_section(Section::About, true), Section::About);
     }
 
     #[test]

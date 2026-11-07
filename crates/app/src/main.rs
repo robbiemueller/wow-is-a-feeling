@@ -266,5 +266,6 @@ fn main() {
              and your graphics driver didn't provide it. Updating your graphics driver usually \
              fixes this.\n\nDetails: {e}"
         ));
+        std::process::exit(1);
     }
 }

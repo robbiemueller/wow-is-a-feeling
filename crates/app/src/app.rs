@@ -954,8 +954,13 @@ impl App {
                 self.actions.push(action);
             }
         }
-        if (down || up) && self.tab != Tab::Settings {
-            self.move_selection(down);
+        if down || up {
+            if self.tab == Tab::Settings {
+                self.actions
+                    .push(Action::SetSection(model::next_section(self.section, down)));
+            } else {
+                self.move_selection(down);
+            }
         }
     }
 
