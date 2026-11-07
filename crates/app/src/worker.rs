@@ -111,6 +111,8 @@ pub struct DirListing {
     pub error: Option<String>,
 }
 
+// A handful of these per install, each moved once, so the size doesn't matter.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum OpOutcome {
     Installed {

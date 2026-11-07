@@ -27,6 +27,11 @@ pub enum Error {
     BadSignature,
     #[error("Close WoW first: {0}")]
     GameRunning(String),
+    #[error(
+        "This download would also replace {}, which isn't part of this addon, so nothing was changed.",
+        .folders.join(", ")
+    )]
+    WouldReplace { folders: Vec<String> },
     #[error("Couldn't read {what}: {detail}")]
     Parse { what: String, detail: String },
     #[error("{0}")]

@@ -109,6 +109,12 @@ pub struct InstallRequest {
     /// `paths::cache_dir()`, to keep a copy in `zips/<safe id>/` for rollback.
     /// `None` keeps nothing.
     pub cache_dir: Option<PathBuf>,
+    /// Folders already in AddOns that this install may replace, besides `old_folders`: this
+    /// addon's own, including ones it shares, and any the player agreed to. If the zip would
+    /// replace anything else, the install stops with [`Error::WouldReplace`] and nothing
+    /// changes. Folders new to the disk are always fine. `None` allows anything, for something
+    /// the player picked by hand, such as a zip they dropped or a rollback.
+    pub may_replace: Option<Vec<String>>,
 }
 
 impl InstallRequest {
@@ -141,6 +147,8 @@ pub struct InstallOutcome {
     pub skipped_files: Vec<String>,
     /// The folders whose TOC targets Forever.
     pub forever_folders: Vec<String>,
+    /// Folders that were already in AddOns and got replaced, other than `old_folders`.
+    pub replaced: Vec<String>,
     /// Things worth telling the player. The install itself succeeded.
     pub warnings: Vec<String>,
     pub kept_zip: Option<PathBuf>,
@@ -1041,14 +1049,26 @@ fn run_install(
                 return Err(error);
             }
         };
-    for old in entries.iter().filter_map(|entry| entry.old.as_ref()) {
-        if !request
-            .old_folders
+    let is_listed = |names: &[String], folder: &str| names.iter().any(|n| fold(n) == fold(folder));
+    let replaced: Vec<String> = entries
+        .iter()
+        .filter_map(|entry| entry.old.clone())
+        .filter(|old| !is_listed(&request.old_folders, old))
+        .collect();
+    if let Some(allowed) = &request.may_replace {
+        let refused: Vec<String> = replaced
             .iter()
-            .any(|name| fold(name) == fold(old))
-        {
-            log::info!("Replacing a folder that was already in AddOns: {old}");
+            .filter(|old| !is_listed(allowed, old))
+            .cloned()
+            .collect();
+        if !refused.is_empty() {
+            log::warn!("Refused to replace {refused:?} for {}", request.addon_id);
+            txn.abandon();
+            return Err(Error::WouldReplace { folders: refused });
         }
+    }
+    for old in &replaced {
+        log::info!("Replacing a folder that was already in AddOns: {old}");
     }
     txn.commit(&entries)?;
 
@@ -1084,6 +1104,7 @@ fn run_install(
         folders: prepared.folders,
         skipped_files: prepared.skipped_files,
         forever_folders: prepared.forever_folders,
+        replaced,
         warnings,
         kept_zip,
     })
@@ -3052,6 +3073,68 @@ mod tests {
     fn hex_encoding() {
         assert_eq!(to_hex(&[0x00, 0xab, 0xff]), "00abff");
         assert_eq!(to_hex(&[]), "");
+    }
+
+    #[test]
+    fn an_install_stops_before_replacing_a_folder_it_was_not_given() {
+        let existing: &[(&str, &[u8])] = &[
+            ("Questie/Questie.toc", b"the real one"),
+            ("Own/Own.toc", b"old"),
+        ];
+        let game = Game::with_addons(existing);
+        let zip = game.zip(
+            "sneaky.zip",
+            &[
+                ("Own/Own.toc", FOREVER_TOC),
+                ("Questie/Questie.toc", FOREVER_TOC),
+            ],
+        );
+        let mut req = request(&["Own"]);
+        req.may_replace = Some(Vec::new());
+        match game.install(&zip, &req) {
+            Err(Error::WouldReplace { folders }) => assert_eq!(folders, ["Questie"]),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert_eq!(game.addons(), tree_from(existing));
+        game.assert_no_leftovers();
+
+        // Agreeing to it, in any case, lets it through and says what went.
+        req.may_replace = Some(vec!["QUESTIE".into()]);
+        let outcome = game.install(&zip, &req).unwrap();
+        assert_eq!(outcome.replaced, ["Questie"]);
+        assert_eq!(
+            game.addons(),
+            tree_from(&[
+                ("Own/Own.toc", FOREVER_TOC),
+                ("Questie/Questie.toc", FOREVER_TOC)
+            ])
+        );
+        game.assert_no_leftovers();
+    }
+
+    #[test]
+    fn a_new_folder_never_counts_as_replacing_anything() {
+        let game = Game::with_addons(&[("Own/Own.toc", b"old")]);
+        let zip = game.zip(
+            "bigger.zip",
+            &[
+                ("Own/Own.toc", FOREVER_TOC),
+                ("Own_Extra/Own_Extra.toc", FOREVER_TOC),
+            ],
+        );
+        let mut req = request(&["Own"]);
+        req.may_replace = Some(Vec::new());
+        let outcome = game.install(&zip, &req).unwrap();
+        assert!(outcome.replaced.is_empty(), "{:?}", outcome.replaced);
+        assert_eq!(outcome.folders, ["Own", "Own_Extra"]);
+    }
+
+    #[test]
+    fn without_a_list_an_install_may_replace_anything_and_says_so() {
+        let game = Game::with_addons(&[("Other/Other.toc", b"old")]);
+        let zip = game.zip("own.zip", &[("Other/Other.toc", FOREVER_TOC)]);
+        let outcome = game.install(&zip, &request(&[])).unwrap();
+        assert_eq!(outcome.replaced, ["Other"]);
     }
 
     #[test]

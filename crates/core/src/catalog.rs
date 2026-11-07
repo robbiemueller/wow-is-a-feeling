@@ -72,6 +72,12 @@ pub struct Addon {
     /// Unix seconds when this addon first appeared, for the "Newest" sort. 0 when unknown.
     #[serde(default, skip_serializing_if = "is_zero_i64")]
     pub created: i64,
+    /// Whether the app may pick this entry by itself: to manage a folder already on disk, or
+    /// to fill a dependency. Set by the catalog builder for hand-picked and moderated entries
+    /// and ones long established under the same name. A stranger's brand new repo isn't. Its
+    /// folders, ids and name are claims, so it only gets installed when a player asks for it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub trusted: bool,
     /// Screenshots, for a source whose details don't list them (WoWInterface). Written by a
     /// stranger, so the app filters these and fetches them with `Http::get_untrusted`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
