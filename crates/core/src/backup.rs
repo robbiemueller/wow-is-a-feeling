@@ -1,8 +1,10 @@
 //! WTF settings backup and restore. WTF holds a player's keybindings, macros and every
 //! addon's SavedVariables, so it's the one folder here that can't be downloaded again.
 //!
-//! Backups go through a `.part` file, and a restore moves the current folder aside
-//! rather than deleting it, so neither one can leave a player worse off.
+//! A backup goes through a `.part` file and only counts once a restore would accept it, so
+//! a bad one can't push out good ones. A restore moves the current folder aside rather than
+//! deleting it, and its folder names say how far it got, so [`recover_restore`] can put
+//! things right after a crash. Neither one can leave a player worse off.
 
 use std::cmp::Reverse;
 use std::fs::{self, File};
@@ -16,14 +18,50 @@ use zip::{CompressionMethod, DateTime, ZipWriter};
 
 use crate::error::{Error, Result};
 use crate::extract::{
-    Limits, TreeOptions, display_path, extract_tree, io_error, is_safe_folder_name, long_path,
+    Limits, TreeOptions, check_tree, display_path, entry_name_fits, extract_tree, io_error,
+    is_safe_folder_name, long_path,
 };
-use crate::install::rename_with_retry;
+use crate::install::{is_present, rename_with_retry};
 
 /// SavedVariables never get this big. Anything that does isn't worth a slow backup.
 pub const MAX_BACKUP_FILE_BYTES: u64 = 256 * 1024 * 1024;
+/// A backup has no total of its own, so this is only here to stop a zip made elsewhere from
+/// filling a disk. No real WTF comes near it.
+const MAX_RESTORE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 const DAY_SECONDS: i64 = 86_400;
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
+/// Unpacking goes here. It only outlives a restore that was interrupted.
+const STAGING_PREFIX: &str = "WTF.restoring-";
+/// The folder a restore replaced, kept for good.
+const ASIDE_PREFIX: &str = "WTF.before-restore-";
+
+/// What a restore accepts: a player's own files, not a stranger's zip. An addon that saved
+/// one long string compresses better than any zip bomb limit, and a heavy player's WTF can
+/// outgrow what's sensible for an addon. Neither is a reason to refuse all of someone's
+/// settings. Paths, links, programs and the size of any one file are checked as usual.
+fn restore_limits() -> Limits {
+    Limits {
+        max_total_bytes: MAX_RESTORE_BYTES,
+        max_ratio: u64::MAX,
+        ..Limits::default()
+    }
+}
+
+fn restore_options() -> TreeOptions {
+    TreeOptions {
+        settings_backup: true,
+        ..TreeOptions::default()
+    }
+}
+
+/// A refusal in words about backups, because the zip checks' own say "addon" and "download".
+fn backup_refusal(error: Error, start: &str, end: &str) -> Error {
+    match error {
+        Error::UnsafeZip(reason) => Error::Other(format!("{start}: {reason} {end}")),
+        Error::Corrupt(reason) => Error::Other(format!("{start}: {reason}. {end}")),
+        other => other,
+    }
+}
 
 /// What [`backup_wtf`] reports as it goes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,11 +88,23 @@ pub struct BackupEntry {
 
 /// Zip `wtf_dir` into `dest_dir/WTF-YYYYMMDD-HHMMSS.zip` (UTC), then keep only the newest
 /// `keep` backups, always at least the one just made. Only files named like our backups
-/// are ever deleted.
+/// are ever deleted. A zip that [`restore_wtf`] would refuse isn't kept and doesn't count:
+/// it's an error, and the older backups stay.
 pub fn backup_wtf(
     wtf_dir: &Path,
     dest_dir: &Path,
     keep: usize,
+    progress: &mut dyn FnMut(BackupProgress),
+    cancel: &AtomicBool,
+) -> Result<PathBuf> {
+    backup_within(wtf_dir, dest_dir, keep, restore_limits(), progress, cancel)
+}
+
+fn backup_within(
+    wtf_dir: &Path,
+    dest_dir: &Path,
+    keep: usize,
+    restorable_within: Limits,
     progress: &mut dyn FnMut(BackupProgress),
     cancel: &AtomicBool,
 ) -> Result<PathBuf> {
@@ -68,6 +118,15 @@ pub fn backup_wtf(
     part.push(".part");
     let part = PathBuf::from(part);
     let written = write_zip(&part, &files, progress, cancel)
+        .and_then(|()| {
+            check_tree(&part, restorable_within, restore_options()).map_err(|error| {
+                backup_refusal(
+                    error,
+                    "This settings backup wasn't saved, because it couldn't be restored",
+                    "Your older backups were kept.",
+                )
+            })
+        })
         .and_then(|()| rename_with_retry(&part, &path).map_err(|e| io_error(&path, e)));
     if let Err(error) = written {
         let _ = fs::remove_file(&part);
@@ -123,51 +182,115 @@ pub fn restore_wtf(zip: &Path, wtf_dir: &Path, game_running: bool) -> Result<Opt
             wtf_dir.display()
         ))
     })?;
-    let staging = parent.join("WTF.restoring");
-    remove_leftover(&staging)?;
+    // Otherwise this would lose track of the settings an unfinished restore moved aside.
+    for note in recover_restore(wtf_dir)? {
+        log::info!("{note}");
+    }
+    let stamp = free_restore_stamp(parent, unix_now());
+    let staging = parent.join(format!("{STAGING_PREFIX}{stamp}"));
+    let aside = parent.join(format!("{ASIDE_PREFIX}{stamp}"));
     let unpacked = extract_tree(
         zip,
         &staging,
-        Limits::default(),
-        TreeOptions::default(),
+        restore_limits(),
+        restore_options(),
         &mut |_| {},
         &AtomicBool::new(false),
     );
     if let Err(error) = unpacked {
         let _ = fs::remove_dir_all(&staging);
-        return Err(error);
+        return Err(backup_refusal(
+            error,
+            "This backup can't be restored",
+            "Your settings weren't changed. Try an older backup.",
+        ));
     }
 
-    let aside = match fs::symlink_metadata(&wtf) {
+    let had_folder = match fs::symlink_metadata(&wtf) {
         Ok(_) => {
-            let aside = free_aside_name(parent, unix_now());
             if let Err(e) = rename_with_retry(&wtf, &aside) {
                 let _ = fs::remove_dir_all(&staging);
                 return Err(io_error(&wtf, e));
             }
-            Some(aside)
+            true
         }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => false,
         Err(e) => {
             let _ = fs::remove_dir_all(&staging);
             return Err(io_error(&wtf, e));
         }
     };
     if let Err(e) = rename_with_retry(&staging, &wtf) {
-        if let Some(aside) = &aside {
-            let _ = rename_with_retry(aside, &wtf);
+        if had_folder && let Err(back) = rename_with_retry(&aside, &wtf) {
+            // Staging stays, because it's what tells the next start this restore never ended.
+            log::error!("Couldn't restore WTF ({e}) or put it back ({back})");
+            return Err(not_put_back(&aside, &back));
         }
         let _ = fs::remove_dir_all(&staging);
         return Err(io_error(&wtf, e));
     }
-    Ok(aside.map(|path| display_path(&path)))
+    Ok(had_folder.then(|| display_path(&aside)))
 }
 
-fn remove_leftover(path: &Path) -> Result<()> {
-    match fs::remove_dir_all(path) {
-        Err(e) if e.kind() != io::ErrorKind::NotFound => Err(io_error(path, e)),
-        _ => Ok(()),
+/// Settle a restore that never finished, because the app was closed or died partway, or
+/// because a file stayed locked. Run this at startup. The folder names say how far it got:
+/// staging only outlives an interrupted restore, and a moved-aside folder with its stamp
+/// means the real settings had already left. Returns one line per interrupted restore.
+///
+/// Folders moved aside by a restore that did finish are left alone, so a player who deletes
+/// WTF on purpose to reset it doesn't get old settings back.
+pub fn recover_restore(wtf_dir: &Path) -> Result<Vec<String>> {
+    let wtf = long_path(wtf_dir);
+    let Some(parent) = wtf.parent() else {
+        return Ok(Vec::new());
+    };
+    let Ok(items) = fs::read_dir(parent) else {
+        return Ok(Vec::new());
+    };
+    let mut stamps: Vec<String> = items
+        .flatten()
+        .filter_map(|item| {
+            let name = item.file_name();
+            Some(name.to_str()?.strip_prefix(STAGING_PREFIX)?.to_string())
+        })
+        .collect();
+    // Newest first in the odd case of several, because that one moved the folder last.
+    stamps.sort_by(|a, b| b.cmp(a));
+    let mut notes = Vec::new();
+    for stamp in stamps {
+        let aside = parent.join(format!("{ASIDE_PREFIX}{stamp}"));
+        if is_present(&aside).map_err(|e| io_error(&aside, e))? {
+            if is_present(&wtf).map_err(|e| io_error(&wtf, e))? {
+                // The game made a new one in the meantime, which may have settings of its
+                // own by now, so that's the player's call.
+                notes.push(format!(
+                    "A settings restore was interrupted. The settings you had before it are in {}.",
+                    display_path(&aside).display()
+                ));
+            } else {
+                rename_with_retry(&aside, &wtf).map_err(|e| not_put_back(&aside, &e))?;
+                notes.push(
+                    "A settings restore was interrupted, so your settings were put back the \
+                     way they were."
+                        .to_string(),
+                );
+            }
+        }
+        let staging = parent.join(format!("{STAGING_PREFIX}{stamp}"));
+        if let Err(error) = fs::remove_dir_all(&staging) {
+            log::warn!("Couldn't clear what an interrupted restore left: {error}");
+        }
     }
+    Ok(notes)
+}
+
+fn not_put_back(aside: &Path, error: &io::Error) -> Error {
+    Error::Other(format!(
+        "Couldn't finish restoring your settings or put the old ones back yet ({error}). \
+         Nothing was deleted, and your old settings are in {}. Close anything that might be \
+         using them and restart this app, or rename that folder to WTF yourself.",
+        display_path(aside).display()
+    ))
 }
 
 struct FileToSave {
@@ -209,6 +332,10 @@ fn collect_files(wtf: &Path, progress: &mut dyn FnMut(BackupProgress)) -> Result
                 continue;
             };
             let name = format!("{prefix}{file_name}");
+            if !entry_name_fits(&name) {
+                skip(name, "its path is too long to restore");
+                continue;
+            }
             // `DirEntry::metadata` doesn't follow links, which is the point: a link
             // could lead anywhere, including in a circle.
             let Ok(meta) = item.metadata() else {
@@ -333,12 +460,15 @@ fn free_backup_name(dest: &Path, now: i64) -> String {
     format!("WTF-{}.zip", timestamp(stamp))
 }
 
-fn free_aside_name(parent: &Path, now: i64) -> PathBuf {
+/// A stamp no other restore has used. Staging and the moved-aside folder share it, which is
+/// how [`recover_restore`] tells them apart from those of finished restores.
+fn free_restore_stamp(parent: &Path, now: i64) -> String {
     let mut stamp = now;
     loop {
-        let path = parent.join(format!("WTF.before-restore-{}", timestamp(stamp)));
-        if !path.exists() {
-            return path;
+        let text = timestamp(stamp);
+        let is_free = |prefix: &str| !parent.join(format!("{prefix}{text}")).exists();
+        if is_free(ASIDE_PREFIX) && is_free(STAGING_PREFIX) {
+            return text;
         }
         stamp += 1;
     }
@@ -441,6 +571,7 @@ fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
 mod tests {
     use super::*;
     use crate::extract::test_zips::{RawEntry, raw_zip, zip_bytes};
+    use crate::install::fault::{self, Plan};
     use std::collections::BTreeMap;
     use zip::ZipArchive;
 
@@ -819,7 +950,7 @@ mod tests {
             .unwrap();
             let result = restore_wtf(&zip, &wow.wtf, false);
             assert!(
-                matches!(result, Err(Error::UnsafeZip(_))),
+                matches!(&result, Err(Error::Other(text)) if text.starts_with("This backup can't")),
                 "{evil}: {result:?}"
             );
             assert_eq!(tree(&wow.wtf), before, "{evil}");
@@ -844,10 +975,12 @@ mod tests {
         let before = tree(&wow.wtf);
         let zip = wow.dir.path().join("bad.zip");
         fs::write(&zip, b"not a zip").unwrap();
-        assert!(matches!(
-            restore_wtf(&zip, &wow.wtf, false),
-            Err(Error::Corrupt(_))
-        ));
+        let text = restore_wtf(&zip, &wow.wtf, false).unwrap_err().to_string();
+        assert!(text.starts_with("This backup can't be restored"), "{text}");
+        assert!(
+            !text.contains("download") && !text.contains("addon"),
+            "{text}"
+        );
         assert_eq!(tree(&wow.wtf), before);
     }
 
@@ -876,12 +1009,367 @@ mod tests {
         let wow = Wow::new();
         let zip = wow.backup(5).unwrap();
         let saved = tree(&wow.wtf);
+        let staging = wow.dir.path().join("WTF.restoring-20200101-000000");
+        write_files(&staging, &[("stale.txt", b"old")]);
+        restore_wtf(&zip, &wow.wtf, false).unwrap();
+        assert_eq!(tree(&wow.wtf), saved);
+        assert!(!staging.exists());
+    }
+
+    fn names_beside_wtf(wow: &Wow) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(wow.dir.path())
+            .unwrap()
+            .flatten()
+            .map(|item| item.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with("WTF"))
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn only_aside(wow: &Wow) -> PathBuf {
+        let asides: Vec<String> = names_beside_wtf(wow)
+            .into_iter()
+            .filter(|name| name.starts_with(ASIDE_PREFIX))
+            .collect();
+        assert_eq!(asides.len(), 1, "{asides:?}");
+        wow.dir.path().join(&asides[0])
+    }
+
+    /// The second rename fails and the way back fails too, or the process dies between them.
+    /// Either way what's left on disk is the same.
+    fn restore_stopped_between_the_renames(wow: &Wow, zip: &Path) -> Error {
+        fault::set(Plan {
+            fail_at: vec![1, 2],
+            ..Plan::default()
+        });
+        let error = restore_wtf(zip, &wow.wtf, false).unwrap_err();
+        fault::take();
+        error
+    }
+
+    #[test]
+    fn when_the_swap_and_the_way_back_both_fail_the_error_says_where_the_settings_are() {
+        let wow = Wow::new();
+        let zip = wow.backup(5).unwrap();
+        let saved = tree(&wow.wtf);
+        let text = restore_stopped_between_the_renames(&wow, &zip).to_string();
+
+        assert!(!wow.wtf.exists());
+        let aside = only_aside(&wow);
+        assert_eq!(tree(&aside), saved, "the old settings must be intact");
+        assert!(text.contains(&*aside.to_string_lossy()), "{text}");
+        assert!(text.contains("rename that folder to WTF"), "{text}");
+    }
+
+    #[test]
+    fn recovery_puts_the_old_settings_back_after_an_interrupted_restore() {
+        let wow = Wow::new();
+        let zip = wow.backup(5).unwrap();
+        let saved = tree(&wow.wtf);
+        fs::write(wow.wtf.join("Config.wtf"), b"changed since that backup").unwrap();
+        let current = tree(&wow.wtf);
+        restore_stopped_between_the_renames(&wow, &zip);
+
+        let notes = recover_restore(&wow.wtf).unwrap();
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].contains("put back"), "{notes:?}");
+        assert_eq!(tree(&wow.wtf), current);
+        assert_ne!(tree(&wow.wtf), saved);
+        assert_eq!(names_beside_wtf(&wow), ["WTF"]);
+
+        // And it only has to say so once.
+        assert!(recover_restore(&wow.wtf).unwrap().is_empty());
+    }
+
+    #[test]
+    fn recovery_that_cant_finish_yet_says_where_the_settings_are_and_tries_again() {
+        let wow = Wow::new();
+        let zip = wow.backup(5).unwrap();
+        let saved = tree(&wow.wtf);
+        restore_stopped_between_the_renames(&wow, &zip);
+
+        fault::set(Plan {
+            fail_at: vec![0],
+            ..Plan::default()
+        });
+        let text = recover_restore(&wow.wtf).unwrap_err().to_string();
+        fault::take();
+        assert!(
+            text.contains(&*only_aside(&wow).to_string_lossy()),
+            "{text}"
+        );
+        assert!(!wow.wtf.exists());
+
+        assert_eq!(recover_restore(&wow.wtf).unwrap().len(), 1);
+        assert_eq!(tree(&wow.wtf), saved);
+    }
+
+    #[test]
+    fn pressing_restore_again_after_an_interrupted_one_finishes_and_keeps_the_old_settings() {
+        let wow = Wow::new();
+        let zip = wow.backup(5).unwrap();
+        let saved = tree(&wow.wtf);
+        fs::write(wow.wtf.join("Config.wtf"), b"changed since that backup").unwrap();
+        let current = tree(&wow.wtf);
+        restore_stopped_between_the_renames(&wow, &zip);
+
+        let aside = restore_wtf(&zip, &wow.wtf, false).unwrap().unwrap();
+        assert_eq!(tree(&wow.wtf), saved);
+        assert_eq!(tree(&aside), current);
+        assert_eq!(
+            names_beside_wtf(&wow).len(),
+            2,
+            "{:?}",
+            names_beside_wtf(&wow)
+        );
+    }
+
+    #[test]
+    fn a_new_wtf_after_an_interrupted_restore_stays_and_the_player_is_told_where_the_old_is() {
+        let wow = Wow::new();
+        let zip = wow.backup(5).unwrap();
+        let saved = tree(&wow.wtf);
+        restore_stopped_between_the_renames(&wow, &zip);
+        // The game ran in between and made itself a default folder.
+        write_files(&wow.wtf, &[("Config.wtf", b"defaults")]);
+        let defaults = tree(&wow.wtf);
+
+        let notes = recover_restore(&wow.wtf).unwrap();
+        let aside = only_aside(&wow);
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].contains(&*aside.to_string_lossy()), "{notes:?}");
+        assert_eq!(tree(&wow.wtf), defaults);
+        assert_eq!(tree(&aside), saved);
+        assert_eq!(
+            names_beside_wtf(&wow).len(),
+            2,
+            "{:?}",
+            names_beside_wtf(&wow)
+        );
+    }
+
+    #[test]
+    fn recovery_leaves_folders_from_finished_restores_alone() {
+        let wow = Wow::new();
+        let zip = wow.backup(5).unwrap();
+        let aside = restore_wtf(&zip, &wow.wtf, false).unwrap().unwrap();
+        assert!(recover_restore(&wow.wtf).unwrap().is_empty());
+        assert!(aside.is_dir() && wow.wtf.is_dir());
+
+        // A player clearing WTF to reset it doesn't get the old one back, not even with a
+        // crash during unpacking left beside it.
+        fs::remove_dir_all(&wow.wtf).unwrap();
         write_files(
-            &wow.dir.path().join("WTF.restoring"),
-            &[("stale.txt", b"old")],
+            &wow.dir.path().join("WTF.restoring-20200101-000000"),
+            &[("half.lua", b"half")],
+        );
+        assert!(recover_restore(&wow.wtf).unwrap().is_empty());
+        assert!(!wow.wtf.exists());
+        assert!(aside.is_dir());
+        assert_eq!(names_beside_wtf(&wow).len(), 1);
+    }
+
+    #[test]
+    fn recovery_with_no_game_folder_does_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("not here").join("WTF");
+        assert!(recover_restore(&missing).unwrap().is_empty());
+        assert!(!missing.parent().unwrap().exists());
+    }
+
+    /// A file like this comes from a power cut, or from an addon that saved one long string.
+    #[test]
+    fn a_settings_file_of_one_repeated_byte_backs_up_and_restores() {
+        let wow = Wow::new();
+        let size = 65 * 1024 * 1024;
+        let zeros = wow.wtf.join("Account/PLAYER/SavedVariables/Zeros.lua");
+        File::create(&zeros).unwrap().set_len(size).unwrap();
+        let zip = wow.backup(5).unwrap();
+        fs::write(wow.wtf.join("Config.wtf"), b"changed").unwrap();
+
+        restore_wtf(&zip, &wow.wtf, false).unwrap();
+        assert_eq!(fs::metadata(&zeros).unwrap().len(), size);
+        assert_eq!(
+            fs::read(wow.wtf.join("Config.wtf")).unwrap(),
+            b"SET gxWindow \"1\""
+        );
+    }
+
+    /// Going by what's really on this disk: every name stays on Linux, the Kelvin sign and the
+    /// `k` stay apart on NTFS though they fold alike, and nothing collides on the rest.
+    #[test]
+    fn names_that_differ_only_by_case_all_come_back_on_a_disk_that_holds_them() {
+        let wow = Wow::new();
+        let saved_dir = wow.wtf.join("Account/PLAYER/SavedVariables");
+        for (name, body) in [
+            ("keep.lua", &b"letter"[..]),
+            ("Keep.lua", b"capital"),
+            ("\u{212A}eep.lua", b"sign"),
+        ] {
+            fs::write(saved_dir.join(name), body).unwrap();
+        }
+        let saved = tree(&wow.wtf);
+        let zip = wow.backup(5).unwrap();
+        fs::write(wow.wtf.join("Config.wtf"), b"changed").unwrap();
+
+        restore_wtf(&zip, &wow.wtf, false).unwrap();
+        assert_eq!(tree(&wow.wtf), saved);
+    }
+
+    /// When the disk can't hold both, that's a refusal with nothing changed, and the zip is
+    /// still a complete copy for anyone opening it by hand.
+    #[test]
+    fn names_that_collide_on_this_disk_refuse_the_restore_and_change_nothing() {
+        let wow = Wow::new();
+        let probe = wow.dir.path().join("case-probe");
+        fs::write(&probe, b"").unwrap();
+        let folds_case = wow.dir.path().join("CASE-PROBE").exists();
+
+        let zip = wow.dir.path().join("elsewhere.zip");
+        fs::write(
+            &zip,
+            raw_zip(&[
+                RawEntry::new("foo.lua", b"one"),
+                RawEntry::new("Foo.lua", b"two"),
+            ]),
+        )
+        .unwrap();
+        let before = tree(&wow.wtf);
+        let result = restore_wtf(&zip, &wow.wtf, false);
+        if folds_case {
+            let text = result.unwrap_err().to_string();
+            assert!(text.starts_with("This backup can't be restored"), "{text}");
+            assert_eq!(tree(&wow.wtf), before);
+            assert_eq!(names_beside_wtf(&wow), ["WTF"]);
+        } else {
+            result.unwrap();
+            assert_eq!(fs::read(wow.wtf.join("foo.lua")).unwrap(), b"one");
+            assert_eq!(fs::read(wow.wtf.join("Foo.lua")).unwrap(), b"two");
+        }
+    }
+
+    #[test]
+    fn a_wtf_over_the_total_limit_for_addons_can_still_be_restored() {
+        // Nine files at the most a backup keeps, the case from the review. Only what they
+        // declare matters to these checks, which saves the test writing 2 GB.
+        let wow = Wow::new();
+        let entries: Vec<RawEntry> = (0..9)
+            .map(|i| {
+                let mut entry = RawEntry::new(format!("big-{i}.lua"), b"x");
+                entry.declared_size = Some(MAX_BACKUP_FILE_BYTES as u32);
+                entry
+            })
+            .collect();
+        let zip = wow.dir.path().join("big.zip");
+        fs::write(&zip, raw_zip(&entries)).unwrap();
+        check_tree(&zip, restore_limits(), restore_options()).unwrap();
+        assert!(check_tree(&zip, Limits::default(), restore_options()).is_err());
+    }
+
+    /// Nothing in a normal WTF reaches a restore's limits now, so this lowers one to get a
+    /// zip it would refuse.
+    #[test]
+    fn a_backup_a_restore_would_refuse_is_not_kept_and_prunes_nothing() {
+        let wow = Wow::new();
+        let older = [wow.backup(2).unwrap(), wow.backup(2).unwrap()];
+        let refused = Limits {
+            max_entries: 2,
+            ..restore_limits()
+        };
+        let result = backup_within(
+            &wow.wtf,
+            &wow.backups,
+            2,
+            refused,
+            &mut |_| {},
+            &not_cancelled(),
+        );
+        let text = result.unwrap_err().to_string();
+        assert!(
+            text.starts_with("This settings backup wasn't saved"),
+            "{text}"
+        );
+        assert!(text.contains("older backups were kept"), "{text}");
+        assert!(!text.contains("addon"), "{text}");
+
+        let left: Vec<PathBuf> = list_backups(&wow.backups)
+            .unwrap()
+            .into_iter()
+            .map(|backup| backup.path)
+            .collect();
+        assert_eq!(left, [older[1].clone(), older[0].clone()]);
+        assert_eq!(
+            fs::read_dir(&wow.backups).unwrap().count(),
+            2,
+            "no .part left"
+        );
+    }
+
+    #[test]
+    fn a_path_too_deep_to_restore_is_left_out_and_reported_and_the_rest_is_saved() {
+        let wow = Wow::new();
+        let saved = tree(&wow.wtf);
+        write_files(
+            &wow.wtf.join(format!("Deep/{}", "d/".repeat(70))),
+            &[("stuck.lua", b"unreachable")],
+        );
+        let mut events = Vec::new();
+        let zip = backup_wtf(
+            &wow.wtf,
+            &wow.backups,
+            5,
+            &mut |e| events.push(e),
+            &not_cancelled(),
+        )
+        .unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, BackupProgress::Skipped { path, reason }
+                    if path.starts_with("Deep/") && reason.contains("too long"))),
+            "{events:?}"
         );
         restore_wtf(&zip, &wow.wtf, false).unwrap();
         assert_eq!(tree(&wow.wtf), saved);
+    }
+
+    #[test]
+    fn folders_named_like_programs_are_restored_with_what_is_in_them() {
+        let wow = Wow::new();
+        for folder in [
+            "SOMEONE@EXAMPLE.COM",
+            "my.so",
+            "a.sh",
+            "Thing.app",
+            "x.jar",
+            "z.exe",
+        ] {
+            write_files(
+                &wow.wtf.join("Account").join(folder),
+                &[("SavedVariables/Foo.lua", b"settings")],
+            );
+        }
+        let saved = tree(&wow.wtf);
+        let zip = wow.backup(5).unwrap();
+        fs::remove_dir_all(wow.wtf.join("Account")).unwrap();
+        restore_wtf(&zip, &wow.wtf, false).unwrap();
+        assert_eq!(tree(&wow.wtf), saved);
+    }
+
+    #[test]
+    fn a_program_in_a_backup_still_stays_out_of_a_restore() {
+        let wow = Wow::new();
+        write_files(
+            &wow.wtf,
+            &[("sync.bat", b"@echo off"), ("Account/PLAYER/run.vbe", b"x")],
+        );
+        let zip = wow.backup(5).unwrap();
+        assert!(zip_names(&zip).contains(&"sync.bat".to_string()));
+        restore_wtf(&zip, &wow.wtf, false).unwrap();
+        assert!(!wow.wtf.join("sync.bat").exists());
+        assert!(!wow.wtf.join("Account/PLAYER/run.vbe").exists());
+        assert!(wow.wtf.join("Config.wtf").is_file());
     }
 
     #[test]

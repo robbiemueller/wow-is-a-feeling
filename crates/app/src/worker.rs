@@ -321,6 +321,10 @@ impl Worker {
                 }
                 w.send(Event::Recovered(result));
             }
+            let restore = backup::recover_restore(&install.wtf_dir).map_err(|e| e.to_string());
+            if !matches!(&restore, Ok(notes) if notes.is_empty()) {
+                w.send(Event::Recovered(restore));
+            }
             w.send(Event::WriteTest(
                 detect::check_writable(&install)
                     .err()

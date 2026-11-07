@@ -39,7 +39,8 @@ use crate::net::Http;
 use crate::toc;
 
 const WORK_DIR_NAME: &str = ".wiaf";
-/// Used only when the catalog doesn't know a zip's size. Real addons top out around 90 MB.
+/// Used only when the catalog doesn't know a zip's size, which is WoWInterface and source
+/// archives. The biggest of those so far is about 100 MB.
 const MAX_UNKNOWN_ZIP_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_TOC_BYTES: u64 = 1024 * 1024;
 /// About five seconds in total, for antivirus and cloud-sync tools to let go of a file.
@@ -814,7 +815,7 @@ fn rollback(dirs: &Dirs, id: &str, entries: &[SwapEntry]) -> io::Result<()> {
     Ok(())
 }
 
-fn is_present(path: &Path) -> io::Result<bool> {
+pub(crate) fn is_present(path: &Path) -> io::Result<bool> {
     match fs::symlink_metadata(path) {
         Ok(_) => Ok(true),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
