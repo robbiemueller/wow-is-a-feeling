@@ -32,7 +32,10 @@ pub struct Catalog {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Addon {
-    /// Stable id: `gh:owner/repo`, `wowi:1234`, or `direct:name`.
+    /// Stable id: `gh:owner/repo`, `wowi:1234`, or `direct:name`. One repository that
+    /// publishes several addons, each under its own tag prefix (`<line>/v1.2.3`), gives each
+    /// extra one `gh:owner/repo/<line>`, with `<line>` lowercase `[a-z0-9-]`. `source` still
+    /// names the plain repository.
     pub id: String,
     pub name: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -87,6 +90,24 @@ pub struct Addon {
     /// stranger, so the app filters these and fetches them with `Http::get_untrusted`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<String>,
+    /// Addons that go with this one, such as the voice packs it plays, as groups that a
+    /// person wrote down: an addon's own files never say. Only a `reviewed` entry's groups
+    /// count, and the app installs none of them unless the player says so.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub packs: Vec<PackGroup>,
+}
+
+/// One kind of pack for an addon: any one of `ids` will do.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PackGroup {
+    /// What the group is for, in a few words, such as "Quest voices".
+    pub name: String,
+    /// The addon does nothing useful until one of these is installed, as with Spoken and
+    /// its quest voices. Otherwise each is a welcome extra.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub needed: bool,
+    /// Catalog ids, in the order to offer them. The first is the one offered by default.
+    pub ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -302,6 +323,42 @@ mod tests {
         );
         let back: Addon = serde_json::from_str(&json).unwrap();
         assert_eq!(back, addon);
+    }
+
+    #[test]
+    fn packs_round_trip_and_stay_out_of_entries_without_them() {
+        let spoken = Addon {
+            id: "gh:rusty-key/spoken-wow".into(),
+            name: "Spoken".into(),
+            category: "quests".into(),
+            packs: vec![
+                PackGroup {
+                    name: "Quest voices".into(),
+                    needed: true,
+                    ids: vec!["gh:rusty-key/spoken-wow/quests-audio".into()],
+                },
+                PackGroup {
+                    name: "Place voices".into(),
+                    needed: false,
+                    ids: vec!["gh:rusty-key/spoken-wow/places-audio".into()],
+                },
+            ],
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&spoken).unwrap();
+        assert!(json.contains(r#""packs":[{"name":"Quest voices","needed":true,"ids":"#));
+        assert!(
+            !json.contains(r#""needed":false"#),
+            "an extra says nothing about needing: {json}"
+        );
+        let back: Addon = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, spoken);
+
+        let plain = serde_json::to_string(&Addon::default()).unwrap();
+        assert!(!plain.contains("packs"), "{plain}");
+        // What an app from before packs makes of a catalog with them: it reads the rest.
+        let old: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(old["id"], "gh:rusty-key/spoken-wow");
     }
 
     #[test]

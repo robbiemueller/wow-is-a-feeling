@@ -167,6 +167,21 @@ Discovery has no review, so anyone with a free GitHub account gets looked at, an
 
 The zip scan reads a zip the way the installer does, through its own name cleaning and layout rules, so a zip can't show the catalog one list of folders and install another. A zip claiming to start past its first byte has two possible directories, and is treated as having nothing in it.
 
+### One product per entry
+
+An installed addon is only ever updated to a newer build of the same addon. Some repositories publish several addons: Spoken's publishes the addon under `spoken/v3.8.3` and each voice pack under its own tag prefix, such as `quests-audio/v2.5.0`, and ClassicUI Forever releases standalone modules beside the main addon. Taking a repository's newest release, whatever it holds, would turn the listing into another addon, and an update would then replace the installed addon's folders with that one's.
+
+- **Pinned to a product.** An entry the last catalog listed keeps its product: a new build only counts if it still ships the last catalog's main folder, compared ignoring case. A newer release that doesn't, whether another product or a rename, is skipped without counting as a failed read. If nothing in reach qualifies, the entry keeps its last build and the build summary names it. A real rename is let through by naming the entry in `allow_new_main` in `curated.toml`, once.
+- **Release lines.** `[[split]]` in `curated.toml` names a seeded repository, the tag prefix of its own addon (`main`) and the prefixes that are addons of their own (`lines`). Tags look like `<prefix>/v1.2.3`, and a prefix matches a whole segment, so `quests-audio` never takes `quests-audio-deDE/v1.0.1`. The repository's own entry keeps `gh:owner/repo` and reads only `main`'s tags. Each line becomes `gh:owner/repo/<line>`, lowercase, and reads only its own. Tags under any other prefix, such as desktop apps, retired packs and languages nobody has checked, are never read.
+- Each prefix's newest releases are fetched on their own, so a busy prefix can't push another out of reach, and the prefix is cut off before detection, so it never decides prerelease, flavor or the version text. Downloads count each line's own zips.
+- Lines are hand-picked, so they're trusted and reviewed from their first build. A line's `source` is the plain repository and its `website` is its current release's page. Its name and summary come from `[overrides]`, because a pack's TOC title describes one of its folders. The app shows a line's summary rather than the repository's README and releases, which are about the main addon.
+
+### Packs
+
+Some addons do nothing until another addon is installed beside them: Spoken plays voices that come in separate voice packs, and neither side's TOC says so. `[[packs]]` in `curated.toml` writes that down as groups on the addon: a `name` such as "Quest voices", whether it's `needed`, and the `ids` that will do, in the order to offer them. Any one of a group's ids meets it. The builder copies the groups onto `Addon.packs`, drops ids the catalog doesn't list and groups left empty, and warns about both. Naming an id there hand-picks it.
+
+The app reads only a reviewed entry's groups, and only trusted ids the catalog has. A group is met when any folder of any of its ids is in AddOns, whoever installed it. Nothing is installed by itself: packs are often over a gigabyte, so the player is asked, with the size. See UI-SPEC.md.
+
 ### What stops a build
 
 One bad addon is dropped with a warning, and one stranger must never be able to stop the catalog for everyone, so very little is a refusal.
