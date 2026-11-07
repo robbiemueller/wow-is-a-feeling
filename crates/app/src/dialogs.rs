@@ -241,8 +241,16 @@ fn replace(ui: &mut Ui, app: &mut App, plan: &ReplacePlan, keep: &mut bool) {
         .id_salt("replace-list")
         .max_height(160.0)
         .show(ui, |ui| {
-            for conflict in &plan.conflicts {
+            // A real addon never gets near this. A strange catalog entry could.
+            const MOST_SHOWN: usize = 40;
+            for conflict in plan.conflicts.iter().take(MOST_SHOWN) {
                 plain(ui, &conflict.describe());
+            }
+            if plan.conflicts.len() > MOST_SHOWN {
+                plain(
+                    ui,
+                    &format!("and {} more", plan.conflicts.len() - MOST_SHOWN),
+                );
             }
         });
     ui.add_space(6.0);

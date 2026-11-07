@@ -348,6 +348,11 @@ fn addon_body(
         ui.add_space(10.0);
     }
     widgets::section(ui, "Details");
+    // First in the section, so it's on screen without scrolling even in the smallest window.
+    if !addon.trusted {
+        widgets::ink(ui, model::UNTRUSTED_NOTE, theme::body(14.5), theme::INK);
+        ui.add_space(3.0);
+    }
     let release = addon.release(channel);
     match (record, release) {
         (Some(record), Some(release)) if model::update_for(record, addon).is_some() => {
@@ -375,7 +380,7 @@ fn addon_body(
     let source = model::source_text(addon);
     match model::source_url(addon) {
         Some(url) => widgets::fact_with(ui, "Source:", |ui| {
-            let link = widgets::ink_link(ui, &source, theme::strong(15.0)).on_hover_text(&url);
+            let link = widgets::ink_link_fit(ui, &source, theme::strong(15.0)).on_hover_text(&url);
             if link.clicked() {
                 app.actions.push(Action::OpenLink(url.clone()));
             }
@@ -386,10 +391,6 @@ fn addon_body(
         widgets::fact(ui, "Folders:", &clean_line(&addon.folders.join(", "), 600));
     }
     requires(app, ui, addon);
-    if !addon.trusted {
-        ui.add_space(4.0);
-        widgets::ink(ui, model::UNTRUSTED_NOTE, theme::body(14.5), theme::INK);
-    }
     ui.add_space(10.0);
     details_sections(app, ui, addon);
 }

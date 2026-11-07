@@ -197,7 +197,12 @@ pub fn frame_and_portrait(app: &mut App, ui: &mut Ui, full: Rect, now: Instant) 
 pub fn overlays(app: &mut App, ui: &mut Ui, full: Rect, now: Instant) {
     let ctx = ui.ctx().clone();
     app.fun.overlays(&ctx, full, now);
-    app.messages.show(&ctx, full, now);
+    let popup_bottom = app
+        .popup
+        .as_ref()
+        .and_then(|_| ctx.memory(|m| m.area_rect(Id::unique("static-popup"))))
+        .map(|popup| popup.max.y + 4.0);
+    app.messages.show(&ctx, full, popup_bottom, now);
 
     let hovering = app.launch.drop_overlay || ctx.input(|i| !i.raw.hovered_files.is_empty());
     if hovering {

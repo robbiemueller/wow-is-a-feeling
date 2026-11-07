@@ -114,15 +114,17 @@ impl Messages {
             .min()
     }
 
-    /// Paint over everything else, and tell screen readers the same thing.
-    pub fn show(&self, ctx: &egui::Context, full: Rect, now: Instant) {
+    /// Paint over everything else, and tell screen readers the same thing. `below` is the top
+    /// edge to start from when something there matters more than the usual spot, which is
+    /// where a popup's first lines are.
+    pub fn show(&self, ctx: &egui::Context, full: Rect, below: Option<f32>, now: Instant) {
         if self.list.is_empty() {
             return;
         }
         let layer = LayerId::new(Order::Foreground, Id::unique("messages"));
         let painter = ctx.layer_painter(layer);
         let font = theme::strong(16.0);
-        let mut y = full.min.y + 100.0;
+        let mut y = below.map_or(full.min.y + 100.0, |y| y.min(full.max.y - 60.0));
         for (i, message) in self.list.iter().enumerate() {
             let alpha = alpha_at(now.saturating_duration_since(message.born));
             let base = match message.kind {

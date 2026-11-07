@@ -1153,11 +1153,11 @@ fn update_all_never_asks_and_leaves_out_what_would_replace_something_new() {
     let mut h = rig.launch_settled();
     click(&mut h, "Update all (2)");
     assert!(app(&h).popup.is_none());
+    assert!(said(&h, SKIPPED), "{:?}", app(&h).messages.texts());
     finish_ops(&mut h);
     assert_eq!(rig.version_on_disk("Bbb").as_deref(), Some("2.0"));
     assert_eq!(rig.version_on_disk("Aaa").as_deref(), Some("1.0"));
     assert_eq!(rig.version_on_disk("Extra").as_deref(), Some("mine"));
-    assert!(said(&h, SKIPPED), "{:?}", app(&h).messages.texts());
     assert_eq!(app(&h).updates, vec![AAA.to_owned()]);
 
     // With only that one left, it still doesn't ask.
@@ -1189,9 +1189,9 @@ fn update_all_never_asks_and_leaves_out_what_would_replace_something_new() {
     let mut h = rig.launch_settled();
     click(&mut h, "Update all (1)");
     assert!(app(&h).popup.is_none());
+    assert!(!said(&h, "wasn't updated"));
     finish_ops(&mut h);
     assert_eq!(rig.version_on_disk("Extra").as_deref(), Some("3.0"));
-    assert!(!said(&h, "wasn't updated"));
 }
 
 const DOMINOS: &str = "gh-like:Dominos";
@@ -1255,10 +1255,10 @@ fn dominos_shares_a_folder_and_only_asks_about_it_once() {
     let mut h = rig.launch_settled();
     click(&mut h, "Update all (2)");
     assert!(app(&h).popup.is_none());
+    assert!(!said(&h, "wasn't updated"));
     finish_ops(&mut h);
     assert_eq!(managed(&h, DOMINOS).unwrap().version, "3.0");
     assert_eq!(managed(&h, MASQUE).unwrap().version, "1.1");
-    assert!(!said(&h, "wasn't updated"));
     assert!(app(&h).messages.errors().is_empty());
 
     // Remove Dominos and the folder stays for the addon still claiming it.
@@ -1358,6 +1358,7 @@ fn a_long_list_of_folders_scrolls_and_the_buttons_stay_on_screen() {
     let button = h.get_by_label("Replace them").rect();
     let screen = h.ctx.content_rect();
     assert!(button.max.y <= screen.max.y, "{button:?} is off {screen:?}");
+    assert!(has_label(&h, "and 20 more"), "the list stops somewhere");
     click(&mut h, "Replace them");
     finish_ops(&mut h);
     assert_eq!(rig.version_on_disk("Taken59").as_deref(), Some("1.0"));
@@ -1442,15 +1443,15 @@ fn a_batch_leaves_out_what_would_replace_something_and_installs_the_rest() {
     click(&mut h, "Handy Kit, 2 addons");
     click(&mut h, "Install all (2)");
     assert!(app(&h).popup.is_none());
-    finish_ops(&mut h);
-    assert!(rig.addons().join("Foo").exists());
-    assert!(!rig.addons().join("CoolPins").exists());
-    assert_eq!(rig.version_on_disk("Questie").as_deref(), Some("mine"));
     assert!(said(
         &h,
         "CoolPins Addon wasn't installed because it would replace Questie. \
          Install it from its own page to choose."
     ));
+    finish_ops(&mut h);
+    assert!(rig.addons().join("Foo").exists());
+    assert!(!rig.addons().join("CoolPins").exists());
+    assert_eq!(rig.version_on_disk("Questie").as_deref(), Some("mine"));
 }
 
 #[test]
@@ -1566,6 +1567,44 @@ fn a_folder_another_install_is_about_to_bring_counts_as_taken() {
 }
 
 #[test]
+fn a_message_sits_below_an_open_popup_not_across_its_first_lines() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = demo_harness(Scene::Normal, dir.path());
+    app_mut(&mut h).yellow("Something else happened a moment ago.");
+    h.step();
+    h.step();
+    let alone = h
+        .get_by_label("Something else happened a moment ago.")
+        .rect();
+    let opened = Action::Install(vec![demo::UNTRUSTED_ID.to_owned()]);
+    app_mut(&mut h).actions.push(opened);
+    for _ in 0..4 {
+        h.step();
+    }
+    let popup = h
+        .ctx
+        .memory(|m| m.area_rect(egui::Id::unique("static-popup")))
+        .unwrap();
+    let message = h
+        .get_by_label("Something else happened a moment ago.")
+        .rect();
+    assert!(
+        alone.min.y < popup.max.y && message.min.y >= popup.max.y,
+        "{message:?} covers {popup:?}"
+    );
+    press(&mut h, Key::Escape);
+    h.step();
+    assert_eq!(
+        h.get_by_label("Something else happened a moment ago.")
+            .rect()
+            .min
+            .y,
+        alone.min.y,
+        "and it goes back where it was"
+    );
+}
+
+#[test]
 fn the_page_says_who_an_addon_really_comes_from() {
     let dir = tempfile::tempdir().unwrap();
     let mut h = demo_harness(Scene::Normal, dir.path());
@@ -1617,6 +1656,27 @@ fn the_page_says_who_an_addon_really_comes_from() {
     click(&mut h, "Replace them");
     finish_ops(&mut h);
     assert!(managed(&h, demo::UNTRUSTED_ID).is_some());
+}
+
+#[test]
+fn a_very_long_repo_name_stays_on_the_page() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = demo_harness(Scene::Normal, dir.path());
+    let long = format!("{}/{}", "o".repeat(39), "r".repeat(100));
+    let mut catalog = demo::catalog();
+    catalog.addons[0].source = Source::Github { repo: long.clone() };
+    app_mut(&mut h).bundle = Some(Arc::new(crate::model::CatalogBundle::new(catalog)));
+    click(&mut h, "Browse");
+    click(&mut h, "Questie, update");
+    let link = h.get_by_label(&format!("GitHub: {long}")).rect();
+    let share = h.get_by_label("Share").rect();
+    assert!(link.width() > 100.0);
+    let page_right = h.ctx.content_rect().max.x - 20.0;
+    assert!(
+        link.max.x <= page_right,
+        "{link:?} runs off past {page_right}"
+    );
+    assert!(link.max.y < share.min.y);
 }
 
 #[test]

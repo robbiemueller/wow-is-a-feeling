@@ -680,7 +680,7 @@ pub fn source_url(addon: &Addon) -> Option<String> {
 /// the repo is the only real signal.
 pub fn source_text(addon: &Addon) -> String {
     match &addon.source {
-        Source::Github { repo } => format!("GitHub: {}", clean_line(repo, 100)),
+        Source::Github { repo } => format!("GitHub: {}", clean_line(repo, 140)),
         Source::Wowi { .. } => "WoWInterface".to_owned(),
         Source::Direct { .. } => "Direct link".to_owned(),
     }

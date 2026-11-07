@@ -401,6 +401,15 @@ pub fn folder_conflicts(
         .get(&addon.id)
         .map(|record| folder_set(&record.folders))
         .unwrap_or_default();
+    let mut others: HashMap<String, Vec<String>> = HashMap::new();
+    for (id, record) in managed {
+        if *id != addon.id {
+            for folder in &record.folders {
+                let names = others.entry(folder.to_lowercase()).or_default();
+                names.push(record.name.clone());
+            }
+        }
+    }
     let mut seen = HashSet::new();
     let mut conflicts = Vec::new();
     for listed in &addon.folders {
@@ -409,20 +418,14 @@ pub fn folder_conflicts(
             continue;
         }
         let found = disk_lookup.get(&lower).and_then(|&i| disk.get(i));
-        let mut owners: Vec<String> = managed
-            .iter()
-            .filter(|(id, m)| **id != addon.id && claims(m, &lower))
-            .map(|(_, m)| m.name.clone())
-            .collect();
-        if owners.is_empty()
-            && let Some(op) = queue.incoming(&lower, &addon.id)
-        {
-            owners.push(op.name.clone());
-        }
-        let owner = match found {
-            _ if !owners.is_empty() => FolderOwner::Addons(owners),
-            Some(found) => FolderOwner::Unmanaged(found.toc.title.clone()),
-            None => continue,
+        let owner = if let Some(names) = others.remove(&lower) {
+            FolderOwner::Addons(names)
+        } else if let Some(op) = queue.incoming(&lower, &addon.id) {
+            FolderOwner::Addons(vec![op.name.clone()])
+        } else if let Some(found) = found {
+            FolderOwner::Unmanaged(found.toc.title.clone())
+        } else {
+            continue;
         };
         conflicts.push(FolderConflict {
             folder: found.map_or_else(|| listed.clone(), |found| found.name.clone()),

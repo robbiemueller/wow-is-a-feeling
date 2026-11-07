@@ -350,6 +350,19 @@ pub fn ink_link(ui: &mut Ui, text: &str, font: egui::FontId) -> Response {
     let galley = ui
         .painter()
         .layout_no_wrap(text.to_owned(), font, theme::INK_LINK);
+    link_galley(ui, text, galley)
+}
+
+/// The same for a link that may be too long for its line. What doesn't fit is cut off on
+/// screen, and a screen reader still gets all of it.
+pub fn ink_link_fit(ui: &mut Ui, text: &str, font: egui::FontId) -> Response {
+    let mut job = LayoutJob::simple_singleline(text.to_owned(), font, theme::INK_LINK);
+    job.wrap = egui::text::TextWrapping::truncate_at_width(ui.available_width().max(40.0));
+    let galley = ui.painter().layout_job(job);
+    link_galley(ui, text, galley)
+}
+
+fn link_galley(ui: &mut Ui, text: &str, galley: std::sync::Arc<egui::Galley>) -> Response {
     let (rect, response) = ui.allocate_exact_size(galley.size(), Sense::click());
     response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Link, true, text));
     let color = if response.hovered() {
