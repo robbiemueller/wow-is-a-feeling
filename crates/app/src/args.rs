@@ -37,6 +37,8 @@ pub struct Launch {
     pub test_rig: bool,
     /// Where to fetch the catalog. Only honored on a test rig.
     pub catalog_url: Option<String>,
+    /// Where to ask WoWInterface about a file. Only honored on a test rig.
+    pub wowi_api: Option<String>,
     /// Save frame counts here after 5 idle seconds, then exit.
     pub frame_report: Option<PathBuf>,
     /// Run the commands in this file, then exit. See `script.rs`.
@@ -86,6 +88,7 @@ impl Launch {
                 "--screenshot" => launch.screenshot = value().map(PathBuf::from),
                 "--game" => launch.game = value().map(PathBuf::from),
                 "--catalog-url" => launch.catalog_url = value(),
+                "--wowi-api" => launch.wowi_api = value(),
                 "--frame-report" => launch.frame_report = value().map(PathBuf::from),
                 "--script" => launch.script = value().map(PathBuf::from),
                 "--tab" => launch.tab = value().as_deref().and_then(parse_tab),

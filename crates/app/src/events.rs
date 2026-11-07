@@ -249,7 +249,10 @@ impl App {
             }
             Err(failure) if failure.cancelled => self.cancelled_ops += 1,
             Err(failure) if !failure.would_replace.is_empty() => self.refused(&op, failure),
-            Err(failure) => self.red(failure.text),
+            Err(failure) => {
+                let line = ops::failed_line(&op, &failure.text);
+                self.op_failed(&op, line);
+            }
         }
         if self.queue.is_idle() && self.cancelled_ops > 0 {
             self.cancelled_ops = 0;
@@ -294,9 +297,18 @@ impl App {
         let text = if unlisted.is_empty() {
             ops::sitting_out_line(&op.name, op.verb != Verb::Install, &folders)
         } else {
-            Error::WouldReplace { folders: unlisted }.to_string()
+            ops::failed_line(op, &Error::WouldReplace { folders: unlisted }.to_string())
         };
-        self.red(text);
+        self.op_failed(op, text);
+    }
+
+    /// Say why, and keep saying it on the addon's page, where the player will look for it
+    /// once the red line has faded.
+    fn op_failed(&mut self, op: &Op, line: String) {
+        if !op.addon_id.is_empty() {
+            self.failures.insert(op.addon_id.clone(), line.clone());
+        }
+        self.red(line);
     }
 
     fn op_installed(
@@ -306,6 +318,7 @@ impl App {
         kept: &[PathBuf],
         local: Option<LocalZipFacts>,
     ) {
+        self.failures.remove(&op.addon_id);
         let now = self.now_unix();
         for warning in &outcome.warnings {
             self.yellow(warning.clone());
@@ -482,6 +495,7 @@ impl App {
     }
 
     fn op_removed(&mut self, op: &Op) {
+        self.failures.remove(&op.addon_id);
         if let OpKind::Remove { folders } = &op.kind {
             let gone = |f: &LocalFolder| folders.iter().any(|g| ops::same_folder(g, &f.name));
             self.demo_disk.retain(|f| !gone(f));

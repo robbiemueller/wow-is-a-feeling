@@ -35,7 +35,7 @@ use sha2::{Digest, Sha256};
 use crate::catalog::{Move, Release};
 use crate::error::{Error, Result};
 use crate::extract::{self, Limits, display_path, fold, io_error, is_safe_folder_name, long_path};
-use crate::net::Http;
+use crate::net::{self, Http};
 use crate::toc;
 
 const WORK_DIR_NAME: &str = ".wiaf";
@@ -1127,6 +1127,10 @@ fn prepare(
     progress: &mut dyn FnMut(Stage),
     cancel: &AtomicBool,
 ) -> Result<Prepared> {
+    let downloaded_from = match source {
+        ZipSource::Download(_) => Some(request.url.as_str()),
+        ZipSource::File(_) => None,
+    };
     let zip = match source {
         ZipSource::Download(http) => {
             let zip = txn.dirs.zip(&txn.id);
@@ -1152,6 +1156,18 @@ fn prepare(
         ZipSource::File(path) => long_path(path),
     };
     progress(Stage::Verifying);
+    // Before the size and checksum, which would only call it corrupt.
+    if is_web_page(&zip) {
+        return Err(match downloaded_from {
+            Some(url) => Error::WebPage {
+                site: net::site_name(url),
+            },
+            None => Error::Other(
+                "That file is a web page saved with a .zip name, not an addon. Download the addon again and drop the zip you get."
+                    .into(),
+            ),
+        });
+    }
     verify_zip(&zip, request, cancel)?;
     let staging = txn.dirs.staged(&txn.id);
     let extracted = extract::extract(
@@ -1179,6 +1195,19 @@ fn prepare(
         skipped_files: extracted.skipped_files,
         forever_folders,
     })
+}
+
+/// Whether a file is markup rather than a zip. A zip starts with `PK`; a web page, after
+/// any byte order mark and blank space, with `<`. Sites send one with a success code, such
+/// as WoWInterface while it holds a new upload for approval.
+fn is_web_page(path: &Path) -> bool {
+    let mut head = Vec::with_capacity(512);
+    let read = File::open(path).and_then(|file| file.take(512).read_to_end(&mut head));
+    if read.is_err() {
+        return false;
+    }
+    let text = head.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(&head);
+    text.iter().find(|byte| !byte.is_ascii_whitespace()) == Some(&b'<')
 }
 
 /// Digest first by SHA-256, else MD5. Empty strings count as not given.
@@ -2506,6 +2535,78 @@ mod tests {
         assert!(matches!(result, Err(Error::HttpStatus { status: 404, .. })));
         assert_eq!(game.addons(), tree_from(BEFORE));
         game.assert_no_leftovers();
+    }
+
+    /// What WoWInterface sends for every download of an addon while a new upload of it waits
+    /// for approval: a notice, with a success code.
+    const HELD_NOTICE: &[u8] = b"\xEF\xBB\xBF\r\n  <!DOCTYPE html PUBLIC \"-//W3C//DTD XHTML 1.0 Transitional//EN\">\n<html><head><title>World of Warcraft AddOns</title></head><body>This file has not yet been approved for download!!</body></html>";
+
+    #[test]
+    fn a_web_page_instead_of_the_zip_says_so_and_changes_nothing() {
+        let server = serve(|_, stream| {
+            respond(
+                stream,
+                "200 OK",
+                &[("Content-Type", "text/html; charset=ISO-8859-1")],
+                HELD_NOTICE,
+            )
+        });
+        // With and without a size from the catalog: neither may call it corrupt.
+        for size in [0, HELD_NOTICE.len() as u64 + 1000] {
+            let (game, _, req) = scenario();
+            let request = InstallRequest {
+                url: format!("{}/getfile.php?id=7032", server.base),
+                size,
+                ..req
+            };
+            let result = install_from_url(
+                &Http::allowing_loopback(),
+                &game.layout,
+                &request,
+                &mut |_| {},
+                &AtomicBool::new(false),
+            );
+            let Err(Error::WebPage { site }) = &result else {
+                panic!("size {size}: {result:?}");
+            };
+            assert_eq!(site, "127.0.0.1");
+            assert_eq!(game.addons(), tree_from(BEFORE));
+            game.assert_no_leftovers();
+        }
+    }
+
+    #[test]
+    fn a_web_page_dropped_as_a_zip_says_what_it_is() {
+        let (game, _, req) = scenario();
+        let page = game.dir.path().join("TomTom.zip");
+        fs::write(&page, HELD_NOTICE).unwrap();
+        let result = game.install(&page, &req);
+        let Err(Error::Other(text)) = &result else {
+            panic!("{result:?}");
+        };
+        assert!(text.contains("web page"), "{text}");
+        assert_eq!(game.addons(), tree_from(BEFORE));
+        game.assert_no_leftovers();
+    }
+
+    #[test]
+    fn only_markup_counts_as_a_web_page() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("f");
+        for (bytes, page) in [
+            (HELD_NOTICE, true),
+            (b"<html>".as_slice(), true),
+            (b" \t\n<?xml version=\"1.0\"?>".as_slice(), true),
+            (b"PK\x03\x04<html>".as_slice(), false),
+            (b"Rar!\x1a\x07".as_slice(), false),
+            (b"".as_slice(), false),
+            (b"   ".as_slice(), false),
+            (b"nope <html>".as_slice(), false),
+        ] {
+            fs::write(&file, bytes).unwrap();
+            assert_eq!(is_web_page(&file), page, "{bytes:?}");
+        }
+        assert!(!is_web_page(&dir.path().join("missing")));
     }
 
     #[test]

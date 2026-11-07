@@ -4,7 +4,7 @@
 
 use crate::demo;
 use crate::model::CatalogBundle;
-use crate::ops::{Op, OpKind, stage_fraction};
+use crate::ops::{self, Op, OpKind, stage_fraction};
 use eframe::egui::{self, ColorImage};
 use feeling_core::backup::{self, BackupEntry, BackupProgress};
 use feeling_core::catalog::{CATALOG_SCHEMA, Catalog};
@@ -159,6 +159,12 @@ impl From<Error> for OpFailure {
     }
 }
 
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
+}
+
 /// Which way the catalog arrived.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum CatalogSource {
@@ -239,8 +245,16 @@ struct Shared {
     demo: bool,
     sim: Duration,
     dirs: Dirs,
-    catalog_url: String,
+    sources: Sources,
     saver: Saver,
+}
+
+/// Where the worker fetches from. Only a test rig points these anywhere but the real sites.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Sources {
+    pub catalog_url: String,
+    /// WoWInterface's file details, see [`details::WOWI_DETAILS_API`].
+    pub wowi_api: String,
 }
 
 impl Worker {
@@ -250,7 +264,7 @@ impl Worker {
         dirs: Dirs,
         demo: bool,
         allow_loopback: bool,
-        catalog_url: String,
+        sources: Sources,
         sim: Duration,
     ) -> Self {
         Self {
@@ -262,7 +276,7 @@ impl Worker {
                 demo,
                 sim,
                 dirs,
-                catalog_url,
+                sources,
                 saver: Saver::default(),
             }),
         }
@@ -376,7 +390,7 @@ impl Worker {
             }
             // An ETag with no file behind it would only earn a useless 304.
             let etag = etag.filter(|_| have_cache);
-            let url = w.shared.catalog_url.clone();
+            let url = w.shared.sources.catalog_url.clone();
             let event = match w
                 .http()
                 .get_if_modified(&url, etag.as_deref(), MAX_CATALOG_BYTES)
@@ -593,6 +607,31 @@ impl Worker {
         });
     }
 
+    /// A web page where a WoWInterface zip should be most often means a new upload of the
+    /// addon is waiting for approval there, which holds back every download of it. WoWInterface
+    /// says whether that's so, which turns a guess into the player's actual answer.
+    fn explain(&self, op: &Op, error: Error) -> OpFailure {
+        if matches!(error, Error::WebPage { .. })
+            && let Some(id) = op
+                .addon_id
+                .strip_prefix("wowi:")
+                .and_then(|id| id.parse().ok())
+        {
+            match details::wowi_held_upload(self.http(), &self.shared.sources.wowi_api, id) {
+                Ok(Some(held)) => {
+                    return OpFailure {
+                        cancelled: false,
+                        text: ops::held_line(&held, unix_now()),
+                        would_replace: Vec::new(),
+                    };
+                }
+                Ok(None) => {}
+                Err(e) => log::info!("Couldn't ask WoWInterface about {}: {e}", op.name),
+            }
+        }
+        error.into()
+    }
+
     fn progress(&self, id: u64, fraction: f32) {
         self.send(Event::OpProgress { id, fraction });
     }
@@ -619,7 +658,8 @@ impl Worker {
                 let size = request.size;
                 let mut report = self.stage_reporter(op.id, size);
                 let outcome =
-                    install::install_from_url(self.http(), &layout, &request, &mut report, cancel)?;
+                    install::install_from_url(self.http(), &layout, &request, &mut report, cancel)
+                        .map_err(|error| self.explain(op, error))?;
                 Ok(self.installed(op, outcome, None))
             }
             OpKind::Rollback {

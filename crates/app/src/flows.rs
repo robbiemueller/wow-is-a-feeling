@@ -258,6 +258,7 @@ impl Rig {
             game: Some(self.game.clone()),
             test_rig: true,
             catalog_url: Some(format!("{}/catalog.json", self.site.base)),
+            wowi_api: Some(format!("{}/wowi", self.site.base)),
             ..Launch::default()
         };
         let state = State::load_from(&self.dirs.state_file);
@@ -590,6 +591,94 @@ fn a_failed_install_says_why_and_changes_nothing() {
     assert!(
         texts.iter().any(|t| t.contains("answered with an error")),
         "{texts:?}"
+    );
+}
+
+#[test]
+fn a_wowinterface_upload_waiting_for_approval_is_explained_on_the_page_until_tried_again() {
+    const TOMTOM: &str = "wowi:7032";
+    const HELD: &str = "Couldn't install TomTom Addon. WoWInterface is holding its downloads \
+                        until it approves the new version (v4.4.1-release) its author posted 2 \
+                        hours ago. Try again later.";
+    // What WoWInterface sends for every download of an addon while a new upload waits.
+    const NOTICE: &[u8] = b"<!DOCTYPE html PUBLIC \"-//W3C//DTD XHTML 1.0 Transitional//EN\">\n\
+                            <html><body>This file has not yet been approved for download!!\
+                            </body></html>";
+    let rig = Rig::new();
+    let mut tomtom = publish_addon(&rig.site, TOMTOM, "TomTom", "v4.4.0-release");
+    let release = tomtom.stable.as_mut().unwrap();
+    release.url = rig.site.put("/getfile.php?id=7032", NOTICE.to_vec());
+    // WoWInterface entries carry no size or checksum.
+    release.size = 0;
+    rig.site.publish(&catalog_of(vec![tomtom]));
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let details = |pending: &str| {
+        format!(
+            r#"[{{"UID":"7032","UIVersion":"v4.4.1-release","UIDate":{}000,"UIPending":"{pending}"}}]"#,
+            now - 2 * 3600
+        )
+        .into_bytes()
+    };
+    rig.site.put("/wowi/7032.json", details("1"));
+
+    let mut h = rig.launch_settled();
+    click(&mut h, "Install");
+    finish_ops(&mut h);
+    assert!(!rig.addons().join("TomTom").exists());
+    assert!(managed(&h, TOMTOM).is_none());
+    assert!(
+        app(&h).messages.errors().contains(&HELD),
+        "{:?}",
+        app(&h).messages.texts()
+    );
+    assert_eq!(
+        h.query_all_by_label(HELD).count(),
+        2,
+        "in red at the top, and on the page"
+    );
+    // The red line fades. The page keeps saying why, beside the button that tries again.
+    app_mut(&mut h).messages = Default::default();
+    h.step();
+    assert!(has_label(&h, HELD));
+
+    // Nothing held, yet still a web page: say what happened without guessing why.
+    rig.site.put("/wowi/7032.json", details("0"));
+    click(&mut h, "Install");
+    assert!(
+        !has_label(&h, HELD),
+        "trying again takes the old reason away"
+    );
+    finish_ops(&mut h);
+    let texts = app(&h).messages.texts();
+    assert!(
+        texts.iter().any(|t| t.starts_with(
+            "Couldn't install TomTom Addon. 127.0.0.1 sent a web page instead of the zip."
+        )),
+        "{texts:?}"
+    );
+
+    // Approved: the same link hands out the zip, and the note goes.
+    rig.site.put(
+        "/getfile.php?id=7032",
+        addon_zip("TomTom", "v4.4.1-release"),
+    );
+    click(&mut h, "Install");
+    finish_ops(&mut h);
+    assert_eq!(
+        rig.version_on_disk("TomTom").as_deref(),
+        Some("v4.4.1-release")
+    );
+    assert!(app(&h).failures.is_empty());
+    app_mut(&mut h).messages = Default::default();
+    h.step();
+    assert!(
+        h.query_all_by_label_contains("Couldn't install")
+            .next()
+            .is_none(),
+        "the page has nothing left to explain"
     );
 }
 
@@ -1139,7 +1228,8 @@ fn replacing_a_folder_on_disk_asks_first_and_cancel_changes_nothing() {
 
 #[test]
 fn a_zip_with_a_surprise_folder_is_refused_in_red() {
-    const REFUSAL: &str = "This download would also replace Questie, which isn't part of this addon, so nothing was changed.";
+    const REFUSAL: &str = "Couldn't install CoolPins Addon. This download would also replace Questie, which isn't part of this addon, so nothing was changed.";
+    const UPDATE_REFUSAL: &str = "Couldn't update CoolPins Addon. This download would also replace Questie, which isn't part of this addon, so nothing was changed.";
     let rig = Rig::new();
     rig.plant("Questie", "mine");
     // The catalog says one thing and the zip brings another, so no question gets asked.
@@ -1167,7 +1257,11 @@ fn a_zip_with_a_surprise_folder_is_refused_in_red() {
         "{:?}",
         app(&h).messages.texts()
     );
-    assert!(has_label(&h, REFUSAL), "it's really on screen");
+    assert_eq!(
+        h.query_all_by_label(REFUSAL).count(),
+        2,
+        "it's really on screen, in red at the top and on the page"
+    );
     close(h);
 
     // An addon the player already has can't start doing it in an update either.
@@ -1187,7 +1281,7 @@ fn a_zip_with_a_surprise_folder_is_refused_in_red() {
     assert_eq!(rig.version_on_disk("Questie").as_deref(), Some("mine"));
     assert_eq!(rig.version_on_disk("CoolPins").as_deref(), Some("1.0"));
     assert_eq!(managed(&h, PINS).unwrap().version, "1.0");
-    assert!(app(&h).messages.errors().contains(&REFUSAL));
+    assert!(app(&h).messages.errors().contains(&UPDATE_REFUSAL));
     close(h);
 
     // A folder new to the disk costs nobody anything, listed or not.

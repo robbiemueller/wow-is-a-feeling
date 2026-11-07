@@ -70,7 +70,8 @@ Keyboard: Up and Down move the selection and skip headers, Enter activates the m
 - Before an update batch: if `backup_wtf` is on and `should_backup` says so, back up WTF first. The casting bar shows it.
 - If the game is running: a yellow message, not a block: "WoW is running. Type /reload in game to load updates. New addons appear after restarting the game." WTF restore is blocked while it's running.
 - The casting bar shows one operation's name and fraction, or "Updating 3 of 7" and overall fraction. A small close button beside it cancels what hasn't finished.
-- Success: update `state`, save, rescan, and put a line in the status strip: "You receive addon: Questie." Failure: red message with the error's text, and nothing else changes.
+- Success: update `state`, save, rescan, and put a line in the status strip: "You receive addon: Questie." Failure: a red message that leads with what failed ("Couldn't install TomTom.") and then the error's text, and nothing else changes. The same text stays on that addon's page in red ink, pinned above its checkboxes and buttons, after the red line fades. It goes when the addon is tried again or something done to it works.
+- A download that comes back as a web page (a notice sent with a success code) says so rather than calling the zip corrupt. For a WoWInterface addon the app then asks WoWInterface's file details whether a new upload is waiting for approval, which blocks every download of that addon, and if so says which version and how long ago it was posted, and to try again later.
 - Drag a zip onto the window to install it through the same safe path, tracked as `local:<main folder>` with no updates. A subtle overlay appears while hovering.
 - `install::recover` results, if any, are told to the player: "An interrupted install was undone."
 

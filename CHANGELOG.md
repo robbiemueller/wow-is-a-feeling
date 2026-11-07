@@ -2,6 +2,11 @@
 
 The section for each release becomes the notes the app shows before it updates itself, so write for players.
 
+## 0.1.2
+
+- When WoWInterface is holding an addon's newest upload until it's approved, which blocks every download of that addon, the app now says so and tells you to try again later. It used to call the download corrupt.
+- A failed install or update now says which addon it was, and the reason stays on that addon's page until you try again, instead of fading after a few seconds.
+
 ## 0.1.1
 
 - The update prompt now says a version is available, since nothing downloads until you choose Update now.

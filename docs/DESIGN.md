@@ -81,7 +81,7 @@ site/                   Landing page for GitHub Pages.
 Staging lives in `<_forever_>/Interface/.wiaf/`, which is on the same volume as `AddOns` and outside it, so the game never scans it.
 
 1. Hold `.wiaf/j/<txn>.lock` open for the whole transaction, so `recover` leaves a live one alone.
-2. Download to `.wiaf/d/<txn>.zip` and verify size and digest when known. WoWInterface is the exception: its link always serves the newest upload, so a catalog entry's size and MD5 can describe an older file.
+2. Download to `.wiaf/d/<txn>.zip` and verify size and digest when known. WoWInterface is the exception: its link always serves the newest upload, so a catalog entry's size and MD5 can describe an older file. A download that starts with markup is a web page, not a zip, and fails as one before those checks. WoWInterface sends one, with a success code, for every download of an addon while a new upload of it waits for approval (`UIPending` in its file details), so the app asks it why before telling the player.
 3. Extract into `.wiaf/s/<txn>/` through the safe extractor.
 4. Require at least one folder with a TOC. Warn, don't fail, when no folder targets Forever.
 5. Write `.wiaf/j/<txn>.json` listing every folder to swap, flushed to disk.

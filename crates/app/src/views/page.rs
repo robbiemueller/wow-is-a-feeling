@@ -17,6 +17,9 @@ use feeling_core::state::{ManagedAddon, Origin};
 const BUTTON_HEIGHT: f32 = 26.0;
 const ROW_GAP: f32 = 6.0;
 const CHECK_HEIGHT: f32 = 20.0;
+/// Between why the last try failed and the checkboxes under it.
+const NOTE_GAP: f32 = 6.0;
+const NOTE_SIZE: f32 = 14.5;
 
 /// Beside a required addon that an install leaves out, because nobody has reviewed it.
 pub const INSTALL_IT_YOURSELF: &str = "(install it yourself)";
@@ -115,7 +118,28 @@ pub fn framed(
     checks: Vec<BarCheck>,
     content: impl FnOnce(&mut App, &mut Ui),
 ) {
+    framed_with_note(app, ui, rect, buttons, checks, None, content);
+}
+
+/// [`framed`], with `note` pinned above the bar: why the last try at this addon failed, in
+/// red ink, so it's beside the buttons that try again and never scrolls out of sight.
+fn framed_with_note(
+    app: &mut App,
+    ui: &mut Ui,
+    rect: Rect,
+    buttons: Vec<BarButton>,
+    checks: Vec<BarCheck>,
+    note: Option<&str>,
+    content: impl FnOnce(&mut App, &mut Ui),
+) {
     let room = (rect.width() - 36.0).max(40.0);
+    let note_height = note.map_or(0.0, |text| {
+        let font = theme::body(NOTE_SIZE);
+        let galley = ui
+            .painter()
+            .layout(text.to_owned(), font, theme::INK_BAD, room);
+        galley.size().y.ceil() + NOTE_GAP
+    });
     let widths: Vec<f32> = buttons
         .iter()
         .map(|b| widgets::button_width(ui, &b.label))
@@ -129,8 +153,9 @@ pub fn framed(
     let check_flow = flow(&check_widths, room, 14.0);
     let check_rows = check_flow.last().map_or(0, |last| last + 1);
 
-    let bar_height =
-        button_rows as f32 * (BUTTON_HEIGHT + ROW_GAP) + check_rows as f32 * (CHECK_HEIGHT + 2.0);
+    let bar_height = note_height
+        + button_rows as f32 * (BUTTON_HEIGHT + ROW_GAP)
+        + check_rows as f32 * (CHECK_HEIGHT + 2.0);
     let bar_bottom = rect.max.y - 10.0;
     let bar_top = bar_bottom - bar_height;
     let text_bottom = (bar_top - 4.0).max(rect.min.y + 36.0);
@@ -156,8 +181,18 @@ pub fn framed(
         });
     });
 
-    // Checkboxes above the buttons, so the main button always sits in the same corner.
     let mut y = bar_top;
+    if let Some(text) = note {
+        let at = Rect::from_min_size(
+            pos2(rect.min.x + 18.0, y),
+            vec2(room, note_height - NOTE_GAP),
+        );
+        ui.scope_builder(UiBuilder::new().max_rect(at), |ui| {
+            widgets::ink(ui, text, theme::body(NOTE_SIZE), theme::INK_BAD);
+        });
+        y += note_height;
+    }
+    // Checkboxes above the buttons, so the main button always sits in the same corner.
     for row in 0..check_rows {
         let mut x = rect.min.x + 18.0;
         for (i, check) in checks.iter().enumerate() {
@@ -319,12 +354,21 @@ fn addon_page(app: &mut App, ui: &mut Ui, rect: Rect, id: &str) {
         },
     ];
 
-    framed(app, ui, rect, buttons, checks, |app, ui| {
-        title(ui, &addon.name);
-        byline(ui, &addon.author);
-        rule(ui);
-        addon_body(app, ui, addon, record.as_ref(), channel);
-    });
+    let failure = app.failures.get(id).cloned();
+    framed_with_note(
+        app,
+        ui,
+        rect,
+        buttons,
+        checks,
+        failure.as_deref(),
+        |app, ui| {
+            title(ui, &addon.name);
+            byline(ui, &addon.author);
+            rule(ui);
+            addon_body(app, ui, addon, record.as_ref(), channel);
+        },
+    );
 }
 
 fn rollback_button(record: Option<&ManagedAddon>, id: &str, busy: bool) -> Option<BarButton> {
@@ -537,24 +581,33 @@ fn managed_only_page(app: &mut App, ui: &mut Ui, rect: Rect, record: &ManagedAdd
     let version = record.version.clone();
     let folders = record.folders.join(", ");
     let local = record.origin == Origin::LocalZip;
-    framed(app, ui, rect, buttons, Vec::new(), |_, ui| {
-        title(ui, &name);
-        rule(ui);
-        body(
-            ui,
-            if local {
-                "Installed from a zip file, so it doesn't get updates."
-            } else {
-                "This addon isn't in the catalog anymore, so it doesn't get updates."
-            },
-        );
-        ui.add_space(10.0);
-        widgets::section(ui, "Details");
-        if !version.is_empty() {
-            widgets::fact(ui, "Version:", &version);
-        }
-        widgets::fact(ui, "Folders:", &clean_line(&folders, 600));
-    });
+    let failure = app.failures.get(&record.id).cloned();
+    framed_with_note(
+        app,
+        ui,
+        rect,
+        buttons,
+        Vec::new(),
+        failure.as_deref(),
+        |_, ui| {
+            title(ui, &name);
+            rule(ui);
+            body(
+                ui,
+                if local {
+                    "Installed from a zip file, so it doesn't get updates."
+                } else {
+                    "This addon isn't in the catalog anymore, so it doesn't get updates."
+                },
+            );
+            ui.add_space(10.0);
+            widgets::section(ui, "Details");
+            if !version.is_empty() {
+                widgets::fact(ui, "Version:", &version);
+            }
+            widgets::fact(ui, "Folders:", &clean_line(&folders, 600));
+        },
+    );
 }
 
 fn other_page(app: &mut App, ui: &mut Ui, rect: Rect, primary: &str) {

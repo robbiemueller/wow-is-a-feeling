@@ -16,11 +16,12 @@ use crate::ops::{self, Casting, Queue};
 use crate::script::Script;
 use crate::skin::Skin;
 use crate::views::{self, toolbar};
-use crate::worker::{Dirs, Event, FoundGame, OpEnv, Worker};
+use crate::worker::{Dirs, Event, FoundGame, OpEnv, Sources, Worker};
 use crate::{demo, theme};
 use eframe::egui::{self, Key, Modifiers, TextureHandle, Ui, Vec2, ViewportCommand, vec2};
 use feeling_core::backup::BackupEntry;
 use feeling_core::catalog::{CATALOG_URL, Channel};
+use feeling_core::details::WOWI_DETAILS_API;
 use feeling_core::scan::{self, AddonGroup, Adoption, LocalFolder};
 use feeling_core::search::SortBy;
 use feeling_core::state::{ManagedAddon, State};
@@ -135,6 +136,9 @@ pub struct App {
     pub fun: Fun,
     pub cursors: Cursors,
     pub channel_choice: HashMap<String, Channel>,
+    /// Why the last try at an addon failed, by addon id. Its page keeps showing it after the
+    /// red line fades, until the addon is tried again or something else works out.
+    pub failures: HashMap<String, String>,
     pub changelog_open: bool,
     pub actions: Vec<Action>,
     /// What to carry on with once the player has chosen a game folder.
@@ -185,17 +189,9 @@ impl App {
 
         let (tx, rx) = mpsc::channel();
         let demo = launch.demo;
-        let catalog_url = catalog_url_for(&launch);
+        let sources = sources_for(&launch);
         let sim = Duration::from_millis(launch.sim_ms.unwrap_or(1200));
-        let worker = Worker::new(
-            ctx.clone(),
-            tx,
-            dirs,
-            demo,
-            launch.test_rig,
-            catalog_url,
-            sim,
-        );
+        let worker = Worker::new(ctx.clone(), tx, dirs, demo, launch.test_rig, sources, sim);
         let now = Instant::now();
         // Scripts press buttons, so like the catalog address they're for test rigs alone.
         let script = launch
@@ -258,6 +254,7 @@ impl App {
             fun,
             cursors: Cursors::default(),
             channel_choice: HashMap::new(),
+            failures: HashMap::new(),
             changelog_open: false,
             actions: Vec::new(),
             after_folder: Vec::new(),
@@ -1203,14 +1200,14 @@ pub fn parse_selection(text: &str) -> Selection {
     }
 }
 
-/// Where to fetch the catalog. Only a test rig can point somewhere else, because a shortcut
-/// with a stranger's catalog in it would be a way to install a stranger's files.
-fn catalog_url_for(launch: &Launch) -> String {
-    launch
-        .catalog_url
-        .clone()
-        .filter(|_| launch.test_rig)
-        .unwrap_or_else(|| CATALOG_URL.to_owned())
+/// Where to fetch from. Only a test rig can point somewhere else, because a shortcut with a
+/// stranger's catalog in it would be a way to install a stranger's files.
+fn sources_for(launch: &Launch) -> Sources {
+    let rig = |url: &Option<String>| url.clone().filter(|_| launch.test_rig);
+    Sources {
+        catalog_url: rig(&launch.catalog_url).unwrap_or_else(|| CATALOG_URL.to_owned()),
+        wowi_api: rig(&launch.wowi_api).unwrap_or_else(|| WOWI_DETAILS_API.to_owned()),
+    }
 }
 
 fn default_browse_folder() -> PathBuf {
@@ -1239,17 +1236,26 @@ mod tests {
     }
 
     #[test]
-    fn only_a_test_rig_can_change_where_the_catalog_comes_from() {
+    fn only_a_test_rig_can_change_where_things_come_from() {
         let mut launch = Launch {
             catalog_url: Some("https://stranger.example/catalog.json".to_owned()),
+            wowi_api: Some("https://stranger.example/wowi".to_owned()),
             ..Launch::default()
         };
-        assert_eq!(catalog_url_for(&launch), CATALOG_URL);
+        let real = Sources {
+            catalog_url: CATALOG_URL.to_owned(),
+            wowi_api: WOWI_DETAILS_API.to_owned(),
+        };
+        assert_eq!(sources_for(&launch), real);
         launch.test_rig = true;
         assert_eq!(
-            catalog_url_for(&launch),
-            "https://stranger.example/catalog.json"
+            sources_for(&launch),
+            Sources {
+                catalog_url: "https://stranger.example/catalog.json".to_owned(),
+                wowi_api: "https://stranger.example/wowi".to_owned(),
+            }
         );
+        assert_eq!(sources_for(&Launch::default()), real);
     }
 
     #[test]

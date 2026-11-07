@@ -2,8 +2,9 @@
 //! folder, and one casting bar that tells the truth about all of it. Pure, so it's tested
 //! without threads.
 
-use crate::model::clean_line;
+use crate::model::{self, clean_line};
 use feeling_core::catalog::{Addon, Channel, Release};
+use feeling_core::details::HeldUpload;
 use feeling_core::install::Stage;
 use feeling_core::scan::LocalFolder;
 use feeling_core::selfupdate::UpdateInfo;
@@ -614,6 +615,40 @@ pub fn not_in_zip(
 }
 
 /// Why an addon wasn't installed or updated, and where the player gets to decide.
+/// A failure, led by what failed, so a line from a batch says which addon it's about.
+pub fn failed_line(op: &Op, text: &str) -> String {
+    let doing = match op.verb {
+        Verb::Install => "install",
+        Verb::Update => "update",
+        Verb::Reinstall => "reinstall",
+        Verb::RollBack => "roll back",
+        Verb::Remove => "remove",
+        // Their own errors already say what they were doing.
+        Verb::Backup | Verb::Restore | Verb::AppUpdate => return text.to_owned(),
+    };
+    if op.name.trim().is_empty() {
+        return text.to_owned();
+    }
+    format!("Couldn't {doing} {}. {text}", clean_line(&op.name, 60))
+}
+
+/// What WoWInterface holding a new upload means for the player. Follows [`failed_line`]'s
+/// "Couldn't install TomTom.", so "its" is the addon.
+pub fn held_line(held: &HeldUpload, now: i64) -> String {
+    let mut upload = "the new version".to_owned();
+    let version = clean_line(&held.version, 32);
+    if !version.is_empty() {
+        upload.push_str(&format!(" ({version})"));
+    }
+    if held.uploaded > 0 {
+        upload.push_str(&format!(
+            " its author posted {}",
+            model::age_text(now - held.uploaded)
+        ));
+    }
+    format!("WoWInterface is holding its downloads until it approves {upload}. Try again later.")
+}
+
 pub fn sitting_out_line<S: AsRef<str>>(name: &str, updating: bool, folders: &[S]) -> String {
     let (done, verb) = if updating {
         ("updated", "Update")
@@ -750,6 +785,57 @@ mod tests {
 
     fn names(started: &[(Op, Arc<AtomicBool>)]) -> Vec<&str> {
         started.iter().map(|(op, _)| op.name.as_str()).collect()
+    }
+
+    #[test]
+    fn a_failure_says_which_addon_and_what_was_being_done() {
+        let mut q = Queue::default();
+        let mut o = op(&mut q, "TomTom", &["TomTom"]);
+        for (verb, line) in [
+            (Verb::Install, "Couldn't install TomTom. Boom."),
+            (Verb::Update, "Couldn't update TomTom. Boom."),
+            (Verb::Reinstall, "Couldn't reinstall TomTom. Boom."),
+            (Verb::RollBack, "Couldn't roll back TomTom. Boom."),
+            (Verb::Remove, "Couldn't remove TomTom. Boom."),
+            (Verb::Backup, "Boom."),
+            (Verb::Restore, "Boom."),
+            (Verb::AppUpdate, "Boom."),
+        ] {
+            o.verb = verb;
+            assert_eq!(failed_line(&o, "Boom."), line);
+        }
+        o.verb = Verb::Install;
+        o.name = "  ".to_owned();
+        assert_eq!(failed_line(&o, "Boom."), "Boom.");
+    }
+
+    #[test]
+    fn a_held_upload_says_what_waits_and_since_when() {
+        let now = 1_794_063_238;
+        let held = HeldUpload {
+            version: "v4.4.1-release".to_owned(),
+            uploaded: now - 720,
+        };
+        assert_eq!(
+            held_line(&held, now),
+            "WoWInterface is holding its downloads until it approves the new version \
+             (v4.4.1-release) its author posted 12 minutes ago. Try again later."
+        );
+        let bare = HeldUpload {
+            version: " \u{202e}\n ".to_owned(),
+            uploaded: 0,
+        };
+        assert_eq!(
+            held_line(&bare, now),
+            "WoWInterface is holding its downloads until it approves the new version. Try again later."
+        );
+        let long = HeldUpload {
+            version: "9".repeat(500),
+            uploaded: now + 50,
+        };
+        let line = held_line(&long, now);
+        assert!(line.len() < 200, "{line}");
+        assert!(line.contains("posted just now"), "{line}");
     }
 
     #[test]

@@ -541,6 +541,31 @@ pub fn is_screenshot_url(url: &str) -> bool {
     Target::parse(url, Reach::Screenshots).is_ok()
 }
 
+/// The name players know a URL's site by, for messages: `WoWInterface`, not
+/// `cdn.wowinterface.com`. A site without a better-known name keeps its host name.
+pub fn site_name(url: &str) -> String {
+    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let host = match authority.strip_prefix('[') {
+        Some(bracketed) => bracketed.split(']').next().unwrap_or_default(),
+        None => authority.split(':').next().unwrap_or_default(),
+    };
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    let on = |site: &str| {
+        host.strip_suffix(site)
+            .is_some_and(|rest| rest.is_empty() || rest.ends_with('.'))
+    };
+    if on("wowinterface.com") || on("mmoui.com") {
+        "WoWInterface".to_owned()
+    } else if on("github.com") || on("githubusercontent.com") {
+        "GitHub".to_owned()
+    } else if host.is_empty() {
+        "The download site".to_owned()
+    } else {
+        host
+    }
+}
+
 fn is_screenshot_host(host: &str) -> bool {
     let name = host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase();
     SCREENSHOT_HOSTS.iter().any(|allowed| {
@@ -871,6 +896,38 @@ mod tests {
 
     fn parse_for_test(url: &str) -> Result<Target> {
         Target::parse(url, Reach::PublicAndLoopback)
+    }
+
+    #[test]
+    fn sites_go_by_the_names_players_know() {
+        for (url, name) in [
+            (
+                "https://cdn.wowinterface.com/downloads/getfile.php?id=7032",
+                "WoWInterface",
+            ),
+            ("https://cdn-wow.mmoui.com/x.zip", "WoWInterface"),
+            (
+                "https://github.com/a/b/releases/download/v1/a.zip",
+                "GitHub",
+            ),
+            ("https://codeload.github.com/a/b/zip/refs/tags/v1", "GitHub"),
+            ("https://objects.githubusercontent.com/x?sig=1", "GitHub"),
+            (
+                "https://foreverdb.net/downloads/ForeverDB.zip",
+                "foreverdb.net",
+            ),
+            ("https://FOREVERDB.NET.:443/x", "foreverdb.net"),
+            ("https://notgithub.com/a.zip", "notgithub.com"),
+            (
+                "https://github.com.evil.example/a.zip",
+                "github.com.evil.example",
+            ),
+            ("http://127.0.0.1:8080/a.zip", "127.0.0.1"),
+            ("http://[::1]:8080/a.zip", "::1"),
+            ("", "The download site"),
+        ] {
+            assert_eq!(site_name(url), name, "{url}");
+        }
     }
 
     /// Lets the local test server stand in for a public site: the first hop may be the

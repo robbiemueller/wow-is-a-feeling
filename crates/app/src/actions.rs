@@ -486,6 +486,8 @@ impl App {
     }
 
     fn push_draft(&mut self, draft: Draft, after: Option<u64>) -> u64 {
+        // Trying again: the casting bar takes over from the old reason.
+        self.failures.remove(&draft.addon_id);
         let id = self.next_op_id();
         self.queue.push(Op {
             id,

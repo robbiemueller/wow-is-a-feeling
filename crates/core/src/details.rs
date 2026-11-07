@@ -77,10 +77,13 @@ struct Endpoints<'a> {
     wowi_api: &'a str,
 }
 
+/// Where WoWInterface describes one file: `{WOWI_DETAILS_API}/{id}.json`.
+pub const WOWI_DETAILS_API: &str = "https://api.mmoui.com/v3/game/WOW/filedetails";
+
 const LIVE: Endpoints<'static> = Endpoints {
     github_raw: "https://raw.githubusercontent.com",
     github_api: "https://api.github.com",
-    wowi_api: "https://api.mmoui.com/v3/game/WOW/filedetails",
+    wowi_api: WOWI_DETAILS_API,
 };
 
 /// Fetch an addon's details. Call it on demand, from a worker thread.
@@ -172,30 +175,7 @@ fn latest_release_body(http: &Http, repo: &str, endpoints: &Endpoints<'_>) -> Op
 }
 
 fn fetch_wowi(http: &Http, id: u64, addon: &Addon, endpoints: &Endpoints<'_>) -> Result<Details> {
-    #[derive(Default, Deserialize)]
-    struct FileDetails {
-        #[serde(rename = "UIDescription", default)]
-        description: Option<String>,
-        #[serde(rename = "UIChangeLog", default)]
-        changelog: Option<String>,
-    }
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum Response {
-        Many(Vec<FileDetails>),
-        One(FileDetails),
-    }
-
-    let url = format!("{}/{id}.json", endpoints.wowi_api);
-    let bytes = http.get_prefix(&url, MAX_DOWNLOAD_BYTES)?;
-    let parsed: Response = serde_json::from_slice(&bytes).map_err(|e| Error::Parse {
-        what: "this addon's details".into(),
-        detail: e.to_string(),
-    })?;
-    let details = match parsed {
-        Response::One(details) => details,
-        Response::Many(list) => list.into_iter().next().unwrap_or_default(),
-    };
+    let details = wowi_file(http, endpoints.wowi_api, id)?;
     let text = |bbcode: Option<String>| cap_text(&bbcode_to_text(&bbcode.unwrap_or_default()));
     let changelog = text(details.changelog);
     Ok(Details {
@@ -210,6 +190,94 @@ fn fetch_wowi(http: &Http, id: u64, addon: &Addon, endpoints: &Endpoints<'_>) ->
             .take(MAX_IMAGES)
             .collect(),
     })
+}
+
+/// A new upload WoWInterface is holding until its staff approve it. Meanwhile it answers
+/// every download of that addon with a web page, the version it already lists included.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldUpload {
+    /// As WoWInterface gives it: a stranger's text, to be cleaned before it's shown.
+    pub version: String,
+    /// Unix seconds, or 0 when WoWInterface doesn't say.
+    pub uploaded: i64,
+}
+
+/// Whether WoWInterface is holding a new upload of file `id` for approval. `api` is
+/// [`WOWI_DETAILS_API`] except in tests.
+pub fn wowi_held_upload(http: &Http, api: &str, id: u64) -> Result<Option<HeldUpload>> {
+    let file = wowi_file(http, api, id)?;
+    if !is_yes(&file.pending) {
+        return Ok(None);
+    }
+    Ok(Some(HeldUpload {
+        version: plain_text(&file.version),
+        // WoWInterface counts in milliseconds.
+        uploaded: whole_number(&file.date).max(0) / 1000,
+    }))
+}
+
+/// One file's details. Numbers and flags arrive as strings about as often as not.
+#[derive(Default, Deserialize)]
+struct WowiFile {
+    #[serde(rename = "UIDescription", default)]
+    description: Option<String>,
+    #[serde(rename = "UIChangeLog", default)]
+    changelog: Option<String>,
+    #[serde(rename = "UIVersion", default)]
+    version: serde_json::Value,
+    #[serde(rename = "UIDate", default)]
+    date: serde_json::Value,
+    #[serde(rename = "UIPending", default)]
+    pending: serde_json::Value,
+}
+
+/// `{api}/{id}.json`, which holds a list of one, or now and then a bare object.
+fn wowi_file(http: &Http, api: &str, id: u64) -> Result<WowiFile> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Response {
+        Many(Vec<WowiFile>),
+        One(WowiFile),
+    }
+
+    let url = format!("{api}/{id}.json");
+    let bytes = http.get_prefix(&url, MAX_DOWNLOAD_BYTES)?;
+    let parsed: Response = serde_json::from_slice(&bytes).map_err(|e| Error::Parse {
+        what: "this addon's details".into(),
+        detail: e.to_string(),
+    })?;
+    Ok(match parsed {
+        Response::One(file) => file,
+        Response::Many(list) => list.into_iter().next().unwrap_or_default(),
+    })
+}
+
+fn is_yes(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Bool(yes) => *yes,
+        serde_json::Value::Number(n) => n.as_f64().is_some_and(|n| n != 0.0),
+        serde_json::Value::String(s) => {
+            let s = s.trim();
+            s == "1" || s.eq_ignore_ascii_case("true")
+        }
+        _ => false,
+    }
+}
+
+fn plain_text(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(s) => s.trim().to_owned(),
+        serde_json::Value::Number(n) => n.to_string(),
+        _ => String::new(),
+    }
+}
+
+fn whole_number(value: &serde_json::Value) -> i64 {
+    match value {
+        serde_json::Value::Number(n) => n.as_i64().unwrap_or(0),
+        serde_json::Value::String(s) => s.trim().parse().unwrap_or(0),
+        _ => 0,
+    }
 }
 
 /// Cut long text at a paragraph break if one's nearby, else a space, and say so.
@@ -1159,6 +1227,59 @@ mod tests {
         assert_eq!(details.about, "Just this.");
         assert_eq!(details.changelog, None);
         assert!(details.images.is_empty());
+    }
+
+    #[test]
+    fn wowinterface_says_when_it_holds_an_upload_for_approval() {
+        // TomTom's details while v4.4.1 waited, trimmed. The flag is a string, the date a
+        // number of milliseconds.
+        let server = serve(|request, stream| {
+            let body: &[u8] = match request.path.as_str() {
+                "/7032.json" => {
+                    br#"[{"UID":"7032","UIVersion":"v4.4.1-release","UIDate":1794062518000,"UIPending":"1","UIName":"TomTom"}]"#
+                }
+                "/5108.json" => {
+                    br#"[{"UID":"5108","UIVersion":"v5.1.0-release","UIDate":1793564625000,"UIPending":"0"}]"#
+                }
+                "/1.json" => br#"{"UIVersion":12,"UIDate":"1794062518000","UIPending":1}"#,
+                "/2.json" => br#"{"UIPending":true}"#,
+                "/3.json" => br#"[{"UIVersion":"1.0"}]"#,
+                _ => br"[]",
+            };
+            respond(stream, "200 OK", &[], body);
+        });
+        let held = |id| wowi_held_upload(&Http::allowing_loopback(), &server.base, id).unwrap();
+        assert_eq!(
+            held(7032),
+            Some(HeldUpload {
+                version: "v4.4.1-release".into(),
+                uploaded: 1_794_062_518,
+            })
+        );
+        assert_eq!(held(5108), None);
+        assert_eq!(
+            held(1),
+            Some(HeldUpload {
+                version: "12".into(),
+                uploaded: 1_794_062_518,
+            })
+        );
+        assert_eq!(
+            held(2),
+            Some(HeldUpload {
+                version: String::new(),
+                uploaded: 0,
+            })
+        );
+        assert_eq!(held(3), None, "no flag means nothing is held");
+        assert_eq!(held(4), None, "an empty answer means nothing is held");
+    }
+
+    #[test]
+    fn wowinterface_held_upload_nonsense_is_an_error() {
+        let server = serve(|_, stream| respond(stream, "200 OK", &[], b"<html>maintenance</html>"));
+        let result = wowi_held_upload(&Http::allowing_loopback(), &server.base, 7032);
+        assert!(matches!(result, Err(Error::Parse { .. })));
     }
 
     #[test]

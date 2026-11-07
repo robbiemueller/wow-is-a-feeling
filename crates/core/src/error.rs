@@ -19,6 +19,11 @@ pub enum Error {
     Cancelled,
     #[error("The download looks corrupt: {0}. Try again.")]
     Corrupt(String),
+    /// A site answered a download with a web page, such as a notice, and a success code.
+    #[error(
+        "{site} sent a web page instead of the zip. Try again later, and if it keeps happening, use Open page to check the addon is still offered there."
+    )]
+    WebPage { site: String },
     #[error("This addon's zip isn't safe to install: {0}")]
     UnsafeZip(String),
     #[error("This addon's zip doesn't contain anything WoW can load.")]
