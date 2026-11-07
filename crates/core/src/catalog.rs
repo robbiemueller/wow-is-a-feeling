@@ -78,6 +78,11 @@ pub struct Addon {
     /// folders, ids and name are claims, so it only gets installed when a player asks for it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub trusted: bool,
+    /// Whether a person chose this entry: seeded, hand-picked or part of an approved pair.
+    /// Only these get installed by themselves as another addon's dependency, because any
+    /// addon can ship a library's folder name long before anything needs it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reviewed: bool,
     /// Screenshots, for a source whose details don't list them (WoWInterface). Written by a
     /// stranger, so the app filters these and fetches them with `Http::get_untrusted`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
