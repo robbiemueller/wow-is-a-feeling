@@ -114,13 +114,18 @@ pub struct InstallRequest {
 impl InstallRequest {
     /// A request for a catalog release, keeping nothing and replacing nothing.
     pub fn for_release(addon_id: &str, release: &Release) -> Self {
+        // WoWInterface's link always serves the newest upload, so after an author updates,
+        // the catalog's size and MD5 describe an older file until the next catalog build.
+        // A mismatch there means newer, not damaged. TLS and the zip's own checksums still
+        // catch a bad download.
+        let always_newest = addon_id.starts_with("wowi:");
         InstallRequest {
             addon_id: addon_id.to_string(),
             version: release.version.clone(),
             url: release.url.clone(),
-            size: release.size,
+            size: if always_newest { 0 } else { release.size },
             sha256: release.sha256.clone(),
-            md5: release.md5.clone(),
+            md5: release.md5.clone().filter(|_| !always_newest),
             moves: release.moves.clone(),
             ..InstallRequest::default()
         }
@@ -3014,6 +3019,24 @@ mod tests {
     fn hex_encoding() {
         assert_eq!(to_hex(&[0x00, 0xab, 0xff]), "00abff");
         assert_eq!(to_hex(&[]), "");
+    }
+
+    #[test]
+    fn only_wowinterface_releases_skip_the_catalogs_size_and_md5() {
+        let release = Release {
+            version: "1".into(),
+            url: "https://example.com/a.zip".into(),
+            size: 5,
+            sha256: Some("aa".into()),
+            md5: Some("bb".into()),
+            ..Release::default()
+        };
+        let wowi = InstallRequest::for_release("wowi:7032", &release);
+        assert_eq!((wowi.size, wowi.md5), (0, None));
+        let github = InstallRequest::for_release("gh:a/b", &release);
+        assert_eq!(github.size, 5);
+        assert_eq!(github.md5.as_deref(), Some("bb"));
+        assert_eq!(github.sha256.as_deref(), Some("aa"));
     }
 
     #[test]

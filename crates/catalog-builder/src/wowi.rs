@@ -16,6 +16,9 @@ use crate::zipscan::{addon_folders, scan_zip};
 
 const API: &str = "https://api.mmoui.com/v3/game/WOW";
 
+/// As many screenshots as the app's panel shows.
+const MAX_IMAGES: usize = 3;
+
 /// A row of `filelist.json`. Numbers often arrive as strings.
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
 pub struct Row {
@@ -43,6 +46,9 @@ pub struct Row {
     pub monthly: u64,
     #[serde(rename = "UIFavoriteTotal", default, deserialize_with = "lenient_u64")]
     pub favorites: u64,
+    /// Screenshots. This listing is the only place the API gives them.
+    #[serde(rename = "UIIMGs", default, deserialize_with = "lenient_strings")]
+    pub images: Vec<String>,
 }
 
 fn lenient_u64<'de, D: serde::Deserializer<'de>>(de: D) -> Result<u64, D::Error> {
@@ -59,6 +65,20 @@ fn lenient_string<'de, D: serde::Deserializer<'de>>(de: D) -> Result<String, D::
         serde_json::Value::Number(n) => n.to_string(),
         _ => String::new(),
     })
+}
+
+fn lenient_strings<'de, D: serde::Deserializer<'de>>(de: D) -> Result<Vec<String>, D::Error> {
+    let items = match serde_json::Value::deserialize(de)? {
+        serde_json::Value::Array(items) => items,
+        _ => Vec::new(),
+    };
+    Ok(items
+        .into_iter()
+        .filter_map(|item| match item {
+            serde_json::Value::String(s) => Some(s),
+            _ => None,
+        })
+        .collect())
 }
 
 /// What we know about one WoWInterface file, kept between runs.
@@ -190,6 +210,12 @@ pub fn candidate(row: &Row, scan: &ZipScan, size: u64, md5: Option<String>) -> C
             deps: scan.external_deps(),
             downloads: row.downloads,
             ids,
+            images: row
+                .images
+                .iter()
+                .take(MAX_IMAGES)
+                .map(|url| url.trim().to_string())
+                .collect(),
             ..Addon::default()
         },
         toc_category: scan.category.clone(),
@@ -316,6 +342,7 @@ mod tests {
             downloads: 1000,
             monthly,
             favorites: 7,
+            images: Vec::new(),
         }
     }
 
@@ -327,6 +354,7 @@ mod tests {
         let body = br#"[
             {"UID":"3896","UICATID":"24","UIVersion":"v1.54.04","UIDate":1792507606000,"UIName":"Atlas",
              "UIAuthorName":"arith","UIFileInfoURL":"https://x.test/a","UIDownloadTotal":"4727895",
+             "UIIMGs":["https://cdn-wow.mmoui.com/preview/pvw51580.png",null,7],
              "UIDownloadMonthly":"654","UIFavoriteTotal":"5328","UIDir":["Atlas"],"UISiblings":null},
             {"UID":7032,"UICATID":24,"UIVersion":null,"UIDate":"1792507606000","UIName":null},
             {"no":"id"},
@@ -335,6 +363,10 @@ mod tests {
         let rows = parse_filelist(body).unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].id, 3896);
+        assert_eq!(
+            rows[0].images,
+            ["https://cdn-wow.mmoui.com/preview/pvw51580.png"]
+        );
         assert_eq!(rows[0].downloads, 4_727_895);
         assert_eq!(rows[0].date_ms, 1_792_507_606_000);
         assert_eq!(rows[1].version, "");

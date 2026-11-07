@@ -93,7 +93,7 @@ fn fetch_from(http: &Http, addon: &Addon, endpoints: &Endpoints<'_>) -> Result<D
         Source::Github { repo } if is_plain_repo(repo) => {
             fetch_github(http, repo, addon, endpoints)
         }
-        Source::Wowi { id } => fetch_wowi(http, *id, endpoints),
+        Source::Wowi { id } => fetch_wowi(http, *id, addon, endpoints),
         _ => Ok(Details {
             about: addon.summary.clone(),
             ..Details::default()
@@ -171,15 +171,13 @@ fn latest_release_body(http: &Http, repo: &str, endpoints: &Endpoints<'_>) -> Op
     serde_json::from_slice::<Release>(&bytes).ok()?.body
 }
 
-fn fetch_wowi(http: &Http, id: u64, endpoints: &Endpoints<'_>) -> Result<Details> {
+fn fetch_wowi(http: &Http, id: u64, addon: &Addon, endpoints: &Endpoints<'_>) -> Result<Details> {
     #[derive(Default, Deserialize)]
     struct FileDetails {
         #[serde(rename = "UIDescription", default)]
         description: Option<String>,
         #[serde(rename = "UIChangeLog", default)]
         changelog: Option<String>,
-        #[serde(rename = "UIIMGs", default)]
-        images: Option<Vec<String>>,
     }
     #[derive(Deserialize)]
     #[serde(untagged)]
@@ -203,9 +201,9 @@ fn fetch_wowi(http: &Http, id: u64, endpoints: &Endpoints<'_>) -> Result<Details
     Ok(Details {
         about: text(details.description),
         changelog: (!changelog.is_empty()).then_some(changelog),
-        images: details
+        // WoWInterface only lists screenshots in its big file list, so the catalog carries them.
+        images: addon
             .images
-            .unwrap_or_default()
             .iter()
             .filter_map(|url| absolute_https(url))
             .filter(|url| net::is_public_url(url))
@@ -1116,16 +1114,19 @@ mod tests {
                 "200 OK",
                 &[],
                 br#"[{"UID":"5086","UIName":"Big","UIDescription":"[b]Bold[/b] intro\r\n[list][*]One[*]Two[/list][img]https://x/y.png[/img]",
-                     "UIChangeLog":"[size=4]v1[/size]\r\nFixed.",
-                     "UIIMGs":["https://cdn.example/1.png","http://cdn.example/2.png","https://cdn.example/3.png","https://cdn.example/4.png"]}]"#,
+                     "UIChangeLog":"[size=4]v1[/size]\r\nFixed."}]"#,
             );
         });
-        let details = fetch_from(
-            &Http::allowing_loopback(),
-            &addon(Source::Wowi { id: 5086 }),
-            &endpoints(&server),
-        )
-        .unwrap();
+        let big = Addon {
+            images: vec![
+                "https://cdn.example/1.png".into(),
+                "http://cdn.example/2.png".into(),
+                "https://cdn.example/3.png".into(),
+                "https://cdn.example/4.png".into(),
+            ],
+            ..addon(Source::Wowi { id: 5086 })
+        };
+        let details = fetch_from(&Http::allowing_loopback(), &big, &endpoints(&server)).unwrap();
         assert_eq!(details.about, "Bold intro\n• One\n• Two");
         assert_eq!(details.changelog.as_deref(), Some("v1\nFixed."));
         assert_eq!(
@@ -1581,21 +1582,19 @@ mod tests {
     #[test]
     fn a_wowi_page_cannot_point_the_app_at_the_players_own_network() {
         let server = serve(|_, stream| {
-            respond(
-                stream,
-                "200 OK",
-                &[],
-                br#"[{"UID":"1","UIDescription":"x","UIIMGs":["https://127.0.0.1/a.png",
-                    "http://192.168.1.1/b.png","//localhost/c.png","https://router/d.png",
-                    "https://cdn.example/fine.png"]}]"#,
-            );
+            respond(stream, "200 OK", &[], br#"[{"UIDescription":"x"}]"#);
         });
-        let details = fetch_from(
-            &Http::allowing_loopback(),
-            &addon(Source::Wowi { id: 1 }),
-            &endpoints(&server),
-        )
-        .unwrap();
+        let page = Addon {
+            images: vec![
+                "https://127.0.0.1/a.png".into(),
+                "http://192.168.1.1/b.png".into(),
+                "//localhost/c.png".into(),
+                "https://router/d.png".into(),
+                "https://cdn.example/fine.png".into(),
+            ],
+            ..addon(Source::Wowi { id: 1 })
+        };
+        let details = fetch_from(&Http::allowing_loopback(), &page, &endpoints(&server)).unwrap();
         assert_eq!(details.images, ["https://cdn.example/fine.png"]);
     }
 

@@ -19,7 +19,7 @@ thiserror = "2"
 log = "0.4"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 zip = { version = "9.4", default-features = false, features = ["deflate-flate2"] }
-ureq = { version = "3.5", default-features = false, features = ["rustls", "platform-verifier", "gzip"] }
+ureq = { version = "3.5", default-features = false, features = ["rustls", "platform-verifier", "gzip", "socks-proxy"] }
 sha2 = "0.10"
 md-5 = "0.10"
 

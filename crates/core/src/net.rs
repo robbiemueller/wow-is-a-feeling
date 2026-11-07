@@ -8,7 +8,7 @@
 use std::borrow::Cow;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -42,8 +42,9 @@ const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
 const CONNECT_RETRY_DELAYS: [Duration; 2] =
     [Duration::from_millis(300), Duration::from_millis(900)];
 const BUFFER_SIZE: usize = 64 * 1024;
-/// Names that only mean something on the player's own network.
-const INTERNAL_SUFFIXES: [&str; 9] = [
+/// Names that only mean something on the player's own network. Windows answers the last
+/// two by itself, without asking DNS.
+const INTERNAL_SUFFIXES: [&str; 11] = [
     ".localhost",
     ".local",
     ".localdomain",
@@ -53,6 +54,8 @@ const INTERNAL_SUFFIXES: [&str; 9] = [
     ".home",
     ".corp",
     ".home.arpa",
+    ".ipv6-literal.net",
+    ".mshome.net",
 ];
 
 /// How far a long-running operation has got, in bytes.
@@ -98,8 +101,9 @@ impl Default for Http {
 }
 
 impl Http {
-    /// The client the app uses: https to public names, and nothing on this machine or
-    /// the local network, on any hop of a redirect.
+    /// The client the app uses: https to public names only, on every hop of a redirect.
+    /// A public name can still point anywhere, and then the certificate check stops anything
+    /// being sent. Links a stranger wrote get the stronger [`Http::get_untrusted`].
     pub fn new() -> Self {
         Self::with_reach(Reach::Public)
     }
@@ -111,22 +115,13 @@ impl Http {
     }
 
     fn with_reach(reach: Reach) -> Self {
-        let tls = TlsConfig::builder()
-            .root_certs(RootCerts::PlatformVerifier)
-            .build();
-        let config = Agent::config_builder()
-            .tls_config(tls)
-            .timeout_connect(Some(CONNECT_TIMEOUT))
-            .timeout_per_read(Some(IO_TIMEOUT))
-            .timeout_per_write(Some(IO_TIMEOUT))
-            .max_redirects(0)
-            .http_status_as_error(false)
-            .user_agent(USER_AGENT)
-            .build();
         Http {
-            agent: config.new_agent(),
+            agent: client_config(RootCerts::PlatformVerifier).new_agent(),
             stranger_agent: Agent::with_parts(
-                config,
+                // The OS's certificate checker can fetch a URL named inside a certificate
+                // during the handshake, outside every rule in this file. So a stranger's
+                // server gets the built-in root list, and at worst a screenshot is lost.
+                client_config(RootCerts::WebPki),
                 DefaultConnector::default(),
                 PublicOnlyResolver::default(),
             ),
@@ -286,6 +281,19 @@ impl Http {
     }
 }
 
+fn client_config(roots: RootCerts) -> Config {
+    let tls = TlsConfig::builder().root_certs(roots).build();
+    Agent::config_builder()
+        .tls_config(tls)
+        .timeout_connect(Some(CONNECT_TIMEOUT))
+        .timeout_per_read(Some(IO_TIMEOUT))
+        .timeout_per_write(Some(IO_TIMEOUT))
+        .max_redirects(0)
+        .http_status_as_error(false)
+        .user_agent(USER_AGENT)
+        .build()
+}
+
 /// Request `start` and follow its redirects, holding every hop to `reach`.
 fn follow_redirects(
     agent: &Agent,
@@ -306,10 +314,12 @@ fn follow_redirects(
                 response,
             });
         }
+        // Not `to_str`, which refuses the raw UTF-8 some servers send here. `escape_url`
+        // handles it, and `Target::parse` still checks the result.
         let location = response
             .headers()
             .get(LOCATION)
-            .and_then(|v| v.to_str().ok());
+            .and_then(|v| std::str::from_utf8(v.as_bytes()).ok());
         match location {
             Some(location) if status.is_redirection() => {
                 let next = join_location(&target.url, location);
@@ -364,14 +374,27 @@ impl Resolver for PublicOnlyResolver {
         let addresses = self.inner.resolve(uri, config, timeout)?;
         // The player's own proxy may well live on this machine. It's their choice, not a
         // stranger's, and the name a stranger wrote is left for the proxy to resolve.
-        let is_players_proxy = config.proxy().is_some_and(|proxy| proxy.uri() == uri);
-        if is_players_proxy || addresses.iter().all(|address| is_public_ip(address.ip())) {
-            Ok(addresses)
-        } else {
+        if config.proxy().is_some_and(|proxy| proxy.uri() == uri) {
+            return Ok(addresses);
+        }
+        let public = keep_public(&addresses, self.inner.empty());
+        if public.is_empty() {
             log::warn!("Refused a private address for a link from an addon's page.");
-            Err(ureq::Error::HostNotFound)
+            return Err(ureq::Error::HostNotFound);
+        }
+        Ok(public)
+    }
+}
+
+/// The connector only ever tries what's kept here, so a private address is never contacted,
+/// and a host with a stray private record still works through its public ones.
+fn keep_public(addresses: &[SocketAddr], mut kept: ResolvedSocketAddrs) -> ResolvedSocketAddrs {
+    for address in addresses {
+        if is_public_ip(address.ip()) {
+            kept.push(*address);
         }
     }
+    kept
 }
 
 /// Whether an address is out on the public internet, not on this machine or a local network.
@@ -383,11 +406,13 @@ fn is_public_ip(ip: IpAddr) -> bool {
 }
 
 fn is_public_v4(ip: Ipv4Addr) -> bool {
-    let [first, second, ..] = ip.octets();
+    let [first, second, third, _] = ip.octets();
     let this_network = first == 0;
+    let protocol_assignments = first == 192 && second == 0 && third == 0;
     let carrier_nat = first == 100 && (64..128).contains(&second);
     let reserved = first >= 240;
     !(this_network
+        || protocol_assignments
         || carrier_nat
         || reserved
         || ip.is_loopback()
@@ -408,6 +433,10 @@ fn is_public_v6(ip: Ipv6Addr) -> bool {
         let [c, d] = low.to_be_bytes();
         Ipv4Addr::new(a, b, c, d)
     };
+    let local_nat64 = segments[..3] == [0x0064, 0xff9b, 1];
+    if local_nat64 {
+        return false;
+    }
     let nat64 = segments[..6] == [0x0064, 0xff9b, 0, 0, 0, 0];
     if nat64 {
         return is_public_v4(embedded(segments[6], segments[7]));
@@ -491,10 +520,21 @@ pub(crate) fn is_public_url(url: &str) -> bool {
 
 /// Whether `host` is a name on the public internet. An address written as numbers is
 /// refused wherever it points: nothing this app fetches lives at one, and resolvers accept
-/// many spellings of this machine, such as `2130706433`, `0x7f.1` and `127.1`.
+/// many spellings of this machine, such as `2130706433`, `0x7f.1` and `127.1`. Labels are
+/// held to what the TLS layer accepts, which also rules out special names Windows answers
+/// itself, such as `..localmachine`. A name in non-ASCII letters is refused too: it's rare,
+/// its punycode spelling works, and it keeps look-alikes of local names out.
 fn is_public_name(host: &str) -> bool {
-    let name = host.trim_end_matches('.').to_ascii_lowercase();
-    if name.starts_with('[') || name.contains('%') {
+    let name = host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase();
+    let is_valid_label = |label: &str| {
+        (1..=63).contains(&label.len())
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+    };
+    if name.len() > 253 || !name.split('.').all(is_valid_label) {
         return false;
     }
     // A single word is a name on the local network: `localhost`, `router`, `nas`.
@@ -1298,6 +1338,17 @@ mod tests {
             "https://vault.internal/x",
             "https://box.home.arpa/x",
             "https://%6c%6f%63%61%6c%68%6f%73%74/x",
+            "https://0--1.ipv6-literal.net/x",
+            "https://fe80--1s1.ipv6-literal.net/x",
+            "https://SNOW.mshome.net/x",
+            "https://..localmachine/x",
+            "https://.router/x",
+            "https://a..b/x",
+            "https://x-.127.0.0.1.nip.io/x",
+            "https://x.local[::1]/x",
+            "https://münchen.de/x",
+            "https://ｌｏｃａｌｈｏｓｔ/x",
+            "https://127。0。0。1/x",
         ] {
             let result = http.get_bytes(url, 10);
             assert!(matches!(result, Err(Error::Other(_))), "{url}: {result:?}");
@@ -1317,6 +1368,10 @@ mod tests {
             "https://GitHub.com./x",
             "https://localhost.example.com/x",
             "https://example.co.uk/x",
+            "https://xn--mnchen-3ya.de/x",
+            "https://release-assets.githubusercontent.com/x",
+            "https://cdn-wow.mmoui.com/preview/pvw29.jpg",
+            "https://under_score.example.com/x",
         ] {
             assert!(Target::parse(url, Reach::Public).is_ok(), "{url}");
         }
@@ -1381,6 +1436,49 @@ mod tests {
     }
 
     #[test]
+    fn private_answers_are_dropped_and_public_ones_kept() {
+        let empty = || DefaultResolver::default().empty();
+        let address = |text: &str| -> SocketAddr { text.parse().unwrap() };
+        let (public, private) = (address("140.82.112.3:443"), address("10.0.0.1:443"));
+        let local = address("[::1]:443");
+        let kept = keep_public(&[private, public, local], empty());
+        assert_eq!(&kept[..], &[public]);
+        // A DNS-based proxy tool answers with these two for every public name.
+        let (fake_v4, fake_v6) = (
+            address("198.18.0.1:443"),
+            address("[fdfe:dcba:9876::1]:443"),
+        );
+        assert_eq!(&keep_public(&[fake_v6, fake_v4], empty())[..], &[fake_v4]);
+        assert!(keep_public(&[private, local], empty()).is_empty());
+    }
+
+    #[test]
+    fn a_strangers_server_never_gets_the_os_certificate_checker() {
+        let http = Http::new();
+        assert!(matches!(
+            http.stranger_agent.config().tls_config().root_certs(),
+            RootCerts::WebPki
+        ));
+        assert!(matches!(
+            http.agent.config().tls_config().root_certs(),
+            RootCerts::PlatformVerifier
+        ));
+    }
+
+    #[test]
+    fn a_redirect_with_raw_utf8_in_it_is_followed() {
+        let server = serve(|request, stream| match request.path.as_str() {
+            "/start" => respond(stream, "302 Found", &[("Location", "/files/café.zip")], b""),
+            "/files/caf%C3%A9.zip" => respond(stream, "200 OK", &[], b"arrived"),
+            other => panic!("unexpected path {other}"),
+        });
+        let body = Http::allowing_loopback()
+            .get_bytes(&format!("{}/start", server.base), 100)
+            .unwrap();
+        assert_eq!(body, b"arrived");
+    }
+
+    #[test]
     fn only_addresses_on_the_public_internet_count_as_public() {
         for ip in [
             "127.0.0.1",
@@ -1412,6 +1510,9 @@ mod tests {
             "64:ff9b::c0a8:101",
             "2002:7f00:1::",
             "2002:c0a8:101::",
+            "192.0.0.1",
+            "192.0.0.255",
+            "64:ff9b:1::c0a8:101",
         ] {
             assert!(!is_public_ip(ip.parse().unwrap()), "{ip}");
         }
@@ -1424,6 +1525,7 @@ mod tests {
             "172.15.255.255",
             "172.32.0.1",
             "192.167.1.1",
+            "192.0.1.1",
             // DNS-based proxy tools hand out this range for every public name.
             "198.18.0.1",
             "2606:4700:4700::1111",

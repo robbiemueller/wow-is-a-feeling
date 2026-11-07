@@ -72,6 +72,10 @@ pub struct Addon {
     /// Unix seconds when this addon first appeared, for the "Newest" sort. 0 when unknown.
     #[serde(default, skip_serializing_if = "is_zero_i64")]
     pub created: i64,
+    /// Screenshots, for a source whose details don't list them (WoWInterface). Written by a
+    /// stranger, so the app filters these and fetches them with `Http::get_untrusted`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
