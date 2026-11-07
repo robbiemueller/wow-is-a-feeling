@@ -558,11 +558,14 @@ pub fn well_edit(ui: &mut Ui, edit: egui::TextEdit<'_>, size: Vec2) -> Response 
     let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
     skin::well(ui.painter(), rect, Color32::BLACK);
     let inner = rect.shrink2(vec2(6.0, 4.0));
-    ui.put(
+    let response = ui.put(
         inner,
         edit.frame(egui::Frame::NONE)
             .font(theme::body(14.0))
             .text_color(Color32::WHITE)
             .desired_width(inner.width()),
-    )
+    );
+    // Whatever comes next starts below the well, not below the text.
+    ui.advance_cursor_after_rect(rect);
+    response
 }

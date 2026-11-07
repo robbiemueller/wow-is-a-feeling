@@ -8,7 +8,7 @@ use crate::widgets::{self, ButtonKind};
 use crate::worker::{DirListing, FoundGame};
 use eframe::egui::{
     self, Align2, Color32, CornerRadius, Frame, Id, Key, Margin, Modal, Modifiers, RichText,
-    ScrollArea, Shadow, Stroke, TextEdit, Ui, vec2,
+    ScrollArea, Shadow, Stroke, TextEdit, Ui, UiBuilder, vec2,
 };
 use feeling_core::catalog::Channel;
 use feeling_core::selfupdate::UpdateInfo;
@@ -211,27 +211,10 @@ fn app_update(ui: &mut Ui, app: &mut App, info: &UpdateInfo, keep: &mut bool) {
     );
     if !info.notes.is_empty() {
         ui.add_space(8.0);
-        crate::skin::well(
-            ui.painter(),
-            ui.available_rect_before_wrap()
-                .with_max_y(ui.cursor().min.y + 140.0),
-            Color32::BLACK,
-        );
-        ui.add_space(4.0);
-        ScrollArea::vertical()
-            .id_salt("update-notes")
-            .max_height(132.0)
-            .min_scrolled_height(132.0)
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.add_space(8.0);
-                    ui.vertical(|ui| {
-                        ui.set_max_width((ui.available_width() - 14.0).max(40.0));
-                        plain(ui, &crate::model::clean_paragraphs(&info.notes));
-                    });
-                });
-            });
-        ui.add_space(6.0);
+        let height = (ui.ctx().content_rect().height() - 320.0).clamp(60.0, 150.0);
+        sunken_list(ui, "update-notes", height, Color32::BLACK, |ui| {
+            plain(ui, &crate::model::clean_paragraphs(&info.notes));
+        });
     }
     button_row(ui, |ui| {
         if widgets::button(ui, "Update now", ButtonKind::Main, true).clicked() {
@@ -314,39 +297,23 @@ fn folder(ui: &mut Ui, app: &mut App, browser: &mut FolderBrowser, keep: &mut bo
     // Room for the list without running off a small window.
     let screen = ui.ctx().content_rect().height();
     let list_height = (screen - 340.0).clamp(90.0, 280.0);
-    let rect = ui
-        .available_rect_before_wrap()
-        .with_max_y(ui.cursor().min.y + list_height + 8.0);
-    crate::skin::well(ui.painter(), rect, theme::WELL);
-    ui.add_space(4.0);
-    ui.horizontal(|ui| {
-        ui.add_space(6.0);
-        ui.vertical(|ui| {
-            ui.set_max_width((rect.width() - 12.0).max(40.0));
-            ScrollArea::vertical()
-                .id_salt("folder-list")
-                .max_height(list_height)
-                .min_scrolled_height(list_height)
-                .auto_shrink(false)
-                .show(ui, |ui| {
-                    ui.spacing_mut().item_spacing.y = 0.0;
-                    match &browser.listing {
-                        None => plain(ui, "Reading..."),
-                        Some(listing) => {
-                            if let Some(error) = &listing.error {
-                                plain(ui, error);
-                            } else if listing.folders.is_empty() {
-                                plain(ui, "No folders in here.");
-                            }
-                            for name in &listing.folders {
-                                if folder_row(ui, name).clicked() {
-                                    app.actions.push(Action::BrowseTo(listing.path.join(name)));
-                                }
-                            }
-                        }
+    sunken_list(ui, "folder-list", list_height, theme::WELL, |ui| {
+        ui.spacing_mut().item_spacing.y = 0.0;
+        match &browser.listing {
+            None => plain(ui, "Reading..."),
+            Some(listing) => {
+                if let Some(error) = &listing.error {
+                    plain(ui, error);
+                } else if listing.folders.is_empty() {
+                    plain(ui, "No folders in here.");
+                }
+                for name in &listing.folders {
+                    if folder_row(ui, name).clicked() {
+                        app.actions.push(Action::BrowseTo(listing.path.join(name)));
                     }
-                });
-        });
+                }
+            }
+        }
     });
     ui.add_space(8.0);
 
@@ -384,6 +351,23 @@ fn folder(ui: &mut Ui, app: &mut App, browser: &mut FolderBrowser, keep: &mut bo
             *keep = false;
         }
     });
+}
+
+/// A sunken box of exactly this height, which scrolls whatever doesn't fit in it.
+fn sunken_list(ui: &mut Ui, id: &str, height: f32, fill: Color32, content: impl FnOnce(&mut Ui)) {
+    let rect = egui::Rect::from_min_size(ui.cursor().min, vec2(ui.available_width(), height));
+    crate::skin::well(ui.painter(), rect, fill);
+    ui.scope_builder(
+        UiBuilder::new().max_rect(rect.shrink2(vec2(6.0, 4.0))),
+        |ui| {
+            ScrollArea::vertical()
+                .id_salt(id)
+                .auto_shrink(false)
+                .show(ui, content);
+        },
+    );
+    // A scope only reserves what its content used, and this box is always the same size.
+    ui.advance_cursor_after_rect(rect);
 }
 
 fn drive_button(ui: &mut Ui, label: &str) -> egui::Response {

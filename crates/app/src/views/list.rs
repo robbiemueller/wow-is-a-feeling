@@ -49,10 +49,11 @@ pub fn show(app: &mut App, ui: &mut Ui, rect: Rect) {
             area = area.vertical_scroll_offset(0.0);
         }
         let count = app.rows.len();
+        let selected = app.selected_row();
         let output = area.show_rows(ui, ROW_HEIGHT, count, |ui, range| {
             ui.spacing_mut().item_spacing.y = 0.0;
             for index in range {
-                draw_row(app, ui, index);
+                draw_row(app, ui, index, selected == Some(index));
             }
         });
         app.list_offset = output.state.clamped_offset().y;
@@ -75,7 +76,7 @@ fn empty_note(app: &App, ui: &mut Ui, inner: Rect) {
     painter.galley(area.min, galley, theme::TEXT_DIM);
 }
 
-fn draw_row(app: &mut App, ui: &mut Ui, index: usize) {
+fn draw_row(app: &mut App, ui: &mut Ui, index: usize, selected: bool) {
     let row = app.rows[index].clone();
     let width = ui.available_width();
     let (rect, response) = ui.allocate_exact_size(vec2(width, ROW_HEIGHT), Sense::click());
@@ -100,7 +101,6 @@ fn draw_row(app: &mut App, ui: &mut Ui, index: usize) {
             }
         }
         row => {
-            let selected = app.is_selected_row(&row);
             let indent = if app.rows_are_flat() {
                 FLAT_INDENT
             } else {
@@ -123,6 +123,7 @@ fn draw_row(app: &mut App, ui: &mut Ui, index: usize) {
                 && let Some(selection) =
                     model::row_selection(&row, app.bundle.as_deref(), &app.groups)
             {
+                app.row_hint = Some(index);
                 app.actions.push(Action::Select(selection));
             }
         }

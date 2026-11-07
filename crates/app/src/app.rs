@@ -118,6 +118,8 @@ pub struct App {
     pub sel_browse: Option<Selection>,
     pub list_offset: f32,
     pub pending_scroll: Option<usize>,
+    /// Which row the selection was last made on.
+    pub row_hint: Option<usize>,
     pub list_to_top: bool,
     pub page_to_top: bool,
     pub focus_search: bool,
@@ -236,6 +238,7 @@ impl App {
             sel_browse: None,
             list_offset: 0.0,
             pending_scroll: None,
+            row_hint: None,
             list_to_top: false,
             page_to_top: false,
             focus_search: false,
@@ -346,25 +349,18 @@ impl App {
         !seen
     }
 
-    pub fn is_selected_row(&self, row: &Row) -> bool {
-        let Some(selection) = self.selection() else {
-            return false;
-        };
-        match (row, selection) {
-            (Row::Addon(i), Selection::Addon(id)) => self
-                .bundle
-                .as_deref()
-                .is_some_and(|b| b.position(id) == Some(*i)),
-            (Row::Managed(a), Selection::Addon(b)) => a == b,
-            (Row::Other(i), Selection::Other(primary)) => self
-                .groups
-                .get(*i as usize)
-                .is_some_and(|g| g.primary == *primary),
-            (Row::Kit(a), Selection::Kit(b)) | (Row::Gap(a), Selection::Gap(b)) => {
-                *a as usize == *b
-            }
-            _ => false,
+    /// The row the selection sits on. A recommended addon is listed under its category too,
+    /// so this prefers the row that was actually clicked or arrowed to.
+    pub fn selected_row(&self) -> Option<usize> {
+        let selection = self.selection()?;
+        let bundle = self.bundle.as_deref();
+        if let Some(hint) = self.row_hint
+            && let Some(row) = self.rows.get(hint)
+            && model::row_selection(row, bundle, &self.groups).as_ref() == Some(selection)
+        {
+            return Some(hint);
         }
+        model::row_of(&self.rows, selection, bundle, &self.groups)
     }
 
     /// True when there are no headers to sit under.
@@ -970,14 +966,13 @@ impl App {
 
     fn move_selection(&mut self, down: bool) {
         let bundle = self.bundle.clone();
-        let from = self
-            .selection()
-            .and_then(|s| model::row_of(&self.rows, s, bundle.as_deref(), &self.groups));
+        let from = self.selected_row();
         let Some(next) = model::step_selection(&self.rows, from, down) else {
             return;
         };
         let selection = model::row_selection(&self.rows[next], bundle.as_deref(), &self.groups);
         self.set_selection(selection);
+        self.row_hint = Some(next);
         self.pending_scroll = Some(next);
     }
 

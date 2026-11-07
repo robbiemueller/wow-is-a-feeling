@@ -1299,6 +1299,24 @@ fn every_settings_page_draws_and_can_be_operated() {
 }
 
 #[test]
+fn popup_buttons_never_sit_on_top_of_the_notes() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = demo_harness(Scene::Normal, dir.path());
+    app_mut(&mut h).popup = Some(Popup::AppUpdate(Box::new(demo::update_info())));
+    h.step();
+    h.step();
+    h.step();
+    let notes = h.get_by_label_contains("What changed").rect();
+    let button = h.get_by_label("Update now").rect();
+    assert!(button.min.y > notes.max.y, "{button:?} overlaps {notes:?}");
+    let popup = h
+        .ctx
+        .memory(|m| m.area_rect(egui::Id::unique("static-popup")))
+        .unwrap();
+    assert!(popup.max.y >= button.max.y, "the popup holds its buttons");
+}
+
+#[test]
 fn the_update_prompt_offers_exactly_what_the_spec_says() {
     let dir = tempfile::tempdir().unwrap();
     let mut h = demo_harness(Scene::Normal, dir.path());
@@ -1583,6 +1601,27 @@ fn a_long_list_only_draws_what_shows_and_the_arrows_scroll_it() {
     }
     h.step();
     assert!(has_label(&h, "A000 Addon, 1.0"));
+}
+
+#[test]
+fn an_addon_listed_twice_is_selected_where_it_was_clicked() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = demo_harness(Scene::Normal, dir.path());
+    click(&mut h, "Browse");
+    click(&mut h, "Quests and Leveling (4)");
+    assert_eq!(h.get_all_by_label("Questie, update").count(), 2);
+    h.get_all_by_label("Questie, update")
+        .last()
+        .unwrap()
+        .click();
+    h.step();
+    h.step();
+    press(&mut h, Key::ArrowDown);
+    assert_eq!(
+        app(&h).selection(),
+        Some(&Selection::Addon("gh:RestedXP/RXPGuides".to_owned())),
+        "the arrow carries on from the row that was clicked, not the first one"
+    );
 }
 
 #[test]
