@@ -196,6 +196,8 @@ fn xtask_sign_builds_on_minisigns_crates_alone() {
             "normal,build",
             "--prefix",
             "none",
+            "--color",
+            "never",
         ])
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .output()

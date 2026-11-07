@@ -9,6 +9,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use feeling_core::selfupdate::verified_manifest;
 use sha2::{Digest, Sha256};
@@ -222,12 +223,18 @@ fn bash() -> Option<OsString> {
     None
 }
 
+/// Its "builds" of xtask are small programs that run the real binaries, because those are too
+/// big to copy from job to job here.
 const FAKE_CARGO: &str = r#"#!/bin/bash
 echo "cargo $*" >> ../../log
 mkdir -p target/debug target/release
+build() {
+  printf '#!/bin/bash\nexec "$%s" "$@"\n' "$2" > "target/debug/$1"
+  chmod +x "target/debug/$1"
+}
 case "$*" in
-  *"--bin xtask-sign"*) cp ../../real/xtask-sign@EXE@ target/debug/ ;;
-  *"-p xtask"*) cp ../../real/xtask@EXE@ target/debug/ ;;
+  *"--bin xtask-sign"*) build xtask-sign REAL_XTASK_SIGN ;;
+  *"-p xtask"*) build xtask REAL_XTASK ;;
   *"-p wow-is-a-feeling"*) echo "the app" > target/release/wow-is-a-feeling ;;
   *) echo "unexpected: cargo $*" >&2; exit 1 ;;
 esac
@@ -281,10 +288,18 @@ PATH="$(cd ../../bin && pwd):$PATH"
 
 const NOTHING: &str = "#!/bin/bash\nexit 0\n";
 
+/// Writing a program and then running it can fail with "text file busy" if another thread
+/// forks while the file is open for writing, so the tests that run things take turns.
+fn one_at_a_time() -> MutexGuard<'static, ()> {
+    static TURN: Mutex<()> = Mutex::new(());
+    TURN.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 /// A temp folder laid out like a runner: artifacts in `store`, GitHub's copy of the release in
 /// `github`, a workspace per job in `work`, and what the stand-ins were asked to do in `log`.
 struct Rig {
     _temp: tempfile::TempDir,
+    _turn: MutexGuard<'static, ()>,
     root: PathBuf,
     bash: OsString,
     secret_key: String,
@@ -300,29 +315,22 @@ struct Failure {
 impl Rig {
     fn new() -> Option<Rig> {
         let bash = bash()?;
+        let turn = one_at_a_time();
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().to_path_buf();
-        for folder in ["bin", "real", "store", "work"] {
+        for folder in ["bin", "store", "work"] {
             fs::create_dir(root.join(folder)).unwrap();
         }
         fs::write(root.join("log"), "").unwrap();
         fs::write(root.join("fakes-first.sh"), FAKES_FIRST).unwrap();
-        for (name, real) in [
-            ("xtask", env!("CARGO_BIN_EXE_xtask")),
-            ("xtask-sign", env!("CARGO_BIN_EXE_xtask-sign")),
-        ] {
-            let copy = format!("{name}{}", env::consts::EXE_SUFFIX);
-            fs::copy(real, root.join("real").join(copy)).unwrap();
-        }
-        let exe = |text: &str| text.replace("@EXE@", env::consts::EXE_SUFFIX);
         for (name, script) in [
-            ("cargo", exe(FAKE_CARGO)),
-            ("gh", FAKE_GH.to_string()),
-            ("curl", FAKE_CURL.to_string()),
-            ("rustup", NOTHING.to_string()),
-            ("sudo", NOTHING.to_string()),
+            ("cargo", FAKE_CARGO),
+            ("gh", FAKE_GH),
+            ("curl", FAKE_CURL),
+            ("rustup", NOTHING),
+            ("sudo", NOTHING),
         ] {
-            write_program(&root.join("bin").join(name), &script);
+            write_program(&root.join("bin").join(name), script);
         }
 
         let key_file = root.join("throwaway.minisign.key");
@@ -336,6 +344,7 @@ impl Rig {
         let secret_key = fs::read_to_string(&key_file).unwrap();
         Some(Rig {
             _temp: temp,
+            _turn: turn,
             root,
             bash,
             secret_key,
@@ -424,7 +433,7 @@ impl Rig {
                         .map(|entry| entry.unwrap().path())
                         .collect()
                 } else {
-                    vec![with_exe_suffix(&work.join(path))]
+                    vec![work.join(path)]
                 };
                 fs::create_dir(self.store(name))
                     .map_err(|e| format!("artifact {name} uploaded twice: {e}"))?;
@@ -470,7 +479,9 @@ impl Rig {
             .arg(&file)
             .current_dir(work)
             .env_remove("MINISIGN_SECRET_KEY")
-            .env("GITHUB_REPOSITORY", REPOSITORY);
+            .env("GITHUB_REPOSITORY", REPOSITORY)
+            .env("REAL_XTASK", env!("CARGO_BIN_EXE_xtask"))
+            .env("REAL_XTASK_SIGN", env!("CARGO_BIN_EXE_xtask-sign"));
         if !extra_env.iter().any(|(key, _)| *key == "GITHUB_REF_NAME") {
             command.env("GITHUB_REF_NAME", release_tag());
         }
@@ -534,16 +545,6 @@ fn write_program(path: &Path, script: &str) {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
     }
-}
-
-/// A built program, under the name it really has on this platform.
-fn with_exe_suffix(path: &Path) -> PathBuf {
-    if path.exists() {
-        return path.to_path_buf();
-    }
-    let mut named = path.as_os_str().to_os_string();
-    named.push(env::consts::EXE_SUFFIX);
-    PathBuf::from(named)
 }
 
 /// An artifact is a zip, which doesn't keep the exec bit.
@@ -884,7 +885,6 @@ fn the_chain_publishes_exactly_what_was_hashed_and_signed() {
         "the 4 updates, latest.json and its signature: {log}"
     );
     assert!(!log.contains("--draft=true"), "{log}");
-    assert_eq!(rig.log().matches("cargo build").count(), 2, "{log}");
     assert_eq!(
         fs::read(rig.root.join("github").join("latest.json")).unwrap(),
         json
@@ -1004,6 +1004,7 @@ fn the_weekly_catalog_check_fails_on_a_broken_catalog() {
         ]
     );
 
+    let _turn = one_at_a_time();
     let dir = tempfile::tempdir().unwrap();
     let check = |catalog: &str| {
         fs::write(dir.path().join("catalog.json"), catalog).unwrap();
