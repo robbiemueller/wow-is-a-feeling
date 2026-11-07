@@ -28,6 +28,12 @@ const MB: u64 = 1024 * KB;
 const GB: u64 = 1024 * MB;
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
 const BUFFER_SIZE: usize = 64 * 1024;
+/// Longest path an entry may have, in bytes, out of the 65,535 a zip allows. Every step
+/// after reading a name costs at least its length. The longest in the catalog is 139.
+const MAX_ENTRY_NAME_BYTES: usize = 1024;
+/// Most folders above an entry. Making a folder walks its whole path, so this is what keeps
+/// one name from taking minutes. The deepest in the catalog is 11.
+const MAX_ENTRY_DEPTH: usize = 64;
 
 /// Dropped without a word: operating systems and git leave these everywhere.
 /// `Icon\r` is the marker macOS adds to folders with a custom icon.
@@ -66,6 +72,9 @@ pub struct Limits {
     /// How much of the file the zip crate may read to list what's inside. It keeps several
     /// copies of what it reads, so this is what bounds its memory, however big the zip is.
     pub max_directory_bytes: u64,
+    /// Folders the zip would create, whether or not it lists them. Each one costs real
+    /// time and disk that no count of entries or bytes would ever see.
+    pub max_folders: usize,
     /// Output bytes per compressed byte. Lua compresses well, but not this well.
     pub max_ratio: u64,
     /// The ratio is only judged past this many bytes, because tiny files can
@@ -82,6 +91,8 @@ impl Default for Limits {
             // The biggest in the catalog is 11 MB, for 104,000 files. The catalog scan gives
             // up at this same size, so nothing it could read trips this.
             max_directory_bytes: 64 * MB,
+            // The most in the catalog is 1,700.
+            max_folders: 20_000,
             max_ratio: 1000,
             ratio_floor_bytes: 64 * MB,
         }
@@ -111,7 +122,7 @@ pub fn extract(
 ) -> Result<Extracted> {
     let (mut archive, zip_len) = open_archive(zip_path, &limits)?;
     let entries = read_entries(&mut archive, &limits)?;
-    let plan = plan_addons(&entries, moves)?;
+    let plan = plan_addons(&entries, moves, &limits)?;
     run_plan(
         &mut archive,
         zip_len,
@@ -145,7 +156,7 @@ pub(crate) fn extract_tree(
 ) -> Result<Extracted> {
     let (mut archive, zip_len) = open_archive(zip_path, &limits)?;
     let entries = read_entries(&mut archive, &limits)?;
-    let plan = plan_tree(&entries, options)?;
+    let plan = plan_tree(&entries, options, &limits)?;
     run_plan(
         &mut archive,
         zip_len,
@@ -467,6 +478,12 @@ const S_IFDIR: u32 = 0o040000;
 /// Backslashes count as separators on every OS, because the same zip must never mean
 /// `..\..\evil` on Windows and an innocent file name on Linux.
 fn clean_entry_path(name: &str) -> std::result::Result<String, String> {
+    if !entry_name_fits(name) {
+        return Err(format!(
+            "it has a file path that's too long or has too many folders ({}).",
+            printable(name)
+        ));
+    }
     if name.contains('\0') {
         return Err(format!(
             "it has a file name with a hidden NUL ({}).",
@@ -501,6 +518,12 @@ fn clean_entry_path(name: &str) -> std::result::Result<String, String> {
         }
     }
     Ok(clean)
+}
+
+/// Whether a path is short and shallow enough for a zip entry. Both separators count, and
+/// so do empty and `.` segments, because this runs before any of them are cleaned away.
+pub(crate) fn entry_name_fits(name: &str) -> bool {
+    name.len() <= MAX_ENTRY_NAME_BYTES && name.matches(['/', '\\']).count() <= MAX_ENTRY_DEPTH
 }
 
 /// Why one path segment can't be written safely on every OS, if it can't.
@@ -697,23 +720,23 @@ struct PlanItem {
     compressed_size: u64,
 }
 
-fn plan_addons(entries: &[ZipEntry], moves: &[Move]) -> Result<Plan> {
+fn plan_addons(entries: &[ZipEntry], moves: &[Move], limits: &Limits) -> Result<Plan> {
     let live: Vec<&ZipEntry> = entries.iter().filter(|e| !is_junk_path(&e.path)).collect();
     let mapped = if moves.is_empty() {
         map_by_layout(&live)
     } else {
         map_by_moves(&live, moves)?
     };
-    plan_from_mapped(mapped, true, false)
+    plan_from_mapped(mapped, true, false, limits)
 }
 
-fn plan_tree(entries: &[ZipEntry], options: TreeOptions) -> Result<Plan> {
+fn plan_tree(entries: &[ZipEntry], options: TreeOptions, limits: &Limits) -> Result<Plan> {
     let mapped = entries
         .iter()
         .filter(|e| !is_junk_path(&e.path))
         .map(|e| (e, e.path.clone()))
         .collect();
-    plan_from_mapped(mapped, false, options.allow_executables)
+    plan_from_mapped(mapped, false, options.allow_executables, limits)
 }
 
 /// Layout rules for a zip with no moves. Every rule keys off where the TOCs are.
@@ -846,6 +869,7 @@ fn plan_from_mapped(
     mapped: Vec<(&ZipEntry, String)>,
     require_toc: bool,
     allow_executables: bool,
+    limits: &Limits,
 ) -> Result<Plan> {
     let is_held_back = |dest: &str| !allow_executables && is_blocked_path(dest);
     // Case-folded top-level name to its spelling.
@@ -871,8 +895,6 @@ fn plan_from_mapped(
     }
 
     let mut plan = Plan::default();
-    let mut seen_files: HashSet<String> = HashSet::new();
-    let mut seen_dirs: HashSet<String> = HashSet::new();
     for (entry, dest) in mapped {
         let top = dest.split('/').next().unwrap_or(&dest);
         let Some(spelling) = folders.get(&fold(top)) else {
@@ -888,20 +910,6 @@ fn plan_from_mapped(
             plan.skipped.push(dest);
             continue;
         }
-        let folded = fold(&dest);
-        let mut search = folded.as_str();
-        while let Some((parent, _)) = search.rsplit_once('/') {
-            seen_dirs.insert(parent.to_string());
-            search = parent;
-        }
-        if entry.is_dir {
-            seen_dirs.insert(folded);
-        } else if !seen_files.insert(folded) {
-            return Err(unsafe_zip(format!(
-                "two of its files would land on the same name ({}).",
-                printable(&dest)
-            )));
-        }
         plan.items.push(PlanItem {
             index: entry.index,
             dest,
@@ -910,16 +918,57 @@ fn plan_from_mapped(
             compressed_size: entry.compressed_size,
         });
     }
+    check_names(&plan.items, limits)?;
+    plan.folders = folders.into_values().collect();
+    plan.folders.sort();
+    plan.skipped.sort();
+    Ok(plan)
+}
+
+/// Refuse a plan with too many folders, or whose names would collide. Everything here
+/// borrows whole paths: a set owning a copy of every parent of every path is how a 1 MB
+/// zip could once ask for all of a machine's memory before any limit got a look at it.
+fn check_names(items: &[PlanItem], limits: &Limits) -> Result<()> {
+    // As spelled, because a case-sensitive disk makes a folder for each spelling.
+    let mut folders: HashSet<&str> = HashSet::new();
+    for item in items {
+        note_folders(&mut folders, &item.dest, item.is_dir);
+        if folders.len() > limits.max_folders {
+            return Err(unsafe_zip(format!(
+                "it would create more than {} folders.",
+                limits.max_folders
+            )));
+        }
+    }
+    let folded: Vec<String> = items.iter().map(|item| fold(&item.dest)).collect();
+    let mut seen_files: HashSet<&str> = HashSet::new();
+    let mut seen_dirs: HashSet<&str> = HashSet::new();
+    for (item, path) in items.iter().zip(&folded) {
+        note_folders(&mut seen_dirs, path, item.is_dir);
+        if !item.is_dir && !seen_files.insert(path) {
+            return Err(unsafe_zip(format!(
+                "two of its files would land on the same name ({}).",
+                printable(&item.dest)
+            )));
+        }
+    }
     if let Some(clash) = seen_files.iter().find(|path| seen_dirs.contains(*path)) {
         return Err(unsafe_zip(format!(
             "the same name is used for a file and a folder ({}).",
             printable(clash)
         )));
     }
-    plan.folders = folders.into_values().collect();
-    plan.folders.sort();
-    plan.skipped.sort();
-    Ok(plan)
+    Ok(())
+}
+
+/// Add the folder `path` is, or is in, and the ones above it. Stops at the first one it
+/// already knows, because whatever added that one added its parents too.
+fn note_folders<'a>(folders: &mut HashSet<&'a str>, path: &'a str, is_dir: bool) {
+    let parent = |path: &'a str| path.rsplit_once('/').map(|(parent, _)| parent);
+    let mut folder = if is_dir { Some(path) } else { parent(path) };
+    while let Some(current) = folder.filter(|current| folders.insert(current)) {
+        folder = parent(current);
+    }
 }
 
 /// Write the plan, or leave nothing behind.
@@ -1505,6 +1554,188 @@ mod tests {
     #[test]
     fn overlong_segments_are_rejected() {
         assert_rejected(format!("Good/{}.lua", "x".repeat(300)));
+    }
+
+    #[test]
+    fn paths_too_long_or_too_deep_are_refused() {
+        let levels = "a/".repeat(MAX_ENTRY_DEPTH);
+        let too_long = format!("Good/{}x.lua", "a-long-name-for-a-folder/".repeat(50));
+        assert!(too_long.len() > MAX_ENTRY_NAME_BYTES);
+        for name in [
+            too_long,
+            format!("Good/{levels}x.lua"),
+            format!("Good\\{}x.lua", levels.replace('/', "\\")),
+            // These clean away to nothing, but they still have to be walked to find that out.
+            format!("Good/{}x.lua", "./".repeat(MAX_ENTRY_DEPTH)),
+            format!("Good/{}x.lua", "/".repeat(MAX_ENTRY_DEPTH)),
+            // The size that made planning ask for a gigabyte per name.
+            format!("Good/{}x.lua", "a/".repeat(32_500)),
+        ] {
+            assert_rejected(name);
+        }
+    }
+
+    #[test]
+    fn paths_at_the_limits_are_fine() {
+        // Just under the depth limit, and written for real.
+        let name = format!("Foo/{}x.lua", "a/".repeat(MAX_ENTRY_DEPTH - 1));
+        let fixture = Fixture::new();
+        let bytes = raw_zip(&[
+            RawEntry::new("Foo/Foo.toc", TOC),
+            RawEntry::new(&name, b"deep"),
+        ]);
+        fixture.extract(&bytes, &[]).unwrap();
+        assert_eq!(fixture.tree()[&name], b"deep");
+        // macOS can't write a path this long once the temp folder is in front of it.
+        let long = format!(
+            "Foo/{}{}",
+            (format!("{}/", "x".repeat(200))).repeat(4),
+            "y".repeat(216)
+        );
+        assert_eq!(long.len(), MAX_ENTRY_NAME_BYTES);
+        assert_eq!(clean_entry_path(&long).unwrap(), long);
+    }
+
+    #[test]
+    fn the_folders_a_zip_would_create_count_even_when_it_does_not_list_them() {
+        let bytes = raw_zip(&[
+            RawEntry::new("Foo/Foo.toc", TOC),
+            RawEntry::new("Foo/a/b/c/d/x.lua", b"1"),
+        ]);
+        let limited = |max_folders| Limits {
+            max_folders,
+            ..Limits::default()
+        };
+        let fixture = Fixture::new();
+        let result = fixture.extract_limited(&bytes, limited(4));
+        assert!(
+            matches!(&result, Err(Error::UnsafeZip(text)) if text.contains("4 folders")),
+            "{result:?}"
+        );
+        assert!(fixture.tree().is_empty());
+        fixture.extract_limited(&bytes, limited(5)).unwrap();
+    }
+
+    #[test]
+    fn empty_folders_count_too() {
+        let bytes = raw_zip(&[
+            RawEntry::new("Foo/Foo.toc", TOC),
+            RawEntry::new("Foo/a/", b""),
+            RawEntry::new("Foo/b/", b""),
+        ]);
+        let limits = Limits {
+            max_folders: 2,
+            ..Limits::default()
+        };
+        let result = Fixture::new().extract_limited(&bytes, limits);
+        assert!(
+            matches!(&result, Err(Error::UnsafeZip(text)) if text.contains("2 folders")),
+            "{result:?}"
+        );
+    }
+
+    /// `seen_dirs` folds case, but a case-sensitive disk makes a folder for each spelling,
+    /// and 12 levels of two spellings each come to thousands of folders.
+    #[test]
+    fn every_spelling_of_a_folder_counts() {
+        let bytes = raw_zip(&[
+            RawEntry::new("Foo/Foo.toc", TOC),
+            RawEntry::new("Foo/a/1.lua", b"1"),
+            RawEntry::new("Foo/A/2.lua", b"2"),
+        ]);
+        let limited = |max_folders| Limits {
+            max_folders,
+            ..Limits::default()
+        };
+        assert!(matches!(
+            Fixture::new().extract_limited(&bytes, limited(2)),
+            Err(Error::UnsafeZip(_))
+        ));
+        Fixture::new().extract_limited(&bytes, limited(3)).unwrap();
+    }
+
+    /// Counts what each thread has on the heap, so a test can hold planning to a budget
+    /// without depending on timing or on what else the machine is doing.
+    mod heap {
+        use std::alloc::{GlobalAlloc, Layout, System};
+        use std::cell::Cell;
+
+        thread_local! {
+            static LIVE: Cell<usize> = const { Cell::new(0) };
+            static PEAK: Cell<usize> = const { Cell::new(0) };
+        }
+
+        fn note(grew: usize, shrank: usize) {
+            let _ = LIVE.try_with(|live| {
+                let now = live.get().saturating_add(grew).saturating_sub(shrank);
+                live.set(now);
+                let _ = PEAK.try_with(|peak| peak.set(peak.get().max(now)));
+            });
+        }
+
+        struct Counting;
+
+        // Only adds counting, and only in this crate's own test build.
+        unsafe impl GlobalAlloc for Counting {
+            unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+                note(layout.size(), 0);
+                unsafe { System.alloc(layout) }
+            }
+
+            unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+                note(layout.size(), 0);
+                unsafe { System.alloc_zeroed(layout) }
+            }
+
+            unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+                note(0, layout.size());
+                unsafe { System.dealloc(pointer, layout) }
+            }
+
+            unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, size: usize) -> *mut u8 {
+                note(size, layout.size());
+                unsafe { System.realloc(pointer, layout, size) }
+            }
+        }
+
+        #[global_allocator]
+        static COUNTING: Counting = Counting;
+
+        /// How far this thread's heap grew while `run` ran.
+        pub fn peak_growth<T>(run: impl FnOnce() -> T) -> (T, usize) {
+            let start = LIVE.with(Cell::get);
+            PEAK.with(|peak| peak.set(start));
+            let result = run();
+            (result, PEAK.with(Cell::get).saturating_sub(start))
+        }
+    }
+
+    /// One of these names has 60 parents, about 30 KB of text between them, which is what
+    /// planning used to keep for each. Its own bytes are a fraction of that.
+    #[test]
+    fn planning_keeps_no_copy_of_each_parent_folder() {
+        let deep = vec!["level-of-a-path"; 60].join("/");
+        let entries: Vec<ZipEntry> = (0..2000)
+            .map(|index| ZipEntry {
+                index,
+                path: format!("Foo/{index}/{deep}/x.lua"),
+                is_dir: false,
+                size: 1,
+                compressed_size: 1,
+            })
+            .collect();
+        let names: usize = entries.iter().map(|entry| entry.path.len()).sum();
+        let limits = Limits {
+            max_folders: usize::MAX,
+            ..Limits::default()
+        };
+        let (plan, grew) =
+            heap::peak_growth(|| plan_tree(&entries, TreeOptions::default(), &limits));
+        assert_eq!(plan.unwrap().items.len(), entries.len());
+        assert!(
+            grew < names * 12,
+            "planning {names} bytes of names took {grew} bytes"
+        );
     }
 
     #[test]
