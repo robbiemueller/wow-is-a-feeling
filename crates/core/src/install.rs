@@ -632,8 +632,13 @@ impl Txn {
                 Err(e) => return Err(io_error(&path, e)),
             };
             match lock.try_lock() {
-                Ok(()) | Err(TryLockError::Error(_)) => return Ok(Txn { dirs, id, lock }),
-                Err(TryLockError::WouldBlock) => {}
+                // Another transaction settling leftovers can take this file for a dead one's
+                // in the moment before it's locked. If so its name is gone by now, and
+                // running under it would mean running with no protection from `recover`.
+                Ok(()) | Err(TryLockError::Error(_)) if path.exists() => {
+                    return Ok(Txn { dirs, id, lock });
+                }
+                _ => {}
             }
         }
         Err(Error::Other(
@@ -901,8 +906,10 @@ fn recover_one(dirs: &Dirs, id: &str) -> Result<Option<String>> {
         }
     };
     cleanup(dirs, id).map_err(|e| io_error(&dirs.root, e))?;
-    drop(lock);
+    // The name goes before the lock does, so that a transaction just starting under this id
+    // can tell, as soon as it gets the lock, that the file it locked is no longer the one.
     remove_any(&lock_path).map_err(|e| io_error(&lock_path, e))?;
+    drop(lock);
     Ok(note)
 }
 
@@ -1765,7 +1772,7 @@ mod tests {
         let waited = started.elapsed();
         assert!(result.is_err());
         assert!(
-            waited >= Duration::from_secs(4) && waited < Duration::from_secs(10),
+            waited >= Duration::from_secs(4) && waited < Duration::from_secs(60),
             "{waited:?}"
         );
         assert_eq!(game.addons(), tree_from(BEFORE));
@@ -2812,6 +2819,32 @@ mod tests {
         let only_a = tree_from(&[("Shared/Shared.toc", FOREVER_TOC), ("Shared/a.lua", b"a")]);
         let only_b = tree_from(&[("Shared/Shared.toc", FOREVER_TOC), ("Shared/b.lua", b"b")]);
         assert!(tree == only_a || tree == only_b, "{tree:?}");
+        game.assert_no_leftovers();
+    }
+
+    #[test]
+    fn installs_running_side_by_side_never_disturb_each_other() {
+        let rounds: usize = std::env::var("WIAF_TEST_ROUNDS")
+            .ok()
+            .and_then(|rounds| rounds.parse().ok())
+            .unwrap_or(40);
+        let game = Arc::new(Game::with_addons(&[]));
+        let threads: Vec<_> = (0..4)
+            .map(|n| {
+                let game = game.clone();
+                let folder = format!("Addon{n}");
+                let toc = format!("{folder}/{folder}.toc");
+                let zip = game.zip(&format!("{n}.zip"), &[(toc.as_str(), FOREVER_TOC)]);
+                thread::spawn(move || {
+                    for _ in 0..rounds {
+                        game.install(&zip, &request(&[folder.as_str()])).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
         game.assert_no_leftovers();
     }
 

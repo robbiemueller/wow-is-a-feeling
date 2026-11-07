@@ -210,12 +210,7 @@ pub fn candidate(row: &Row, scan: &ZipScan, size: u64, md5: Option<String>) -> C
             deps: scan.external_deps(),
             downloads: row.downloads,
             ids,
-            images: row
-                .images
-                .iter()
-                .take(MAX_IMAGES)
-                .map(|url| url.trim().to_string())
-                .collect(),
+            images: screenshots(row),
             ..Addon::default()
         },
         toc_category: scan.category.clone(),
@@ -305,9 +300,18 @@ pub fn fetch_rows(http: &Http) -> Result<Vec<Row>, String> {
 pub fn refreshed(entry: &Candidate, row: &Row) -> Candidate {
     let mut entry = entry.clone();
     entry.addon.downloads = row.downloads;
+    entry.addon.images = screenshots(row);
     entry.favorites = row.favorites;
     entry.wowi_category = Some(row.category.clone());
     entry
+}
+
+fn screenshots(row: &Row) -> Vec<String> {
+    row.images
+        .iter()
+        .take(MAX_IMAGES)
+        .map(|url| url.trim().to_string())
+        .collect()
 }
 
 /// A file whose new version couldn't be read: its URL now serves the new zip, so

@@ -803,8 +803,9 @@ mod tests {
             .min()
             .unwrap();
         println!("scan of 500 folders: {best:?}");
-        // Loose, because antivirus can sit on a fresh temp folder.
-        assert!(best.as_millis() < 500, "took {best:?}");
+        // Very loose. This only catches something pathological: antivirus can sit on a
+        // fresh temp folder, and a busy machine or CI runner can be slower still.
+        assert!(best.as_millis() < 5000, "took {best:?}");
     }
 
     // ---- group_unmanaged ----

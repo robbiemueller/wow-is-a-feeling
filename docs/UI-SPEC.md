@@ -46,8 +46,8 @@ Keyboard: Up and Down move the selection and skip headers, Enter activates the m
 
 **Catalog addon:**
 - Name in the display face, "by author", the hand-drawn rule.
-- Description (summary), then About (README text, fetched on demand after a 300 ms pause on the selection, cached for the last 64 addons), then Screenshots (up to 3, decoded on a worker with a 5 MB and 4096 px limit, scaled to at most 640 px wide, textures freed when evicted), then Changelog (collapsed).
-- Details: Version, Updated, Size, Source (a link), Folders, Requires (required addons by name; click to select).
+- Description (summary), then Details: Version, Updated, Size, Source (a link), Folders, Requires (required addons by name; click to select).
+- Then Screenshots (up to 3, decoded on a worker with a 5 MB and 4096 px limit, scaled to at most 640 px wide, textures freed when evicted), then About (README text, fetched on demand after a 300 ms pause on the selection, cached for the last 64 addons), then Changelog (collapsed). A README can run long, so the pictures come first.
 - Fetch failures just leave those sections out and say so in small text. The page must stay usable offline.
 - Buttons along the bottom, always visible: **Install** or **Update** or **Reinstall** (main), **Remove**, **Open page**, **Share**. **Roll back to x** appears when a previous version is kept. Two small checkboxes: "Use beta versions" and "Don't update this addon" (the pin).
 

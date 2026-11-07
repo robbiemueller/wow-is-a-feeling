@@ -88,7 +88,7 @@ pub fn state(scene: Scene) -> State {
     if scene != Scene::Empty {
         let mut tomtom = record("wowi:7032", "TomTom", "v4.0.5", &["TomTom"]);
         tomtom.previous_version = Some("v4.0.4".to_owned());
-        tomtom.previous_zip = Some(PathBuf::from(r"C:\demo\zips\v4.0.4.zip"));
+        tomtom.previous_zip = Some(PathBuf::from("demo-zips").join("v4.0.4.zip"));
         let mut dominos = record("gh:tullamods/Dominos", "Dominos", "11.2.2", &["Dominos"]);
         dominos.pinned = true;
         let mut tweaks = record("local:MyTweaks", "My Tweaks", "1.2", &["MyTweaks"]);
@@ -293,7 +293,7 @@ pub fn update_info() -> UpdateInfo {
 
 /// The zips a real install would have kept, so rollback can be tried in the demo.
 pub fn kept_zips(version: &str, prev: Option<&ManagedAddon>) -> Vec<PathBuf> {
-    let zip = |v: &str| PathBuf::from(format!(r"C:\demo\zips\{v}.zip"));
+    let zip = |v: &str| PathBuf::from("demo-zips").join(format!("{v}.zip"));
     let mut kept = vec![zip(version)];
     kept.extend(prev.map(|p| zip(&p.version)));
     kept

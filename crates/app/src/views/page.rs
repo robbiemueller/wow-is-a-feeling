@@ -346,7 +346,6 @@ fn addon_body(
         widgets::mixed_label(ui, &addon.summary, 15.5, theme::INK);
         ui.add_space(10.0);
     }
-    details_sections(app, ui, addon);
     widgets::section(ui, "Details");
     let release = addon.release(channel);
     match (record, release) {
@@ -386,6 +385,8 @@ fn addon_body(
         widgets::fact(ui, "Folders:", &clean_line(&addon.folders.join(", "), 600));
     }
     requires(app, ui, addon);
+    ui.add_space(10.0);
+    details_sections(app, ui, addon);
 }
 
 /// Required addons by name, each a click away when the catalog has it.
@@ -419,7 +420,8 @@ fn requires(app: &mut App, ui: &mut Ui, addon: &Addon) {
     });
 }
 
-/// About, Screenshots and Changelog, whatever has arrived so far.
+/// Screenshots, About and Changelog, whatever has arrived so far. A readme can run long,
+/// so the pictures go first, where they get seen.
 fn details_sections(app: &mut App, ui: &mut Ui, addon: &Addon) {
     let Some(entry) = app.details.get(&addon.id) else {
         return;
@@ -437,11 +439,6 @@ fn details_sections(app: &mut App, ui: &mut Ui, addon: &Addon) {
             ui.add_space(10.0);
         }
         Fetch::Ready(details) => {
-            if !details.about.is_empty() && details.about != addon.summary {
-                widgets::section(ui, "About");
-                body(ui, &details.about);
-                ui.add_space(10.0);
-            }
             if !entry.textures.is_empty() {
                 widgets::section(ui, "Screenshots");
                 for texture in &entry.textures {
@@ -458,6 +455,11 @@ fn details_sections(app: &mut App, ui: &mut Ui, addon: &Addon) {
                     ui.add_space(6.0);
                 }
                 ui.add_space(4.0);
+            }
+            if !details.about.is_empty() && details.about != addon.summary {
+                widgets::section(ui, "About");
+                body(ui, &details.about);
+                ui.add_space(10.0);
             }
             if let Some(changelog) = details.changelog.clone() {
                 let open = app.changelog_open;
