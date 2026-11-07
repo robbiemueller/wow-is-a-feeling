@@ -334,6 +334,22 @@ pub fn stage_fraction(stage: Stage, expected_size: u64) -> f32 {
     }
 }
 
+/// Is this the same folder? Names fold the way core's installer folds them, all of Unicode
+/// and not only ASCII, so every decision about who owns a folder agrees with what an install
+/// does on disk.
+pub fn same_folder(a: &str, b: &str) -> bool {
+    a.eq_ignore_ascii_case(b) || a.to_lowercase() == b.to_lowercase()
+}
+
+/// Where the catalog lists this folder, for putting a record's main folder first. Folders
+/// it doesn't list go last.
+pub fn listed_position(listed: &[String], folder: &str) -> usize {
+    listed
+        .iter()
+        .position(|known| same_folder(known, folder))
+        .unwrap_or(usize::MAX)
+}
+
 /// Folders this addon owns that no other managed addon claims. These are the ones an
 /// update may replace and a removal may delete.
 pub fn own_folders(id: &str, managed: &BTreeMap<String, ManagedAddon>) -> Vec<String> {
@@ -345,7 +361,7 @@ pub fn own_folders(id: &str, managed: &BTreeMap<String, ManagedAddon>) -> Vec<St
         .iter()
         .filter(|folder| {
             !managed.iter().any(|(other, addon)| {
-                other != id && addon.folders.iter().any(|f| f.eq_ignore_ascii_case(folder))
+                other != id && addon.folders.iter().any(|f| same_folder(f, folder))
             })
         })
         .cloned()
@@ -375,7 +391,7 @@ impl FolderConflict {
         let folder = clean_line(&self.folder, 60);
         match &self.owner {
             FolderOwner::Addons(names) => format!("{folder}: part of {}", short_list(names)),
-            FolderOwner::Unmanaged(Some(title)) if !title.eq_ignore_ascii_case(&self.folder) => {
+            FolderOwner::Unmanaged(Some(title)) if !same_folder(title, &self.folder) => {
                 format!(
                     "{folder}: {}, not installed by this app",
                     clean_line(title, 60)
@@ -944,6 +960,26 @@ mod tests {
         .into();
         assert_eq!(own_folders("a", &managed), vec!["A".to_owned()]);
         assert!(own_folders("missing", &managed).is_empty());
+    }
+
+    #[test]
+    fn a_shared_folder_spelled_with_another_case_outside_ascii_is_still_shared() {
+        // The installer folds all of Unicode, so to the disk these are one folder.
+        let managed: BTreeMap<String, ManagedAddon> = [
+            ("a".to_owned(), record("a", "1", &["Aaa", "Ärger"])),
+            ("b".to_owned(), record("b", "1", &["Bbb", "ärger"])),
+        ]
+        .into();
+        assert_eq!(own_folders("b", &managed), vec!["Bbb".to_owned()]);
+        assert_eq!(own_folders("a", &managed), vec!["Aaa".to_owned()]);
+        assert!(same_folder("ÄRGER", "ärger") && !same_folder("Ärger", "Arger"));
+        let listed = ["Ärger".to_owned(), "Ärger_Lib".to_owned()];
+        assert_eq!(
+            listed_position(&listed, "ärger"),
+            0,
+            "the main folder sorts first"
+        );
+        assert_eq!(listed_position(&listed, "Other"), usize::MAX);
     }
 
     #[test]

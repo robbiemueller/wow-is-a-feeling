@@ -945,7 +945,7 @@ fn read_local_facts(addons_dir: &Path, folders: &[String]) -> Option<LocalZipFac
     let local = scan::scan_addons(addons_dir).unwrap_or_default();
     let found = local
         .iter()
-        .find(|f| f.name.eq_ignore_ascii_case(&main))
+        .find(|f| crate::ops::same_folder(&f.name, &main))
         .map(|f| (f.toc.title.clone(), f.toc.version.clone()));
     let (title, version) = found.unwrap_or((None, None));
     Some(LocalZipFacts {

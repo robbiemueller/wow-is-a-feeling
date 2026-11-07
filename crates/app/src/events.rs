@@ -351,14 +351,7 @@ impl App {
                 }
             }
             // Main folder first, the order the catalog lists them in.
-            let order = |folder: &String| {
-                addon
-                    .folders
-                    .iter()
-                    .position(|known| known.eq_ignore_ascii_case(folder))
-                    .unwrap_or(usize::MAX)
-            };
-            folders.sort_by_key(order);
+            folders.sort_by_key(|folder| ops::listed_position(&addon.folders, folder));
         }
         if self.demo {
             self.demo_add_folders(&folders, &name, &version);
@@ -415,7 +408,7 @@ impl App {
     fn demo_add_folders(&mut self, folders: &[String], name: &str, version: &str) {
         for folder in folders {
             self.demo_disk
-                .retain(|f| !f.name.eq_ignore_ascii_case(folder));
+                .retain(|f| !ops::same_folder(&f.name, folder));
             let mut local = LocalFolder {
                 name: folder.clone(),
                 toc_file: Some(format!("{folder}.toc")),
@@ -432,7 +425,7 @@ impl App {
 
     fn op_removed(&mut self, op: &Op) {
         if let OpKind::Remove { folders } = &op.kind {
-            let gone = |f: &LocalFolder| folders.iter().any(|g| g.eq_ignore_ascii_case(&f.name));
+            let gone = |f: &LocalFolder| folders.iter().any(|g| ops::same_folder(g, &f.name));
             self.demo_disk.retain(|f| !gone(f));
             // Known already, so the rows don't flash an "other folder" until the rescan.
             self.folders.retain(|f| !gone(f));
