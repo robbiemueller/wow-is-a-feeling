@@ -214,7 +214,7 @@ impl App {
             .id_salt("search")
             .hint_text(
                 RichText::new("Search addons, or type /help")
-                    .color(theme::TEXT_DIM)
+                    .color(theme::HINT)
                     .font(theme::body(15.0)),
             )
             .font(theme::body(15.0))

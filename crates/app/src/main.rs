@@ -2,6 +2,8 @@
 
 mod app;
 mod demo;
+#[allow(dead_code)] // Wired up with the working interface.
+mod easter;
 mod skin;
 mod theme;
 mod widgets;

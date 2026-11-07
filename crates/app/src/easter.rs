@@ -44,7 +44,8 @@ pub fn parse_slash(input: &str, facts: Facts) -> Option<Slash> {
     let command = parts.next().unwrap_or("").to_ascii_lowercase();
     Some(match command.as_str() {
         "help" | "?" => Slash::Say(
-            "Commands: /played, /reload, /who, /roll, /dance, /ding, /afk, /pwnage, /feeling".to_owned(),
+            "Commands: /played, /reload, /who, /roll, /dance, /ding, /afk, /pwnage, /feeling"
+                .to_owned(),
         ),
         "played" => Slash::Say(played_text(facts)),
         "reload" | "rl" => Slash::Reload,
@@ -79,7 +80,10 @@ fn who_text(facts: Facts) -> String {
 }
 
 fn roll_text(max: Option<&str>) -> String {
-    let max = max.and_then(|m| m.parse::<u64>().ok()).filter(|m| *m >= 1).unwrap_or(100);
+    let max = max
+        .and_then(|m| m.parse::<u64>().ok())
+        .filter(|m| *m >= 1)
+        .unwrap_or(100);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(4, |d| u64::from(d.subsec_nanos()));
@@ -90,7 +94,12 @@ fn roll_text(max: Option<&str>) -> String {
 
 /// Short, friendly durations for `/played`.
 pub fn human_duration(seconds: u64) -> String {
-    let (d, h, m, s) = (seconds / 86400, seconds / 3600 % 24, seconds / 60 % 60, seconds % 60);
+    let (d, h, m, s) = (
+        seconds / 86400,
+        seconds / 3600 % 24,
+        seconds / 60 % 60,
+        seconds % 60,
+    );
     let plural = |n: u64, word: &str| format!("{n} {word}{}", if n == 1 { "" } else { "s" });
     if d > 0 {
         format!("{}, {}", plural(d, "day"), plural(h, "hour"))
@@ -136,9 +145,9 @@ const FLAVOR: [&str; 16] = [
 
 /// A flavor line that stays the same for a given addon.
 pub fn flavor_line(addon_id: &str) -> &'static str {
-    let hash = addon_id
-        .bytes()
-        .fold(0xcbf2_9ce4_8422_2325_u64, |h, b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3));
+    let hash = addon_id.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+    });
     FLAVOR[(hash % FLAVOR.len() as u64) as usize]
 }
 
@@ -187,7 +196,8 @@ impl MonitorGag {
 
     /// When the UI next needs to wake up to turn the screen back on.
     pub fn wake_in(&self, now: Instant) -> Option<Duration> {
-        self.off_until.map(|until| until.saturating_duration_since(now))
+        self.off_until
+            .map(|until| until.saturating_duration_since(now))
     }
 }
 
@@ -233,10 +243,19 @@ mod tests {
 
     #[test]
     fn commands_are_case_insensitive_and_trimmed() {
-        assert_eq!(parse_slash("  /RELOAD  ", Facts::default()), Some(Slash::Reload));
+        assert_eq!(
+            parse_slash("  /RELOAD  ", Facts::default()),
+            Some(Slash::Reload)
+        );
         assert_eq!(parse_slash("/Dance", Facts::default()), Some(Slash::Dance));
-        assert_eq!(parse_slash("/pwnage", Facts::default()), Some(Slash::Pwnage));
-        assert_eq!(parse_slash("/feeling", Facts::default()), Some(Slash::OpenAbout));
+        assert_eq!(
+            parse_slash("/pwnage", Facts::default()),
+            Some(Slash::Pwnage)
+        );
+        assert_eq!(
+            parse_slash("/feeling", Facts::default()),
+            Some(Slash::OpenAbout)
+        );
     }
 
     #[test]
@@ -246,7 +265,13 @@ mod tests {
 
     #[test]
     fn played_reports_real_numbers() {
-        let facts = Facts { seconds_open: 3700, launches: 7, addons_installed: 3, updates_applied: 2, managed: 3 };
+        let facts = Facts {
+            seconds_open: 3700,
+            launches: 7,
+            addons_installed: 3,
+            updates_applied: 2,
+            managed: 3,
+        };
         match parse_slash("/played", facts) {
             Some(Slash::Say(text)) => {
                 assert!(text.contains("1 hour, 1 minute"), "{text}");
@@ -290,7 +315,10 @@ mod tests {
 
     #[test]
     fn flavor_is_stable_per_addon() {
-        assert_eq!(flavor_line("gh:Questie/Questie"), flavor_line("gh:Questie/Questie"));
+        assert_eq!(
+            flavor_line("gh:Questie/Questie"),
+            flavor_line("gh:Questie/Questie")
+        );
     }
 
     #[test]
@@ -303,7 +331,10 @@ mod tests {
         assert!(!gag.is_off(start));
         assert!(gag.click(start + Duration::from_millis(400)));
         assert!(gag.is_off(start + Duration::from_secs(1)));
-        assert!(!gag.click(start + Duration::from_secs(2)), "ignored while off");
+        assert!(
+            !gag.click(start + Duration::from_secs(2)),
+            "ignored while off"
+        );
         assert!(!gag.is_off(start + Duration::from_secs(10)));
     }
 

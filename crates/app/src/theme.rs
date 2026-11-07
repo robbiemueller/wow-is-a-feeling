@@ -11,6 +11,7 @@ pub const GOLD_DIM: Color32 = Color32::from_rgb(201, 162, 39);
 pub const GOLD_LINE: Color32 = Color32::from_rgb(138, 106, 40);
 pub const TEXT: Color32 = Color32::from_rgb(232, 224, 204);
 pub const TEXT_DIM: Color32 = Color32::from_rgb(158, 150, 132);
+pub const HINT: Color32 = Color32::from_rgb(196, 188, 166);
 pub const SHADOW: Color32 = Color32::from_black_alpha(220);
 pub const ERROR_RED: Color32 = Color32::from_rgb(255, 48, 32);
 #[allow(dead_code)] // Used by the message overlay.

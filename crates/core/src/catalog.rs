@@ -271,7 +271,15 @@ mod tests {
             ..Default::default()
         };
         let json = serde_json::to_string(&addon).unwrap();
-        assert!(
+        assert!(
+            !json.contains("stars"),
+            "empty fields should be omitted: {json}"
+        );
+        assert!(
+            !json.contains("\"ids\""),
+            "empty fields should be omitted: {json}"
+        );
+        assert!(
             !json.contains("created"),
             "empty fields should be omitted: {json}"
         );
