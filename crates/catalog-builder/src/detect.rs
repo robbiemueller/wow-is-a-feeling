@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::ZipScan;
 use crate::text::{normalize, tokens, zip_stem};
+use crate::zipscan::match_score;
 
 /// 2026-07-01. Nothing older can target Forever, and WoWInterface uses the same line.
 pub const FOREVER_EPOCH: i64 = 1_782_864_000;
@@ -101,7 +102,8 @@ pub struct Chosen {
     /// Releases that couldn't be examined this run.
     pub errors: Vec<String>,
     pub no_longer_forever: bool,
-    /// The newest release passed over because its Forever build is another addon's.
+    /// The newest release passed over because its Forever build is another addon's, when it's
+    /// newer than every build chosen.
     pub skipped: Option<String>,
 }
 
@@ -300,11 +302,16 @@ pub fn classify_release(
         );
     }
     let repo_norm = normalize(repo_name);
+    let pin_norm = pin.map(normalize);
     let best_first = |a: &&GhAsset| {
         let stem = normalize(&zip_stem(&a.name));
+        // A zip named like the pinned folder goes before a bigger one, so another addon's
+        // bigger zips can't push the pinned addon's own past the ones that get read.
+        let like_pin = pin_norm.as_deref().map_or(0, |pin| match_score(&stem, pin));
         (
             is_nolib(&a.name),
             stem != repo_norm,
+            std::cmp::Reverse(like_pin),
             std::cmp::Reverse(a.size),
         )
     };
@@ -314,18 +321,24 @@ pub fn classify_release(
         .filter(|a| flavor_of(&a.name) == Flavor::Forever)
         .collect();
     named.sort_by_key(best_first);
-    queue.extend(named.into_iter().take(MAX_ZIPS_PER_RELEASE));
-
     let release_is_flavored = flavor_of(&release.tag) == Flavor::Other;
+    let mut unlabeled: Vec<&GhAsset> = Vec::new();
     if allow_toc_reads && !release_is_flavored {
-        let mut unlabeled: Vec<&GhAsset> = zips
+        unlabeled = zips
             .iter()
             .copied()
             .filter(|a| flavor_of(&a.name) == Flavor::Unlabeled && !is_nolib(&a.name))
             .collect();
         unlabeled.sort_by_key(best_first);
-        queue.extend(unlabeled.into_iter().take(MAX_ZIPS_PER_RELEASE));
     }
+    let past_the_caps: Vec<&str> = named
+        .iter()
+        .skip(MAX_ZIPS_PER_RELEASE)
+        .chain(unlabeled.iter().skip(MAX_ZIPS_PER_RELEASE))
+        .map(|a| a.name.as_str())
+        .collect();
+    queue.extend(named.iter().take(MAX_ZIPS_PER_RELEASE));
+    queue.extend(unlabeled.iter().take(MAX_ZIPS_PER_RELEASE));
 
     let mut seen: Vec<&str> = Vec::new();
     let mut read_something = false;
@@ -348,6 +361,17 @@ pub fn classify_release(
         }
     }
     if passed_over {
+        // While zips are left unread, the pinned addon's own could be one of them, and caching
+        // the release as another addon's would keep it from ever being read.
+        let unread = past_the_caps
+            .iter()
+            .filter(|name| !seen.contains(name))
+            .count();
+        if unread > 0 {
+            return Err(format!(
+                "every zip read is another addon's, and {unread} more weren't read, so it's tried again next run"
+            ));
+        }
         // Another addon's release, which says nothing about whether this one still has Forever.
         verdict.skipped_for = pin.map(str::to_string);
         return Ok(verdict);
@@ -405,7 +429,11 @@ pub fn choose_builds(
             }
         };
         if verdict.skipped_for.is_some() {
-            chosen.skipped.get_or_insert_with(|| release.tag.clone());
+            // Worth naming only while it's newer than anything listed. A stable build ends the
+            // look, so only a beta can have come first.
+            if chosen.beta.is_none() {
+                chosen.skipped.get_or_insert_with(|| release.tag.clone());
+            }
             continue;
         }
 
@@ -1008,16 +1036,89 @@ mod tests {
         fake.zips
             .insert("Pack.zip".into(), Ok(forever_scan("Pack")));
         fake.zips
-            .insert("Main.zip".into(), Ok(forever_scan("Main")));
-        let releases = [release("v1", 1, &["Pack.zip", "Main.zip"])];
+            .insert("Extras.zip".into(), Ok(forever_scan("Main")));
+        let mut releases = [release("v1", 1, &["Pack.zip", "Extras.zip"])];
+        releases[0].assets[0].size = 2000;
 
         let chosen = pinned(&mut fake, &releases, &mut BTreeMap::new(), "Main");
-        assert_eq!(chosen.stable.unwrap().asset.name, "Main.zip");
-        assert_eq!(fake.zip_reads, ["Pack.zip", "Main.zip"]);
+        assert_eq!(chosen.stable.unwrap().asset.name, "Extras.zip");
+        assert_eq!(fake.zip_reads, ["Pack.zip", "Extras.zip"]);
         assert_eq!(
             chosen.skipped, None,
             "the release had the pinned addon after all"
         );
+    }
+
+    #[test]
+    fn the_zip_named_like_the_pinned_folder_is_read_before_bigger_ones() {
+        let mut fake = Fake::default();
+        let mut names = Vec::new();
+        for at in 0..MAX_ZIPS_PER_RELEASE {
+            let name = format!("MainVoices{at}-1.0.zip");
+            fake.zips
+                .insert(name.clone(), Ok(forever_scan(&format!("MainVoices{at}"))));
+            names.push(name);
+        }
+        fake.zips
+            .insert("Main-1.0.zip".into(), Ok(forever_scan("Main")));
+        names.push("Main-1.0.zip".into());
+        let borrowed: Vec<&str> = names.iter().map(String::as_str).collect();
+        let mut releases = [release("v1", 1, &borrowed)];
+        for (at, asset) in releases[0].assets.iter_mut().enumerate() {
+            asset.size = 10_000 - u64::try_from(at).unwrap();
+        }
+
+        let chosen = pinned(&mut fake, &releases, &mut BTreeMap::new(), "Main");
+        assert_eq!(chosen.stable.unwrap().asset.name, "Main-1.0.zip");
+        assert_eq!(fake.zip_reads, ["Main-1.0.zip"], "the smallest, read first");
+
+        // Unpinned, size still decides.
+        let mut fake_unpinned = Fake {
+            zips: fake.zips.clone(),
+            ..Fake::default()
+        };
+        let mut cache = BTreeMap::new();
+        choose_builds(
+            "Repo",
+            &releases,
+            &mut cache,
+            None,
+            &mut fake_unpinned,
+            &|| false,
+        );
+        assert_eq!(fake_unpinned.zip_reads, ["MainVoices0-1.0.zip"]);
+    }
+
+    #[test]
+    fn a_release_isnt_settled_as_another_addons_while_zips_are_left_unread() {
+        let mut fake = Fake::default();
+        let mut names = Vec::new();
+        for at in 0..=MAX_ZIPS_PER_RELEASE {
+            let name = format!("Part{at}.zip");
+            fake.zips
+                .insert(name.clone(), Ok(forever_scan(&format!("Part{at}"))));
+            names.push(name);
+        }
+        let borrowed: Vec<&str> = names.iter().map(String::as_str).collect();
+        let releases = [release("v1", 1, &borrowed)];
+        let mut cache = BTreeMap::new();
+
+        let chosen = pinned(&mut fake, &releases, &mut cache, "Main");
+        assert_eq!(fake.zip_reads.len(), MAX_ZIPS_PER_RELEASE);
+        assert!(cache.is_empty(), "not cached as another addon's");
+        assert_eq!(chosen.skipped, None);
+        assert_eq!(chosen.errors.len(), 1);
+        assert!(
+            chosen.errors[0].contains("1 more weren't read"),
+            "{:?}",
+            chosen.errors
+        );
+
+        // Every zip read and none of them the addon's: that's settled.
+        let all_read = [release("v1", 1, &borrowed[..MAX_ZIPS_PER_RELEASE])];
+        let chosen = pinned(&mut fake, &all_read, &mut cache, "Main");
+        assert!(chosen.errors.is_empty());
+        assert_eq!(cache["v1"].skipped_for.as_deref(), Some("Main"));
     }
 
     #[test]

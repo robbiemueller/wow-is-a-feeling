@@ -6,7 +6,7 @@ use std::fs;
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
 
-use feeling_core::catalog::{Addon, CATEGORIES, Catalog, Channel, Source};
+use feeling_core::catalog::{Addon, CATEGORIES, Catalog, Channel, PackGroup, Source};
 use feeling_core::install::{self, InstallRequest, Layout};
 use feeling_core::net::{self, Http};
 use feeling_core::scan;
@@ -71,6 +71,7 @@ fn static_problems(catalog: &Catalog) -> Vec<String> {
             problems.push(format!("{} has no release", addon.id));
         }
         problems.extend(github_id_problem(addon));
+        problems.extend(formerly_problems(addon));
         for group in &addon.packs {
             if group.name.trim().is_empty() {
                 problems.push(format!("{} has a group of packs with no name", addon.id));
@@ -81,6 +82,7 @@ fn static_problems(catalog: &Catalog) -> Vec<String> {
                     addon.id, group.name
                 ));
             }
+            problems.extend(met_by_problems(addon, group));
         }
         for release in [&addon.stable, &addon.beta].into_iter().flatten() {
             if !net::is_public_url(&release.url) {
@@ -156,6 +158,87 @@ fn github_id_problem(addon: &Addon) -> Option<String> {
             addon.id
         )),
     }
+}
+
+/// The most former main folders an entry keeps, as the builder has it.
+const MAX_FORMERLY: usize = 8;
+/// The most `met_by` prefixes a pack group takes, as the builder has it.
+const MAX_MET_BY: usize = 8;
+
+/// The app counts an installed copy whose main folder is in `formerly` as this addon, so the
+/// list is short, plain folder names, and never the main folder the entry has now.
+fn formerly_problems(addon: &Addon) -> Vec<String> {
+    let id = &addon.id;
+    let mut problems = Vec::new();
+    if addon.formerly.len() > MAX_FORMERLY {
+        problems.push(format!(
+            "{id} has {} former main folders, more than {MAX_FORMERLY}",
+            addon.formerly.len()
+        ));
+    }
+    let mut seen = BTreeSet::new();
+    for folder in &addon.formerly {
+        if !is_folder_name(folder) {
+            problems.push(format!(
+                "{id} has a former main folder that can't be a folder name: {folder:?}"
+            ));
+        }
+        if !seen.insert(folder.to_ascii_lowercase()) {
+            problems.push(format!("{id} lists {folder} as a former main folder twice"));
+        }
+        if addon
+            .folders
+            .first()
+            .is_some_and(|main| main.eq_ignore_ascii_case(folder))
+        {
+            problems.push(format!(
+                "{id} lists its main folder {folder} as a former one"
+            ));
+        }
+    }
+    problems
+}
+
+/// The app counts any folder starting with one of a group's `met_by` prefixes as meeting it,
+/// so an empty or odd prefix could meet it for anything.
+fn met_by_problems(addon: &Addon, group: &PackGroup) -> Vec<String> {
+    let mut problems = Vec::new();
+    if group.met_by.len() > MAX_MET_BY {
+        problems.push(format!(
+            "{}'s {} packs have {} met_by prefixes, more than {MAX_MET_BY}",
+            addon.id,
+            group.name,
+            group.met_by.len()
+        ));
+    }
+    for prefix in &group.met_by {
+        if !is_folder_name(prefix) {
+            problems.push(format!(
+                "{}'s {} packs have a met_by prefix that can't start a folder name: {prefix:?}",
+                addon.id, group.name
+            ));
+        }
+    }
+    problems
+}
+
+/// A name that's safe for one folder under AddOns on every OS, by the same rule the builder's
+/// gate uses, so a catalog that came some other way is held to it too.
+fn is_folder_name(name: &str) -> bool {
+    const DEVICES: [&str; 22] = [
+        "con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8",
+        "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
+    ];
+    let bad_char = |c: char| {
+        c.is_control() || matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|')
+    };
+    let stem = name.split('.').next().unwrap_or(name).to_ascii_lowercase();
+    !name.is_empty()
+        && name.len() <= 120
+        && !name.starts_with(['.', ' '])
+        && !name.ends_with(['.', ' '])
+        && !name.chars().any(bad_char)
+        && !DEVICES.contains(&stem.as_str())
 }
 
 /// The download sites README.md lists under "What it connects to". A catalog that sends
@@ -277,7 +360,7 @@ fn try_install(http: &Http, addon: &Addon) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use feeling_core::catalog::{PackGroup, Release};
+    use feeling_core::catalog::Release;
 
     use super::*;
 
@@ -392,6 +475,64 @@ mod tests {
         listing.stable.as_mut().unwrap().url =
             "https://cdn.wowinterface.com/downloads/getfile.php?id=7".into();
         assert!(static_problems(&catalog(vec![listing])).is_empty());
+    }
+
+    #[test]
+    fn former_main_folders_are_short_plain_names_and_never_the_main_one() {
+        let mut spoken = entry("gh:rusty-key/spoken-wow", SPOKEN);
+        spoken.formerly = vec!["SpokenOld".into(), "Spoken_Legacy".into()];
+        assert!(static_problems(&catalog(vec![spoken.clone()])).is_empty());
+        for (formerly, wanted) in [
+            (vec!["../evil".to_string()], "can't be a folder name"),
+            (vec![String::new()], "can't be a folder name"),
+            (vec!["CON".into()], "can't be a folder name"),
+            (vec!["Old".into(), "OLD".into()], "twice"),
+            (vec!["spoken".into()], "its main folder"),
+            (
+                (0..=MAX_FORMERLY).map(|n| format!("Old{n}")).collect(),
+                "more than 8",
+            ),
+        ] {
+            spoken.formerly = formerly;
+            let problems = static_problems(&catalog(vec![spoken.clone()]));
+            assert!(
+                problems.iter().any(|p| p.contains(wanted)),
+                "{:?}: {problems:?}",
+                spoken.formerly
+            );
+        }
+    }
+
+    #[test]
+    fn met_by_prefixes_are_safe_folder_name_starts_and_few() {
+        let quests = entry("gh:rusty-key/spoken-wow/quests-audio", SPOKEN);
+        let mut spoken = entry("gh:rusty-key/spoken-wow", SPOKEN);
+        let with = |met_by: Vec<String>| PackGroup {
+            name: "Quest voices".into(),
+            needed: true,
+            ids: vec!["gh:rusty-key/spoken-wow/quests-audio".into()],
+            met_by,
+        };
+        spoken.packs = vec![with(vec!["SpokenQuestsAudio".into()])];
+        let fine = static_problems(&catalog(vec![spoken.clone(), quests.clone()]));
+        assert!(fine.is_empty(), "{fine:?}");
+        for (met_by, wanted) in [
+            (vec![String::new()], "can't start a folder name"),
+            (vec!["Spoken/Quests".into()], "can't start a folder name"),
+            (vec![" Spoken".into()], "can't start a folder name"),
+            (
+                (0..=MAX_MET_BY).map(|n| format!("Pack{n}")).collect(),
+                "more than 8",
+            ),
+        ] {
+            spoken.packs = vec![with(met_by)];
+            let problems = static_problems(&catalog(vec![spoken.clone(), quests.clone()]));
+            assert!(
+                problems.iter().any(|p| p.contains(wanted)),
+                "{:?}: {problems:?}",
+                spoken.packs[0].met_by
+            );
+        }
     }
 
     #[test]

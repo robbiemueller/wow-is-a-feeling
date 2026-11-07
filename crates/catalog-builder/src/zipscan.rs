@@ -397,7 +397,9 @@ fn best_match(folder: &str, hints: &[String]) -> (u32, std::cmp::Reverse<usize>)
     (score, std::cmp::Reverse(name.len()))
 }
 
-fn match_score(name: &str, hint: &str) -> u32 {
+/// How alike two normalized names are: the same, one starting with the other, or else how
+/// long a start they share. Higher is better.
+pub(crate) fn match_score(name: &str, hint: &str) -> u32 {
     if name == hint {
         return 2000;
     }

@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use feeling_core::catalog::{Addon, CATALOG_SCHEMA, CATEGORIES, Catalog, PackGroup, Release};
 
 use crate::curated::{Curated, HandPicked, PackSpec};
-use crate::model::{Held, MAX_DEPS};
+use crate::model::{Held, MAX_DEPS, MAX_FORMERLY};
 use crate::text::fold_name;
 use crate::zipscan::MAX_FOLDERS;
 
@@ -99,11 +99,33 @@ pub fn addon_problem(addon: &Addon) -> Option<String> {
     if lower.len() != addon.folders.len() {
         return Some("folder names that differ only by case".to_string());
     }
-    addon
-        .stable
-        .iter()
-        .chain(addon.beta.iter())
-        .find_map(|release| release_problem(release, &addon.folders))
+    formerly_problem(addon).or_else(|| {
+        addon
+            .stable
+            .iter()
+            .chain(addon.beta.iter())
+            .find_map(|release| release_problem(release, &addon.folders))
+    })
+}
+
+/// What's wrong with an addon's former main folders. The builder only ever writes a short list
+/// of safe names, so this is the last guard on what every player's catalog carries.
+fn formerly_problem(addon: &Addon) -> Option<String> {
+    let formerly = &addon.formerly;
+    if formerly.len() > MAX_FORMERLY {
+        return Some(format!("too many former main folders ({})", formerly.len()));
+    }
+    if let Some(bad) = formerly.iter().find(|f| !is_safe_folder(f)) {
+        return Some(format!("unsafe former main folder {bad:?}"));
+    }
+    let lower: BTreeSet<String> = formerly.iter().map(|f| f.to_ascii_lowercase()).collect();
+    if lower.len() != formerly.len() {
+        return Some("former main folders that differ only by case".to_string());
+    }
+    let main = addon.folders.first()?;
+    lower
+        .contains(&main.to_ascii_lowercase())
+        .then(|| format!("its main folder {main} is also a former one"))
 }
 
 /// What the gate goes by besides the catalog itself.
@@ -278,7 +300,7 @@ fn attach_packs(catalog: &mut Catalog, specs: &[PackSpec], warnings: &mut Vec<St
                 name: name.to_string(),
                 needed: spec.needed,
                 ids,
-                met_by: Vec::new(),
+                met_by: spec.met_by.clone(),
             });
     }
     for addon in &mut catalog.addons {
@@ -872,6 +894,7 @@ mod tests {
             name: name.into(),
             needed,
             ids: ids.iter().map(|id| (*id).to_string()).collect(),
+            met_by: vec![format!("{}Audio", name.split_whitespace().next().unwrap())],
         }
     }
 
@@ -919,16 +942,16 @@ mod tests {
                     name: "Quest voices".into(),
                     needed: true,
                     ids: vec!["gh:rusty-key/spoken-wow/quests-audio".into()],
-                    met_by: Vec::new(),
+                    met_by: vec!["QuestAudio".into()],
                 },
                 PackGroup {
                     name: "Place voices".into(),
                     needed: false,
                     ids: vec!["gh:rusty-key/spoken-wow/places-audio".into()],
-                    met_by: Vec::new(),
+                    met_by: vec!["PlaceAudio".into()],
                 },
             ],
-            "in the order they were written"
+            "in the order they were written, with what else meets them"
         );
         assert!(
             passed.catalog.addons[1..]
@@ -1041,5 +1064,26 @@ mod tests {
         let passed = gate_with(build(), &curated, &picks, None, &[]).unwrap();
         assert_eq!(passed.catalog.gaps.len(), 1);
         assert!(passed.warnings.is_empty(), "{:?}", passed.warnings);
+    }
+
+    #[test]
+    fn a_bad_formerly_drops_the_entry_like_bad_folders_do() {
+        let mut thing = addon("gh:a/b", "Thing");
+        thing.formerly = vec!["Old".into(), "Older".into()];
+        assert_eq!(addon_problem(&thing), None);
+        for bad in [
+            (0..=MAX_FORMERLY).map(|i| format!("Old{i}")).collect(),
+            vec!["../evil".to_string()],
+            vec![String::new()],
+            vec!["Old".into(), "OLD".into()],
+            vec!["thing".into()],
+        ] {
+            thing.formerly = bad;
+            assert!(addon_problem(&thing).is_some(), "{:?}", thing.formerly);
+        }
+        let (out, warnings) = pass(catalog(vec![thing, addon("gh:a/c", "Other")]));
+        assert_eq!(out.addons.len(), 1);
+        assert_eq!(out.addons[0].id, "gh:a/c");
+        assert!(warnings[0].contains("is also a former one"), "{warnings:?}");
     }
 }

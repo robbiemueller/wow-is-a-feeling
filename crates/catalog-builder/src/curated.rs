@@ -13,7 +13,7 @@ use crate::detect::{Flavor, flavor_of, tag_is_prerelease};
 use crate::gate::is_safe_folder;
 use crate::github::{self, RepoInfo};
 use crate::http::{Channel, Http, unix_now};
-use crate::model::{Candidate, ZipScan};
+use crate::model::{Candidate, MAX_FORMERLY, ZipScan};
 use crate::rangezip::{HttpRange, RangeReader};
 use crate::text::{
     clean_author, clean_name, clean_summary, clean_version, encode_path, round_sig,
@@ -59,10 +59,10 @@ pub struct Curated {
     /// else merges a listing, whatever a repository's own files claim.
     #[serde(default)]
     pub merges: BTreeMap<String, String>,
-    /// Entries whose next build may ship a main folder the last catalog didn't list them
-    /// with: a real rename. Each one comes out again once the catalog with it is out.
+    /// Which addon a GitHub entry is, by id, written down where the last catalog can't be
+    /// trusted to say: a rename, or another addon of the repository already in its place.
     #[serde(default)]
-    pub allow_new_main: Vec<String>,
+    pub pins: BTreeMap<String, PinSpec>,
     /// Repositories that publish several addons, each under its own tag prefix.
     #[serde(default)]
     pub split: Vec<SplitSpec>,
@@ -98,6 +98,23 @@ pub struct PackSpec {
     pub needed: bool,
     /// Catalog ids, in the order to offer them.
     pub ids: Vec<String>,
+    /// Folder name prefixes that meet the group too, for packs the catalog doesn't list:
+    /// other languages, or ones from another tool.
+    #[serde(default)]
+    pub met_by: Vec<String>,
+}
+
+/// Which addon one GitHub entry is, as `[pins."<id>"]`. See "One product per entry" in
+/// `docs/DESIGN.md`.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PinSpec {
+    /// The folder that identifies the entry's addon. A new build only counts if it ships it.
+    pub main: String,
+    /// Main folders the addon really had before. Copies installed under one of them still
+    /// get its updates, because they go into its `formerly`.
+    #[serde(default)]
+    pub was: Vec<String>,
 }
 
 /// More lines than any repository needs, since each costs requests on every full look.
@@ -106,6 +123,9 @@ const MAX_LINES: usize = 32;
 const MAX_LINE_BYTES: usize = 64;
 /// A pack group's name is a label on the addon's page.
 const MAX_PACK_GROUP_CHARS: usize = 40;
+/// Prefixes per pack group. A few cover every language and every tool there is, and the app
+/// checks each against every folder in AddOns.
+const MAX_MET_BY: usize = 8;
 
 impl SplitSpec {
     /// The catalog id of a release line: the repository as GitHub spells it, and the
@@ -161,6 +181,11 @@ fn looks_like_id(id: &str) -> bool {
         id.strip_prefix(kind)
             .is_some_and(|rest| !rest.trim().is_empty())
     })
+}
+
+/// `gh:owner/repo`: a repository's own entry, not one of its release lines.
+fn is_repo_id(id: &str) -> bool {
+    repo_of_id(id).is_some_and(|repo| valid_repo_name(repo) && id.len() == "gh:".len() + repo.len())
 }
 
 /// The id of a GitHub entry: a repository's own, or one of its release lines'.
@@ -288,11 +313,12 @@ impl Curated {
             .find(|s| s.repo.eq_ignore_ascii_case(repo))
     }
 
-    /// Whether this entry's next build may ship another main folder than the last one.
-    pub fn allows_new_main(&self, id: &str) -> bool {
-        self.allow_new_main
+    /// What `[pins]` says about this entry. Case doesn't matter.
+    pub fn pin_of(&self, id: &str) -> Option<&PinSpec> {
+        self.pins
             .iter()
-            .any(|allowed| allowed.eq_ignore_ascii_case(id))
+            .find(|(pinned, _)| pinned.eq_ignore_ascii_case(id))
+            .map(|(_, pin)| pin)
     }
 
     /// A split repository that isn't seeded, which nothing promises to read on every run.
@@ -332,11 +358,12 @@ impl Curated {
                 return Some(format!("merges: {repo} isn't owner/repo"));
             }
         }
-        if let Some(id) = self.allow_new_main.iter().find(|id| !is_github_id(id)) {
-            return Some(format!("allow_new_main: {id} isn't a GitHub entry's id"));
-        }
-        if let Some(problem) = self.split_mistake().or_else(|| self.packs_mistake()) {
-            return Some(problem);
+        let problem = self
+            .split_mistake()
+            .or_else(|| self.packs_mistake())
+            .or_else(|| self.pins_mistake());
+        if problem.is_some() {
+            return problem;
         }
         let gap_folders = self.gaps.iter().flat_map(|gap| gap.folders.iter());
         gap_folders
@@ -419,14 +446,97 @@ impl Curated {
                     return Some(format!("packs for {addon}: {name} lists {id} twice"));
                 }
             }
+            if let Some(problem) = met_by_mistake(&group.met_by) {
+                return Some(format!("packs {name} for {addon}: {problem}"));
+            }
+        }
+        None
+    }
+
+    fn pins_mistake(&self) -> Option<String> {
+        let mut pinned = BTreeSet::new();
+        for (id, pin) in &self.pins {
+            if !is_github_id(id) {
+                return Some(format!("pins: {id} isn't a GitHub entry's id"));
+            }
+            if !is_repo_id(id) {
+                return Some(format!(
+                    "pins: {id} is a release line, and its tag prefix already says which addon it is"
+                ));
+            }
+            if repo_of_id(id)
+                .and_then(|repo| self.split_of(repo))
+                .is_some()
+            {
+                return Some(format!(
+                    "pins: {id} is in [[split]], whose tag prefixes already say which addon each entry is"
+                ));
+            }
+            if !pinned.insert(id.to_ascii_lowercase()) {
+                return Some(format!("pins: {id} is pinned twice"));
+            }
+            if let Some(problem) = pin_mistake(pin) {
+                return Some(format!("pins for {id}: {problem}"));
+            }
         }
         None
     }
 }
 
+/// What's wrong with one `[pins]` entry's folders, if anything.
+fn pin_mistake(pin: &PinSpec) -> Option<String> {
+    let main = &pin.main;
+    if let Some(folder) = std::iter::once(main)
+        .chain(&pin.was)
+        .find(|folder| !is_safe_folder(folder))
+    {
+        return Some(format!("{folder:?} can't be a folder name"));
+    }
+    if pin.was.len() > MAX_FORMERLY {
+        return Some(format!(
+            "was names more than {MAX_FORMERLY} folders, the most formerly keeps"
+        ));
+    }
+    let mut seen = BTreeSet::new();
+    for folder in &pin.was {
+        if folder.eq_ignore_ascii_case(main) {
+            return Some(format!("was names {folder}, which is its main folder now"));
+        }
+        if !seen.insert(folder.to_ascii_lowercase()) {
+            return Some(format!("was names {folder} twice"));
+        }
+    }
+    None
+}
+
+/// What's wrong with a pack group's `met_by`, if anything. The app counts any folder that starts
+/// with one of these as the group met, so an empty or odd one could meet it for anything.
+fn met_by_mistake(met_by: &[String]) -> Option<String> {
+    if met_by.is_empty() {
+        return Some(
+            "met_by is empty: name the folder prefixes that meet it, its own packs' and any from elsewhere"
+                .to_string(),
+        );
+    }
+    if met_by.len() > MAX_MET_BY {
+        return Some(format!("met_by has more than {MAX_MET_BY} prefixes"));
+    }
+    let mut seen = BTreeSet::new();
+    for prefix in met_by {
+        if !is_safe_folder(prefix) {
+            return Some(format!("met_by {prefix:?} can't start a folder name"));
+        }
+        if !seen.insert(prefix.to_ascii_lowercase()) {
+            return Some(format!("met_by names {prefix} twice"));
+        }
+    }
+    None
+}
+
 /// Everything a person chose: `seeds.toml`, what `curated.toml` names, and both sides
 /// of an approved merge. Always beats anything found by search. Release lines exist only
-/// because someone wrote them down, so they're always in here.
+/// because someone wrote them down, so they're always in here. `[pins]` isn't: it only says
+/// which addon an entry is, and vouches for nothing else about it.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct HandPicked {
     ids: BTreeSet<String>,
@@ -1548,10 +1658,40 @@ mod tests {
         for folder in ["SpokenQuestsAudioAlliance", "SpokenQuestsAudioGossip"] {
             assert!(curated.reserved.contains(&folder.to_string()), "{folder}");
         }
-        assert!(
-            curated.allow_new_main.is_empty(),
-            "a rename is let through once, then taken out again"
+
+        // Every language, CurseForge's splits and the old single-folder packs meet quest
+        // voices, and the names Spoken still reads meet places and readables.
+        let met_by = |name: &str| {
+            let group = curated.packs.iter().find(|g| g.name == name).unwrap();
+            group.met_by.clone()
+        };
+        assert_eq!(met_by("Quest voices"), ["SpokenQuestsAudio"]);
+        assert_eq!(
+            met_by("Place voices"),
+            ["SpokenPlacesAudio", "SpokenZonesAudio"]
         );
+        assert_eq!(
+            met_by("Readable voices"),
+            ["SpokenReadablesAudio", "SpokenBooksAudio"]
+        );
+        assert_eq!(met_by("Boss voices"), ["SpokenBossesAudio"]);
+        for group in curated.packs.iter() {
+            for id in &group.ids {
+                let name = curated.overrides[id].name.as_deref().unwrap();
+                assert!(
+                    name.ends_with("(English)"),
+                    "{id}: a pack's name says its language"
+                );
+            }
+        }
+
+        // The data pack that had taken the addon's place.
+        let pin = curated.pin_of("gh:jhunthrop/foreversixty").unwrap();
+        assert_eq!(pin.main, "ForeverSixty");
+        assert!(pin.was.is_empty());
+        for id in curated.pins.keys() {
+            assert!(!picks.contains(id), "{id}: a pin picks nothing");
+        }
     }
 
     #[test]
@@ -1566,14 +1706,24 @@ mod tests {
         let split = |repo: &str, main: &str, lines: &str| {
             format!("[[split]]\nrepo = \"{repo}\"\nmain = \"{main}\"\nlines = [{lines}]\n")
         };
-        let pack = |addon: &str, name: &str, ids: &str| {
-            format!("[[packs]]\naddon = \"{addon}\"\nname = \"{name}\"\nids = [{ids}]\n")
+        let pack_met_by = |addon: &str, name: &str, ids: &str, met_by: &str| {
+            format!(
+                "[[packs]]\naddon = \"{addon}\"\nname = \"{name}\"\nids = [{ids}]\nmet_by = [{met_by}]\n"
+            )
+        };
+        let pack = |addon: &str, name: &str, ids: &str| pack_met_by(addon, name, ids, "\"Voices\"");
+        let pin = |id: &str, main: &str, was: &str| {
+            format!("[pins.\"{id}\"]\nmain = \"{main}\"\nwas = [{was}]\n")
         };
         let twice = split("a/b", "main", "") + &split("A/B", "other", "");
         let long_name = pack("gh:a/b", &"x".repeat(41), "\"gh:a/c\"");
         let same_group =
             pack("gh:a/b", "Voices", "\"gh:a/c\"") + &pack("gh:a/b", "voices", "\"gh:a/d\"");
         let many: Vec<String> = (0..=MAX_LINES).map(|i| format!("\"l{i}\"")).collect();
+        let many_prefixes: Vec<String> = (0..=MAX_MET_BY).map(|i| format!("\"V{i}\"")).collect();
+        let many_was: Vec<String> = (0..=MAX_FORMERLY).map(|i| format!("\"Old{i}\"")).collect();
+        let pinned_twice = pin("gh:a/b", "B", "") + &pin("GH:A/B", "B", "");
+        let split_and_pinned = split("a/b", "main", "") + &pin("gh:a/b", "B", "");
         for wrong in [
             "[merges]\nabc = \"a/b\"\n".to_string(),
             "[merges]\n12 = \"not a repo\"\n".to_string(),
@@ -1599,19 +1749,41 @@ mod tests {
             pack("gh:a/b", "Voices", "\"a/c\""),
             pack("nothing", "Voices", "\"gh:a/c\""),
             same_group,
-            "allow_new_main = [\"wowi:12\"]\n".to_string(),
-            "allow_new_main = [\"gh:not a repo\"]\n".to_string(),
-            "allow_new_main = [\"gh:a/b/Upper\"]\n".to_string(),
-            "allow_new_main = [\"gh:a/b/c/d\"]\n".to_string(),
+            pack_met_by("gh:a/b", "Voices", "\"gh:a/c\"", ""),
+            pack_met_by("gh:a/b", "Voices", "\"gh:a/c\"", "\"\""),
+            pack_met_by("gh:a/b", "Voices", "\"gh:a/c\"", "\" \""),
+            pack_met_by("gh:a/b", "Voices", "\"gh:a/c\"", "\"Voices/Other\""),
+            pack_met_by("gh:a/b", "Voices", "\"gh:a/c\"", "\"Voices\", \"VOICES\""),
+            pack_met_by("gh:a/b", "Voices", "\"gh:a/c\"", &many_prefixes.join(", ")),
+            pin("wowi:12", "B", ""),
+            pin("direct:x", "B", ""),
+            pin("gh:not a repo", "B", ""),
+            pin("gh:a/b/quests-audio", "B", ""),
+            pin("gh:a/b/c/d", "B", ""),
+            pin("gh:a/b", "../evil", ""),
+            pin("gh:a/b", "", ""),
+            pin("gh:a/b", "B", "\"a/b\""),
+            pin("gh:a/b", "B", "\"b\""),
+            pin("gh:a/b", "B", "\"Old\", \"OLD\""),
+            pin("gh:a/b", "B", &many_was.join(", ")),
+            pinned_twice,
+            split_and_pinned,
+            "[pins.\"gh:a/b\"]\nwas = [\"Old\"]\n".to_string(),
+            "[pins.\"gh:a/b\"]\nmain = \"B\"\nfolder = \"C\"\n".to_string(),
         ] {
             std::fs::write(&path, &wrong).unwrap();
             let error = load_curated(&path).unwrap_err();
             assert!(error.contains("mistake"), "{wrong}: {error}");
         }
 
-        let fine = "allow_new_main = [\"gh:a/b\", \"gh:a/b/quests-audio\"]\n".to_string()
+        let fine = pin("gh:a/c", "C", "\"OldC\"")
             + &split("a/b", "spoken", "\"quests-audio\", \"places2\"")
-            + &pack("gh:a/b", "Quest voices", "\"gh:a/b/quests-audio\"");
+            + &pack_met_by(
+                "gh:a/b",
+                "Quest voices",
+                "\"gh:a/b/quests-audio\"",
+                "\"SpokenQuestsAudio\"",
+            );
         std::fs::write(&path, &fine).unwrap();
         let curated = load_curated(&path).unwrap();
         assert_eq!(
@@ -1619,6 +1791,13 @@ mod tests {
             ["spoken", "quests-audio", "places2"]
         );
         assert!(!curated.packs[0].needed, "an extra unless it says so");
+        assert_eq!(curated.packs[0].met_by, ["SpokenQuestsAudio"]);
+        let pinned = curated.pin_of("GH:A/C").unwrap();
+        assert_eq!(
+            (pinned.main.as_str(), &pinned.was[..]),
+            ("C", &["OldC".to_string()][..])
+        );
+        assert!(curated.pin_of("gh:a/b").is_none());
     }
 
     #[test]
@@ -1667,6 +1846,7 @@ mod tests {
                 name: "Voices".into(),
                 needed: false,
                 ids: vec!["gh:fourth/voices".into()],
+                met_by: vec!["Voices".into()],
             }],
             ..Curated::default()
         };
@@ -1693,8 +1873,15 @@ mod tests {
                 name: "Voices".into(),
                 needed: true,
                 ids: vec!["wowi:99".into()],
+                met_by: vec!["Voices".into()],
             }],
-            allow_new_main: vec!["gh:fifth/renamed".into()],
+            pins: BTreeMap::from([(
+                "gh:fifth/renamed".to_string(),
+                PinSpec {
+                    main: "Renamed".into(),
+                    was: vec!["Old".into()],
+                },
+            )]),
             ..Curated::default()
         };
         let picks = HandPicked::new(&Seeds::default(), &curated);
@@ -1709,8 +1896,9 @@ mod tests {
         assert!(!picks.contains("gh:rusty-key/spoken-wow/places-audio"));
         assert!(
             !picks.contains("gh:fifth/renamed"),
-            "allowing a rename doesn't pick anything"
+            "saying which addon an entry is doesn't pick it"
         );
+        assert!(!curated.named_repos().contains("fifth/renamed"));
     }
 
     #[test]

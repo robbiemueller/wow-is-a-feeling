@@ -35,6 +35,9 @@ pub struct ZipScan {
 
 /// Required addons kept per TOC. The most any real addon lists is 8.
 pub const MAX_DEPS: usize = 64;
+/// Former main folders an entry keeps in `formerly`, the most recent. An addon renames its
+/// main folder once or twice in its life, and every player's catalog carries the list.
+pub const MAX_FORMERLY: usize = 8;
 /// Real ids are 8 bytes or fewer, so nothing longer is one.
 const MAX_ID_BYTES: usize = 32;
 

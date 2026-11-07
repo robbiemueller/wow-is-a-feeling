@@ -1146,10 +1146,10 @@ fn replay_real_data_with_spokens_voice_packs() {
     check(
         &real,
         &baseline,
-        "A stranger titled Spoken Audio: Quests",
+        "A stranger titled Spoken Audio: Quests (English)",
         with_lines(vec![repo(
             "zebra/Quests",
-            "Spoken Audio: Quests",
+            "Spoken Audio: Quests (English)",
             &["ZebraQuests"],
             1,
         )]),
