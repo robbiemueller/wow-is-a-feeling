@@ -3219,6 +3219,7 @@ fn spoken(site: &Site, version: &str) -> Addon {
         name: "Quest voices".to_owned(),
         needed: true,
         ids: vec![QUEST_VOICES.to_owned()],
+        met_by: Vec::new(),
     }];
     spoken
 }

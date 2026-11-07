@@ -95,6 +95,12 @@ pub struct Addon {
     /// count, and the app installs none of them unless the player says so.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub packs: Vec<PackGroup>,
+    /// Main folders this addon had before, that the catalog vouches for: a rename its author
+    /// made, or a main folder it moved away from. An installed copy whose main folder is here
+    /// is still this addon and gets its updates. A different addon from the same repository
+    /// never gets in here, so an update can't turn an installed addon into it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub formerly: Vec<String>,
 }
 
 /// One kind of pack for an addon: any one of `ids` will do.
@@ -108,6 +114,11 @@ pub struct PackGroup {
     pub needed: bool,
     /// Catalog ids, in the order to offer them. The first is the one offered by default.
     pub ids: Vec<String>,
+    /// Folder name prefixes that meet the group too, for packs the catalog doesn't list:
+    /// other languages, or ones from another tool. "SpokenQuestsAudio" meets quest voices in
+    /// any language, so nobody is told their own voices are missing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub met_by: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -336,11 +347,13 @@ mod tests {
                     name: "Quest voices".into(),
                     needed: true,
                     ids: vec!["gh:rusty-key/spoken-wow/quests-audio".into()],
+                    met_by: Vec::new(),
                 },
                 PackGroup {
                     name: "Place voices".into(),
                     needed: false,
                     ids: vec!["gh:rusty-key/spoken-wow/places-audio".into()],
+                    met_by: Vec::new(),
                 },
             ],
             ..Default::default()

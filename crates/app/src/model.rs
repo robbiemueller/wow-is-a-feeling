@@ -1419,6 +1419,7 @@ mod tests {
             name: name.to_owned(),
             needed,
             ids: ids.iter().map(|id| (*id).to_owned()).collect(),
+            met_by: Vec::new(),
         }
     }
 

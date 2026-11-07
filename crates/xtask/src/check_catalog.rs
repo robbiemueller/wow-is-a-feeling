@@ -313,6 +313,7 @@ mod tests {
             name: "Quest voices".into(),
             needed: true,
             ids: vec!["gh:rusty-key/spoken-wow/quests-audio".into()],
+            met_by: Vec::new(),
         }];
         let quests = entry("gh:rusty-key/spoken-wow/quests-audio", SPOKEN);
         let problems = static_problems(&catalog(vec![spoken, quests]));
@@ -327,11 +328,13 @@ mod tests {
                 name: "Quest voices".into(),
                 needed: true,
                 ids: vec!["gh:rusty-key/spoken-wow/quests-audio".into()],
+                met_by: Vec::new(),
             },
             PackGroup {
                 name: " ".into(),
                 needed: false,
                 ids: vec![],
+                met_by: Vec::new(),
             },
         ];
         let problems = static_problems(&catalog(vec![spoken]));

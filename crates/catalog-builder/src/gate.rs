@@ -278,6 +278,7 @@ fn attach_packs(catalog: &mut Catalog, specs: &[PackSpec], warnings: &mut Vec<St
                 name: name.to_string(),
                 needed: spec.needed,
                 ids,
+                met_by: Vec::new(),
             });
     }
     for addon in &mut catalog.addons {
@@ -918,11 +919,13 @@ mod tests {
                     name: "Quest voices".into(),
                     needed: true,
                     ids: vec!["gh:rusty-key/spoken-wow/quests-audio".into()],
+                    met_by: Vec::new(),
                 },
                 PackGroup {
                     name: "Place voices".into(),
                     needed: false,
                     ids: vec!["gh:rusty-key/spoken-wow/places-audio".into()],
+                    met_by: Vec::new(),
                 },
             ],
             "in the order they were written"
@@ -988,6 +991,7 @@ mod tests {
             name: "Old".into(),
             needed: true,
             ids: vec!["gh:rusty-key/spoken-wow/places-audio".into()],
+            met_by: Vec::new(),
         }];
         let passed = with_packs(c, vec![]);
         assert!(passed.catalog.addons[0].packs.is_empty());
