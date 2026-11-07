@@ -180,6 +180,11 @@ repos = [
   # folders, which curated.toml reserves, so it has to be picked by hand to stay listed.
   # Rethink this one if WeakAuras itself gets a Forever build: both would claim the folders.
   "dldvlpr-addons-wow/Musca-Auras",
+  # Libraries that their own author's addons require, so they install as dependencies. Only
+  # a hand-picked provider is installed by itself. Checked: every requirer has the same owner.
+  "peavers-warcraft/PeaversCommons",
+  "peavers-warcraft/PeaversConfig",
+  "LenweSaralonde/Musician",
 ]
 
 # WoWInterface only. Keep this short: --wowi-limit always includes these.
