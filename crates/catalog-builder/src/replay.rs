@@ -508,6 +508,18 @@ fn replay_real_data_with_each_attack() {
     check(
         &real,
         &baseline,
+        "A Questie look-alike in mathematical bold",
+        vec![repo(
+            "zebra/Questie-C",
+            "\u{1D410}\u{1D42E}\u{1D41E}\u{1D42C}\u{1D42D}\u{1D422}\u{1D41E}",
+            &["QuestieX"],
+            1,
+        )],
+        |o| held_because(o, "gh:zebra/Questie-C"),
+    );
+    check(
+        &real,
+        &baseline,
         "A Questie look-alike with the plain name and its own folder",
         vec![repo("zebra/Questie-B", "Questie", &["QuestieX"], 1)],
         |o| held_because(o, "gh:zebra/Questie-B"),
