@@ -15,7 +15,8 @@ use feeling_core::catalog::Channel;
 use feeling_core::selfupdate::UpdateInfo;
 use std::path::{Path, PathBuf};
 
-/// What a removal will touch, worked out when the popup opens.
+/// What a removal will touch, worked out when the popup opens. What it really deletes is
+/// worked out again when it starts, in case an install queued ahead of it shares a folder.
 #[derive(Clone, Debug)]
 pub struct RemovePlan {
     /// The managed record that goes away with the folders, if there is one.

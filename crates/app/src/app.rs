@@ -671,7 +671,16 @@ impl App {
     }
 
     pub fn pump_queue(&mut self) {
-        let started = self.queue.start_ready();
+        // What a removal or an update deletes goes by the records as they are when it starts,
+        // not when it was asked for: an install ahead of it may have come to share a folder.
+        let empty = BTreeMap::new();
+        let managed = self
+            .state
+            .current()
+            .map_or(&empty, |record| &record.managed);
+        let started = self
+            .queue
+            .start_ready_with(|op| ops::settle_folders(op, managed));
         if started.is_empty() {
             return;
         }

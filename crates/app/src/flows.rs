@@ -1355,6 +1355,40 @@ fn dominos_shares_a_folder_and_only_asks_about_it_once() {
 }
 
 #[test]
+fn a_removal_waiting_behind_a_sharing_install_leaves_the_shared_folder() {
+    let rig = Rig::new();
+    let masque = publish_addon(&rig.site, MASQUE, "Masque_Dominos", "1.0");
+    rig.site
+        .publish(&catalog_of(vec![masque, dominos(&rig.site, "1.0")]));
+    let mut h = rig.launch_settled();
+    click(&mut h, "Masque_Dominos Addon, 1.0");
+    click(&mut h, "Install");
+    finish_ops(&mut h);
+
+    // "Dominos includes it, so drop the separate one", asked while Dominos is on its way. The
+    // removal was planned when nobody else claimed the folder. Both go in before another
+    // frame, so the removal waits behind the install however quick that is.
+    app_mut(&mut h).ask_remove(&Selection::Addon(MASQUE.to_owned()));
+    let Some(Popup::Remove(plan)) = app_mut(&mut h).popup.take() else {
+        panic!("Remove asks first");
+    };
+    assert_eq!(plan.folders, ["Masque_Dominos"]);
+    let agreed = vec!["Masque_Dominos".to_owned()];
+    app_mut(&mut h).apply(Action::ReplaceAndInstall(DOMINOS.to_owned(), agreed));
+    app_mut(&mut h).apply(Action::ConfirmRemove(plan));
+    finish_ops(&mut h);
+    assert!(managed(&h, MASQUE).is_none());
+    assert_eq!(
+        managed(&h, DOMINOS).unwrap().folders,
+        ["Dominos", "Masque_Dominos"]
+    );
+    assert!(
+        rig.addons().join("Masque_Dominos").exists(),
+        "Dominos still claims it"
+    );
+}
+
+#[test]
 fn a_shared_folder_the_zip_did_not_bring_is_only_asked_about_once() {
     // The catalog keeps one list of folders per addon, so a build can have fewer than it says.
     let rig = Rig::new();

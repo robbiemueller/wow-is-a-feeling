@@ -188,14 +188,24 @@ impl Queue {
         self.waiting.push_back(op);
     }
 
-    /// Every op that may start right now, each with the flag that cancels it.
+    #[cfg(test)]
     pub fn start_ready(&mut self) -> Vec<(Op, Arc<AtomicBool>)> {
+        self.start_ready_with(|_| {})
+    }
+
+    /// Every op that may start right now, each with the flag that cancels it. `settle` sees
+    /// each one first, so what it does can be decided at the last moment.
+    pub fn start_ready_with(
+        &mut self,
+        mut settle: impl FnMut(&mut Op),
+    ) -> Vec<(Op, Arc<AtomicBool>)> {
         let mut started = Vec::new();
         let mut index = 0;
         while index < self.waiting.len() {
             let op = &self.waiting[index];
             if self.can_start(index) {
-                let op = self.waiting.remove(index).expect("index was just checked");
+                let mut op = self.waiting.remove(index).expect("index was just checked");
+                settle(&mut op);
                 let cancel = Arc::new(AtomicBool::new(false));
                 started.push((op.clone(), cancel.clone()));
                 self.running.push(Running {
@@ -366,6 +376,29 @@ pub fn own_folders(id: &str, managed: &BTreeMap<String, ManagedAddon>) -> Vec<St
         })
         .cloned()
         .collect()
+}
+
+/// Decide what an op deletes now that it's starting, from the records as they are now. A
+/// removal or an update that waited behind an install could otherwise delete a folder that
+/// install has since come to share.
+pub fn settle_folders(op: &mut Op, managed: &BTreeMap<String, ManagedAddon>) {
+    match &mut op.kind {
+        OpKind::Download { old_folders, .. } | OpKind::Rollback { old_folders, .. } => {
+            *old_folders = own_folders(&op.addon_id, managed);
+        }
+        OpKind::Remove { folders } if managed.contains_key(&op.addon_id) => {
+            *folders = own_folders(&op.addon_id, managed);
+        }
+        // Folders nothing managed when the player asked, or an addon whose record has gone
+        // since: whatever a record claims by now isn't theirs to delete.
+        OpKind::Remove { folders } => {
+            folders.retain(|folder| {
+                let lower = folder.to_lowercase();
+                !managed.values().any(|record| claims(record, &lower))
+            });
+        }
+        _ => {}
+    }
 }
 
 /// A folder an install would replace that isn't this addon's.
@@ -980,6 +1013,79 @@ mod tests {
             "the main folder sorts first"
         );
         assert_eq!(listed_position(&listed, "Other"), usize::MAX);
+    }
+
+    #[test]
+    fn what_an_op_deletes_is_settled_from_the_records_when_it_starts() {
+        // Dominos landed while these waited, and shares Masque_Dominos now.
+        let managed: BTreeMap<String, ManagedAddon> = [
+            (
+                "d".to_owned(),
+                record("d", "1", &["Dominos", "Masque_Dominos"]),
+            ),
+            (
+                "m".to_owned(),
+                record("m", "1", &["Masque_Dominos", "Masque_Extra"]),
+            ),
+        ]
+        .into();
+        let settled = |addon_id: &str, kind: OpKind| {
+            let mut op = Op {
+                id: 1,
+                verb: Verb::Remove,
+                kind,
+                addon_id: addon_id.to_owned(),
+                name: String::new(),
+                folders: HashSet::new(),
+                after: None,
+                exclusive: false,
+            };
+            settle_folders(&mut op, &managed);
+            op.kind
+        };
+        let both = || vec!["Masque_Dominos".to_owned(), "Masque_Extra".to_owned()];
+
+        let removal = settled("m", OpKind::Remove { folders: both() });
+        assert!(
+            matches!(&removal, OpKind::Remove { folders } if folders == &["Masque_Extra"]),
+            "planned before Dominos had a record: {removal:?}"
+        );
+        let update = settled(
+            "m",
+            OpKind::Download {
+                release: Release::default(),
+                channel: Channel::Stable,
+                origin: Origin::Catalog,
+                old_folders: both(),
+                may_replace: both(),
+            },
+        );
+        assert!(
+            matches!(&update, OpKind::Download { old_folders, may_replace, .. }
+                if old_folders == &["Masque_Extra"] && may_replace == &both()),
+            "a zip without it no longer deletes it, and may still replace it: {update:?}"
+        );
+        let rollback = settled(
+            "m",
+            OpKind::Rollback {
+                zip: PathBuf::from("zips/0.9.zip"),
+                version: "0.9".to_owned(),
+                channel: Channel::Stable,
+                origin: Origin::Catalog,
+                old_folders: both(),
+            },
+        );
+        assert!(
+            matches!(&rollback, OpKind::Rollback { old_folders, .. } if old_folders == &["Masque_Extra"]),
+            "{rollback:?}"
+        );
+        // Unmanaged folders: one a record has claimed since isn't the player's to delete now.
+        let loose = vec!["masque_dominos".to_owned(), "Loose".to_owned()];
+        let other = settled("other:Loose", OpKind::Remove { folders: loose });
+        assert!(
+            matches!(&other, OpKind::Remove { folders } if folders == &["Loose"]),
+            "{other:?}"
+        );
     }
 
     #[test]
