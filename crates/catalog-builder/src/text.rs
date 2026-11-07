@@ -15,6 +15,7 @@ pub fn normalize(text: &str) -> String {
 /// `Questie`. For telling whether two addons would pass for each other, never for display.
 pub fn fold_name(text: &str) -> String {
     text.chars()
+        .map(plain_form)
         .filter(|c| c.is_alphanumeric())
         .flat_map(fold_letter)
         .collect()
@@ -23,7 +24,83 @@ pub fn fold_name(text: &str) -> String {
 /// A folder name with the same look-alikes folded, keeping its punctuation: `Foo_Bar`
 /// and `FooBar` are different folders on disk, however alike they read.
 pub fn fold_folder(text: &str) -> String {
-    text.chars().flat_map(fold_letter).collect()
+    text.chars().map(plain_form).flat_map(fold_letter).collect()
+}
+
+/// A letter or digit drawn in a style, as the plain one: the mathematical bold, italic,
+/// script, fraktur, double-struck, sans-serif and monospace alphabets, the letterlike
+/// symbols that stand in for a few of their letters, circled, parenthesized and squared
+/// letters, and small capitals. A name written in any of them reads as the plain name.
+fn plain_form(c: char) -> char {
+    let code = u32::from(c);
+    let nth = |first: char, at: u32| char::from_u32(u32::from(first) + at).unwrap_or(c);
+    match code {
+        // Thirteen styles in a row, each A to Z and then a to z.
+        0x1D400..=0x1D6A3 => match (code - 0x1D400) % 52 {
+            at @ 0..=25 => nth('A', at),
+            at => nth('a', at - 26),
+        },
+        0x1D6A4 => 'i',
+        0x1D6A5 => 'j',
+        // Five styles of Greek, each 25 capitals, a nabla, 25 small letters and 7 symbols.
+        0x1D6A8..=0x1D7C9 => match (code - 0x1D6A8) % 58 {
+            17 => 'Θ',
+            at @ 0..=24 => nth('Α', at),
+            at @ 26..=50 => nth('α', at - 26),
+            _ => c,
+        },
+        // Five styles of 0 to 9.
+        0x1D7CE..=0x1D7FF => nth('0', (code - 0x1D7CE) % 10),
+        0x2460..=0x2468 => nth('1', code - 0x2460),
+        0x24EA => '0',
+        0x249C..=0x24B5 => nth('a', code - 0x249C),
+        0x24B6..=0x24CF => nth('A', code - 0x24B6),
+        0x24D0..=0x24E9 => nth('a', code - 0x24D0),
+        // Parenthesized, squared, negative circled and negative squared capitals.
+        0x1F110..=0x1F189 if (code - 0x1F110) % 32 < 26 => nth('A', (code - 0x1F110) % 32),
+        _ => match c {
+            'ℬ' => 'B',
+            'ℂ' | 'ℭ' => 'C',
+            'ⅅ' => 'D',
+            'ℰ' => 'E',
+            'ℱ' => 'F',
+            'ℋ' | 'ℌ' | 'ℍ' => 'H',
+            'ℐ' | 'ℑ' => 'I',
+            'ℒ' => 'L',
+            'ℳ' => 'M',
+            'ℕ' => 'N',
+            'ℙ' => 'P',
+            'ℚ' => 'Q',
+            'ℛ' | 'ℜ' | 'ℝ' => 'R',
+            'ℤ' | 'ℨ' => 'Z',
+            'ᴀ' => 'a',
+            'ʙ' => 'b',
+            'ᴄ' => 'c',
+            'ⅆ' | 'ᴅ' => 'd',
+            'ℯ' | 'ⅇ' | 'ᴇ' => 'e',
+            'ꜰ' => 'f',
+            'ℊ' | 'ɢ' => 'g',
+            'ℎ' | 'ℏ' | 'ʜ' => 'h',
+            'ℹ' | 'ⅈ' | 'ɪ' => 'i',
+            'ⅉ' | 'ᴊ' => 'j',
+            'ᴋ' => 'k',
+            'ℓ' | 'ʟ' => 'l',
+            'ᴍ' => 'm',
+            'ɴ' => 'n',
+            'ℴ' | 'ᴏ' => 'o',
+            'ᴘ' => 'p',
+            'ǫ' => 'q',
+            'ʀ' => 'r',
+            'ꜱ' => 's',
+            'ᴛ' => 't',
+            'ᴜ' => 'u',
+            'ᴠ' => 'v',
+            'ᴡ' => 'w',
+            'ʏ' => 'y',
+            'ᴢ' => 'z',
+            other => other,
+        },
+    }
 }
 
 fn fold_letter(c: char) -> impl Iterator<Item = char> {
@@ -481,6 +558,71 @@ mod tests {
         assert_ne!(fold_name("Questie Reloaded"), "questie");
         assert_ne!(fold_name("Bagnon"), fold_name("Baganator"));
         assert_eq!(fold_name("--!!"), "", "nothing left to compare");
+    }
+
+    /// `plain` written in a style whose capitals start at `capitals` and small letters at `small`.
+    fn styled(plain: &str, capitals: u32, small: u32) -> String {
+        plain
+            .chars()
+            .map(|c| {
+                let (start, first) = if c.is_ascii_uppercase() {
+                    (capitals, 'A')
+                } else {
+                    (small, 'a')
+                };
+                char::from_u32(start + u32::from(c) - u32::from(first)).unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn folding_sees_through_letters_written_in_a_style() {
+        let mut same = vec![
+            styled("Questie", 0x1D400, 0x1D41A), // bold
+            styled("Questie", 0x1D434, 0x1D44E), // italic
+            styled("Questie", 0x1D468, 0x1D482), // bold italic
+            styled("Questie", 0x1D504, 0x1D51E), // fraktur
+            styled("Questie", 0x1D5A0, 0x1D5BA), // sans-serif
+            styled("Questie", 0x1D63C, 0x1D656), // sans-serif bold italic
+            styled("Questie", 0x1D670, 0x1D68A), // monospace
+            styled("QUESTIE", 0x24B6, 0x24D0),   // circled
+            styled("questie", 0x249C, 0x249C),   // parenthesized
+            styled("QUESTIE", 0x1F130, 0x1F130), // squared
+            styled("QUESTIE", 0x1F170, 0x1F170), // negative squared
+        ];
+        // Script and double-struck borrow some letters from the letterlike symbols.
+        same.push("\u{1D4AC}\u{1D4CA}\u{212F}\u{1D4C8}\u{1D4C9}\u{1D4BE}\u{212F}".into());
+        same.push(format!("\u{211A}{}", styled("uestie", 0, 0x1D552)));
+        // Small capitals.
+        same.push("\u{01EB}\u{1D1C}\u{1D07}\u{A731}\u{1D1B}\u{026A}\u{1D07}".into());
+        for name in &same {
+            assert_eq!(fold_name(name), "questie", "{name}");
+            assert_eq!(fold_folder(name), "questie", "{name}");
+        }
+        assert_eq!(
+            fold_name("Bartender\u{1D7D2}"),
+            "bartender4",
+            "a bold digit"
+        );
+        assert_eq!(
+            fold_name("Bartender\u{2463}"),
+            "bartender4",
+            "a circled digit"
+        );
+        assert_eq!(
+            fold_name("\u{1D6A8}\u{1D6BB}\u{1D6B1}\u{1D6A8}"),
+            "atka",
+            "bold Greek capitals"
+        );
+        assert_eq!(
+            fold_name("\u{2113}ib\u{210E}"),
+            "libh",
+            "a script l and an italic h"
+        );
+        assert_ne!(
+            fold_name(&styled("Bagnon", 0x1D400, 0x1D41A)),
+            fold_name("Baganator")
+        );
     }
 
     #[test]

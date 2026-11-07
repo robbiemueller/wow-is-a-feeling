@@ -117,6 +117,81 @@ fn with_wowi_id(mut candidate: Candidate, id: &str) -> Candidate {
     candidate
 }
 
+/// A new upload to WoWInterface, which its light moderation let through.
+fn listing(id: u64, title: &str, folders: &[&str]) -> Candidate {
+    let addon = Addon {
+        id: format!("wowi:{id}"),
+        name: title.into(),
+        author: "uploader".into(),
+        source: Source::Wowi { id },
+        stable: Some(Release {
+            version: "1.0".into(),
+            url: format!("https://cdn.wowinterface.com/downloads/getfile.php?id={id}"),
+            date: NOW,
+            ..Release::default()
+        }),
+        folders: folders.iter().map(|f| f.to_string()).collect(),
+        ids: feeling_core::catalog::ExternalIds {
+            wowi: Some(id.to_string()),
+            ..Default::default()
+        },
+        downloads: 1,
+        ..Addon::default()
+    };
+    Candidate {
+        addon,
+        ..Candidate::default()
+    }
+}
+
+/// A folder that listed addons require, nothing listed provides and nothing reserves, with
+/// the addons that require it: the gap a squatter would aim for. None of those addons is
+/// hand-picked, so the pass gets to a squatter older than them before it gets to them. The
+/// one whose requirers have the most downloads, so the replay always picks the same one.
+fn open_dependency(
+    catalog: &Catalog,
+    curated: &Curated,
+    picks: &HandPicked,
+) -> (String, Vec<String>) {
+    let lower = |folder: &str| folder.to_ascii_lowercase();
+    let provided: BTreeSet<String> = catalog
+        .addons
+        .iter()
+        .flat_map(|a| a.folders.iter().map(|f| lower(f)))
+        .collect();
+    let reserved: BTreeSet<String> = curated
+        .gaps
+        .iter()
+        .flat_map(|gap| gap.folders.iter())
+        .chain(curated.reserved.iter())
+        .map(|f| lower(f))
+        .collect();
+    let mut needed: BTreeMap<String, (u64, String, Vec<String>)> = BTreeMap::new();
+    let mut chosen_need: BTreeSet<String> = BTreeSet::new();
+    for addon in &catalog.addons {
+        for dep in &addon.deps {
+            let key = lower(dep);
+            if provided.contains(&key) || reserved.contains(&key) || key.starts_with("blizzard_") {
+                continue;
+            }
+            if picks.contains(&addon.id) {
+                chosen_need.insert(key.clone());
+            }
+            let entry = needed
+                .entry(key)
+                .or_insert_with(|| (0, dep.clone(), vec![]));
+            entry.0 += addon.downloads;
+            entry.2.push(addon.id.clone());
+        }
+    }
+    let (_, (_, folder, requirers)) = needed
+        .into_iter()
+        .filter(|(key, _)| !chosen_need.contains(key))
+        .max_by(|a, b| a.1.0.cmp(&b.1.0).then_with(|| b.0.cmp(&a.0)))
+        .expect("some listed addon requires a folder nothing provides");
+    (folder, requirers)
+}
+
 struct Outcome {
     published: Published,
     picks: HandPicked,
@@ -141,7 +216,12 @@ fn run(
 ) -> Result<Outcome, String> {
     let picks = HandPicked::new(&real.seeds, &real.curated);
     let mut input = scanned(&real.state);
-    input.repos.extend(extra);
+    for candidate in extra {
+        match candidate.addon.source {
+            Source::Wowi { .. } => input.wowi.push(candidate),
+            _ => input.repos.push(candidate),
+        }
+    }
     edit(&mut input);
     let settled = settle(input, &real.curated, &picks, Some(previous), NOW);
     let dir = tempfile::tempdir().unwrap();
@@ -275,8 +355,9 @@ fn replay_real_data_with_nobody_attacking() {
         .iter()
         .filter(|a| outcome.picks.contains(&a.id))
         .count();
+    let reviewed = new.addons.iter().filter(|a| a.reviewed).count();
     println!(
-        "trusted {trusted}, baseline age {baseline}, hand-picked {picked}, of {}",
+        "trusted {trusted}, reviewed {reviewed}, baseline age {baseline}, hand-picked {picked}, of {}",
         new.addons.len()
     );
     println!(
@@ -297,6 +378,12 @@ fn replay_real_data_with_nobody_attacking() {
     assert!(
         new.addons.iter().all(|a| a.trusted),
         "all of today is established"
+    );
+    assert!(
+        new.addons
+            .iter()
+            .all(|a| a.reviewed == outcome.picks.contains(&a.id)),
+        "reviewed means hand-picked"
     );
     let wrong_tiers = changes.get("tier").map_or(0, Vec::len);
     assert!(wrong_tiers < 10, "tiers moved: {wrong_tiers}");
@@ -337,6 +424,7 @@ fn harmless(outcome: &Outcome, id: &str) -> String {
         .listed(id)
         .unwrap_or_else(|| panic!("{id} should be listed under its own name"));
     assert!(!addon.trusted, "{id} must not be picked by the app");
+    assert!(!addon.reviewed, "{id} must never fill a dependency");
     assert!(addon.ids.is_empty(), "{id} keeps no ids");
     assert!(addon.downloads < 100_000, "{id} borrowed counts");
     format!(
@@ -416,6 +504,18 @@ fn replay_real_data_with_each_attack() {
             4_000_000,
         )],
         |o| held_because(o, "gh:zebra/Questie-A"),
+    );
+    check(
+        &real,
+        &baseline,
+        "A Questie look-alike in mathematical bold",
+        vec![repo(
+            "zebra/Questie-C",
+            "\u{1D410}\u{1D42E}\u{1D41E}\u{1D42C}\u{1D42D}\u{1D422}\u{1D41E}",
+            &["QuestieX"],
+            1,
+        )],
+        |o| held_because(o, "gh:zebra/Questie-C"),
     );
     check(
         &real,
@@ -556,6 +656,49 @@ fn replay_real_data_with_each_attack() {
         |o| held_because(o, "gh:zebra/CoolPins"),
     );
 
+    // Squatting a dependency: shipping a folder listed addons require and nothing provides,
+    // so that once trusted, the app would install it by itself for them.
+    let (gap, requirers) = open_dependency(&clean.published.catalog, &real.curated, &clean.picks);
+    println!(
+        "A folder {} listed addons require and nothing provides: {gap}",
+        requirers.len()
+    );
+    check(
+        &real,
+        &baseline,
+        "A new repository shipping that folder",
+        vec![repo(
+            "zebra/Handy",
+            "Handy Helpers",
+            &["HandyHelpers", &gap],
+            1,
+        )],
+        |o| held_because(o, "gh:zebra/Handy"),
+    );
+    check(
+        &real,
+        &baseline,
+        "A new WoWInterface upload shipping that folder",
+        vec![listing(
+            99_999_001,
+            "Handy Helpers",
+            &["HandyHelpers", &gap],
+        )],
+        |o| held_because(o, "wowi:99999001"),
+    );
+    check(
+        &real,
+        &baseline,
+        "A new repository shipping a library before anything requires it",
+        vec![repo(
+            "zebra/LibFuture",
+            "LibFuture-1.0",
+            &["LibFuture-1.0"],
+            1,
+        )],
+        |o| harmless(o, "gh:zebra/LibFuture"),
+    );
+
     // Two more that need the last catalog to say something different.
     let sleeper_id = "gh:paradosi/ForeverQuestItemBar";
     let target_id = "gh:peavers-warcraft/PeaversCommons";
@@ -614,6 +757,40 @@ fn replay_real_data_with_each_attack() {
     assert_eq!(addon.created, NOW);
     assert!(!addon.trusted);
     println!("A sleeper retitled to a name nobody has: listed, age reset, not trusted");
+
+    // The folder nothing provides, from an entry that's been listed all along.
+    let is_requirer = |id: &str| requirers.iter().any(|r| r.eq_ignore_ascii_case(id));
+    assert!(!is_requirer(sleeper_id));
+    let ships_the_gap = |input: &mut Scanned| {
+        let entry = input
+            .repos
+            .iter_mut()
+            .find(|c| c.addon.id == sleeper_id)
+            .unwrap();
+        entry.addon.folders.push(gap.clone());
+    };
+    let established = run(&real, vec![], &real.previous, ships_the_gap).unwrap();
+    println!(
+        "An established addon starting to ship that folder: {}",
+        held_because(&established, sleeper_id)
+    );
+    // Older than every addon that requires the folder, so the pass gets to it first.
+    let mut younger_requirers = real.previous.clone();
+    for addon in &mut younger_requirers.addons {
+        addon.created = match addon.id.as_str() {
+            id if id == sleeper_id => NOW - 120 * DAY,
+            id if is_requirer(id) => NOW - 30 * DAY,
+            _ => 0,
+        };
+    }
+    let ahead = run(&real, vec![], &younger_requirers, ships_the_gap).unwrap();
+    println!(
+        "An older addon starting to ship a younger addon's missing folder: {}",
+        held_because(&ahead, sleeper_id)
+    );
+    for id in &requirers {
+        assert!(ahead.listed(id).is_some(), "{id} stays listed");
+    }
 
     // A flood: many repositories, each with its own name.
     let flood: Vec<Candidate> = (0..60)
@@ -700,4 +877,80 @@ fn replay_real_data_with_each_attack() {
             println!("Losing the scan cache, with 300 repositories left: refused, {problem}")
         }
     }
+}
+
+/// Which of today's dependency links the app would stop filling by itself once it only
+/// installs a reviewed entry as a dependency, and the unreviewed providers that matter most,
+/// so a maintainer knows what to seed.
+#[test]
+#[ignore = "needs the real catalog data, see the top of this file"]
+fn replay_real_data_dependency_links() {
+    use feeling_core::deps::{FolderIndex, best_provider};
+
+    let real = load();
+    let outcome = run(&real, vec![], &real.previous, without_changes).unwrap();
+    let today = &outcome.published.catalog;
+    // Each copy sets both flags, so this holds whichever one `best_provider` goes by.
+    let allowing = |reviewed_only: bool| {
+        let mut catalog = today.clone();
+        for addon in &mut catalog.addons {
+            let may = if reviewed_only {
+                addon.reviewed
+            } else {
+                addon.trusted
+            };
+            (addon.trusted, addon.reviewed) = (may, may);
+        }
+        catalog
+    };
+    let (before, after) = (allowing(false), allowing(true));
+    let index = FolderIndex::build(today);
+
+    let (mut links, mut unfilled, mut same, mut other) = (0, 0, 0, 0);
+    let mut lost: BTreeMap<usize, (u64, Vec<&str>, BTreeSet<&str>)> = BTreeMap::new();
+    for addon in &today.addons {
+        let own: BTreeSet<String> = addon.folders.iter().map(|f| f.to_lowercase()).collect();
+        for dep in &addon.deps {
+            let folder = dep.to_lowercase();
+            if folder.starts_with("blizzard_") || own.contains(&folder) {
+                continue;
+            }
+            links += 1;
+            match (
+                best_provider(&folder, &before, &index),
+                best_provider(&folder, &after, &index),
+            ) {
+                (None, _) => unfilled += 1,
+                (Some(was), Some(will)) if was == will => same += 1,
+                (Some(_), Some(_)) => other += 1,
+                (Some(was), None) => {
+                    let row = lost.entry(was).or_default();
+                    row.0 += addon.downloads;
+                    row.1.push(&addon.id);
+                    row.2.insert(dep);
+                }
+            }
+        }
+    }
+    let gone: usize = lost.values().map(|row| row.1.len()).sum();
+    println!("dependency links: {links}, of which nothing trusted provides {unfilled} today");
+    println!("  still installed by themselves: {same} from the same entry, {other} from another");
+    println!(
+        "  no longer installed by themselves: {gone}, from {} providers nobody reviewed",
+        lost.len()
+    );
+    let mut ranked: Vec<_> = lost.into_iter().collect();
+    ranked.sort_by(|a, b| b.1.0.cmp(&a.1.0).then_with(|| a.0.cmp(&b.0)));
+    println!("  by downloads of the addons that need them:");
+    for (at, (downloads, needers, folders)) in ranked.iter().take(15) {
+        let provider = &today.addons[*at];
+        println!(
+            "    {} ({} downloads) for {folders:?}: {} addons with {downloads} downloads, such as {}",
+            provider.id,
+            provider.downloads,
+            needers.len(),
+            needers[0]
+        );
+    }
+    assert_eq!(same + other + gone + unfilled, links);
 }

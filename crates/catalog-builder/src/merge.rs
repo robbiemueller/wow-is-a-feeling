@@ -325,8 +325,6 @@ struct Ledger {
     names: HashMap<String, Vec<usize>>,
     folders: HashMap<String, Vec<usize>>,
     per_owner: HashMap<String, usize>,
-    /// Folders that entries kept so far require, folded.
-    required: HashSet<String>,
 }
 
 impl Ledger {
@@ -342,8 +340,6 @@ impl Ledger {
                 .or_default()
                 .push(at);
         }
-        self.required
-            .extend(candidate.addon.deps.iter().map(|dep| fold_folder(dep)));
         if let Some(owner) = owner_of(&candidate)
             && !picks.contains(&candidate.addon.id)
         {
@@ -410,25 +406,6 @@ impl Ledger {
         None
     }
 
-    /// A folder that listed addons require and nothing provides yet is the easiest one to
-    /// squat: once a newcomer was trusted, the app would install it as a dependency. So only
-    /// something already listed with that folder, a listing or a hand-picked repo may fill it.
-    fn squats_a_dependency(&self, candidate: &Candidate, last: &LastCatalog) -> Option<String> {
-        if is_baseline(candidate) || is_listing(candidate) {
-            return None;
-        }
-        candidate.addon.folders.iter().find_map(|folder| {
-            let folded = fold_folder(folder);
-            let fills_a_gap =
-                self.required.contains(&folded) && !self.folders.contains_key(&folded);
-            (fills_a_gap && !last.had_folder(&candidate.addon.id, &folded)).then(|| {
-                format!(
-                    "it would be the first to provide {folder}, which addons already listed require"
-                )
-            })
-        })
-    }
-
     fn at(&self, places: Option<&Vec<usize>>) -> Vec<&Candidate> {
         places
             .into_iter()
@@ -443,6 +420,8 @@ impl Ledger {
 struct LastCatalog<'a> {
     folders_of: HashMap<String, HashSet<String>>,
     owners_of: HashMap<String, Vec<&'a str>>,
+    /// Folders its addons require, folded.
+    required: HashSet<String>,
 }
 
 impl<'a> LastCatalog<'a> {
@@ -458,6 +437,8 @@ impl<'a> LastCatalog<'a> {
             }
             last.folders_of
                 .insert(addon.id.to_ascii_lowercase(), folders);
+            last.required
+                .extend(addon.deps.iter().map(|dep| fold_folder(dep)));
         }
         last
     }
@@ -467,6 +448,22 @@ impl<'a> LastCatalog<'a> {
         self.folders_of
             .get(&id.to_ascii_lowercase())
             .is_some_and(|folders| folders.contains(folded))
+    }
+
+    /// Folders the last catalog's addons require that nothing still provides: no entry
+    /// listed with the folder then still ships it now. Worked out once, before the pass, so
+    /// neither the order of the pass nor a newcomer's own requirements can change it.
+    fn open_dependencies(&self, candidates: &[Candidate]) -> HashSet<String> {
+        let mut open = self.required.clone();
+        for candidate in candidates {
+            for folder in &candidate.addon.folders {
+                let folded = fold_folder(folder);
+                if self.had_folder(&candidate.addon.id, &folded) {
+                    open.remove(&folded);
+                }
+            }
+        }
+        open
     }
 
     /// For an entry that was already listed: a folder it has only now added, which another
@@ -500,6 +497,21 @@ impl<'a> LastCatalog<'a> {
     }
 }
 
+/// A folder that listed addons require and nothing provides is the easiest one to squat:
+/// once whatever ships it was trusted, the app would install it as a dependency. So only
+/// something already listed with that folder, or something hand-picked, may fill it. Being
+/// old doesn't count, and neither does being a WoWInterface listing: either can start
+/// shipping any folder it likes in its next upload.
+fn squats_a_dependency(candidate: &Candidate, open: &HashSet<String>) -> Option<String> {
+    candidate.addon.folders.iter().find_map(|folder| {
+        open.contains(&fold_folder(folder)).then(|| {
+            format!(
+                "it would be the first to provide {folder}, which addons already listed require"
+            )
+        })
+    })
+}
+
 /// Settle who gets what. Candidates go in order, hand-picked first and then oldest, each
 /// claiming its name and folders. One whose name or main folder is already taken is held
 /// out of the catalog, and so is one with a side folder taken by something strictly ahead
@@ -531,6 +543,7 @@ pub fn hold_collisions(
     });
 
     let last = LastCatalog::new(rules.previous);
+    let open = last.open_dependencies(&ordered);
     let mut ledger = Ledger::default();
     let mut held = Vec::new();
     for candidate in ordered {
@@ -543,7 +556,7 @@ pub fn hold_collisions(
             .or_else(|| ledger.conflict(&candidate, picks))
             .or_else(|| {
                 (!picks.contains(&candidate.addon.id))
-                    .then(|| ledger.squats_a_dependency(&candidate, &last))
+                    .then(|| squats_a_dependency(&candidate, &open))
                     .flatten()
             });
         match problem {
@@ -559,6 +572,8 @@ pub fn hold_collisions(
 /// anything that has kept its name for two weeks. Everything else is a stranger's new repo
 /// and only gets installed when a player asks for it, and its ids on other sites are only
 /// claims, so they go. Among what's left, an id belongs to whoever got there first.
+/// Only what a person chose is reviewed, which is what it takes to be installed as another
+/// addon's dependency: any addon can ship a library's folder long before anything needs it.
 /// `candidates` must be in the collision pass's order.
 pub fn settle_trust(
     candidates: &mut [Candidate],
@@ -587,7 +602,8 @@ pub fn settle_trust(
 
     for candidate in candidates.iter_mut() {
         let addon = &mut candidate.addon;
-        addon.trusted = picks.contains(&addon.id)
+        addon.reviewed = picks.contains(&addon.id);
+        addon.trusted = addon.reviewed
             || matches!(addon.source, Source::Wowi { .. })
             || now - addon.created >= TRUST_AFTER_SECS;
         if !addon.trusted {
@@ -724,11 +740,7 @@ mod tests {
         assert_eq!(held_ids(&held), ["gh:stranger/LibMissing"]);
         assert_eq!(ids(&kept), ["gh:someone/NeedsLib"]);
 
-        // A listing or a hand-picked repo still can, and so can anything once a provider exists.
-        let listing = wowi(42, "LibMissing", &["LibMissing"]);
-        let (kept, held) = pass(vec![needs.clone(), listing], &picks(&[]), Some(&before));
-        assert!(held.is_empty(), "{:?}", held_ids(&held));
-        assert_eq!(kept.len(), 2);
+        // A hand-picked repo or listing still can.
         let chosen = gh("trusted/LibMissing", &["LibMissing"]);
         let (_, held) = pass(
             vec![needs.clone(), chosen],
@@ -736,11 +748,74 @@ mod tests {
             Some(&before),
         );
         assert!(held.is_empty(), "{:?}", held_ids(&held));
+        let seeded = wowi(42, "LibMissing", &["LibMissing"]);
+        let (_, held) = pass(vec![needs.clone(), seeded], &picks(&["42"]), Some(&before));
+        assert!(held.is_empty(), "{:?}", held_ids(&held));
 
         // Something already listed with that folder keeps it, however young.
         let young = gh("someone/LibMissing", &["LibMissing"]);
         let before = published(&[(&needs, 0), (&young, NOW - 3 * DAY)]);
         let (kept, held) = pass(vec![needs, young], &picks(&[]), Some(&before));
+        assert!(held.is_empty(), "{:?}", held_ids(&held));
+        assert_eq!(kept.len(), 2);
+    }
+
+    #[test]
+    fn a_listing_cannot_be_the_first_to_fill_a_dependency_either() {
+        let mut needs = gh("someone/NeedsLib", &["NeedsLib"]);
+        needs.addon.deps = vec!["LibMissing".into()];
+        let before = published(&[(&needs, 0)]);
+        let listing = wowi(42, "Harmless Bags", &["HarmlessBags", "LibMissing"]);
+        let (kept, held) = pass(vec![needs, listing], &picks(&[]), Some(&before));
+        assert_eq!(held_ids(&held), ["wowi:42"]);
+        assert!(held[0].reason.contains("LibMissing"), "{}", held[0].reason);
+        assert_eq!(ids(&kept), ["gh:someone/NeedsLib"]);
+    }
+
+    #[test]
+    fn an_established_entry_cannot_start_providing_a_dependency() {
+        let mut needs = gh("someone/NeedsLib", &["NeedsLib"]);
+        needs.addon.deps = vec!["LibMissing".into()];
+        let helper = named(gh("zebra/Helpers", &["Helpers"]), "Helpers");
+        let grown = named(gh("zebra/Helpers", &["Helpers", "LibMissing"]), "Helpers");
+        // From before ages were kept, and older than the addon that needs the folder, which
+        // also puts it first in the pass.
+        for (helper_age, needs_age) in [(0, 0), (NOW - 120 * DAY, NOW - 30 * DAY)] {
+            let before = published(&[(&needs, needs_age), (&helper, helper_age)]);
+            let (kept, held) = pass(
+                vec![grown.clone(), needs.clone()],
+                &picks(&[]),
+                Some(&before),
+            );
+            assert_eq!(held_ids(&held), ["gh:zebra/Helpers"], "{helper_age}");
+            assert!(
+                held[0].reason.contains("first to provide"),
+                "{}",
+                held[0].reason
+            );
+            assert_eq!(ids(&kept), ["gh:someone/NeedsLib"]);
+        }
+    }
+
+    #[test]
+    fn a_provider_that_left_doesnt_open_its_folder_to_a_newcomer() {
+        let mut needs = gh("someone/NeedsLib", &["NeedsLib"]);
+        needs.addon.deps = vec!["LibThing".into()];
+        let gone = gh("author/LibThing", &["LibThing"]);
+        let before = published(&[(&needs, 0), (&gone, 0)]);
+        let squatter = gh("stranger/LibThing", &["LibThing"]);
+        let (_, held) = pass(vec![needs, squatter], &picks(&[]), Some(&before));
+        assert_eq!(held_ids(&held), ["gh:stranger/LibThing"]);
+    }
+
+    #[test]
+    fn a_newcomer_requiring_a_folder_doesnt_hold_whatever_ships_it_next() {
+        let lib = named(gh("author/Thing", &["Thing"]), "Thing");
+        let before = published(&[(&lib, 0)]);
+        let grown = named(gh("author/Thing", &["Thing", "Thing_Lib"]), "Thing");
+        let mut griefer = gh("zebra/Wants", &["Wants"]);
+        griefer.addon.deps = vec!["Thing_Lib".into()];
+        let (kept, held) = pass(vec![griefer, grown], &picks(&[]), Some(&before));
         assert!(held.is_empty(), "{:?}", held_ids(&held));
         assert_eq!(kept.len(), 2);
     }
@@ -1346,6 +1421,52 @@ mod tests {
             .map(|c| c.addon.id.as_str())
             .collect();
         assert_eq!(trusted, ["gh:a/Chosen", "wowi:9", "gh:a/Old", "gh:a/Older"]);
+    }
+
+    #[test]
+    fn only_what_a_person_chose_is_reviewed() {
+        let curated = Curated {
+            featured: vec!["gh:a/Featured".into()],
+            merges: [("77".to_string(), "a/Paired".to_string())].into(),
+            ..Curated::default()
+        };
+        let seeds = Seeds {
+            repos: vec!["a/Seeded".into()],
+            wowi: vec![9],
+        };
+        let out = trust(
+            vec![
+                aged(gh("a/Seeded", &["A"]), 0),
+                aged(wowi(9, "Seeded Listing", &["B"]), 0),
+                aged(gh("a/Featured", &["C"]), 0),
+                aged(gh("a/Paired", &["D"]), 0),
+                aged(wowi(77, "Paired Listing", &["E"]), 0),
+                aged(wowi(10, "Listing", &["F"]), 0),
+                aged(gh("a/Older", &["G"]), 400),
+                aged(gh("a/New", &["H"]), 0),
+            ],
+            &HandPicked::new(&seeds, &curated),
+            &[],
+        );
+        let reviewed: Vec<&str> = out
+            .iter()
+            .filter(|c| c.addon.reviewed)
+            .map(|c| c.addon.id.as_str())
+            .collect();
+        assert_eq!(
+            reviewed,
+            [
+                "gh:a/Seeded",
+                "wowi:9",
+                "gh:a/Featured",
+                "gh:a/Paired",
+                "wowi:77"
+            ]
+        );
+        assert!(
+            out.iter().all(|c| c.addon.trusted || !c.addon.reviewed),
+            "reviewed is trusted too"
+        );
     }
 
     #[test]
