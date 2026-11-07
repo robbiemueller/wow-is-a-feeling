@@ -268,6 +268,14 @@ fn attach_packs(catalog: &mut Catalog, specs: &[PackSpec], warnings: &mut Vec<St
         .iter()
         .map(|addon| (addon.id.to_ascii_lowercase(), addon.id.clone()))
         .collect();
+    let own_folders: BTreeMap<String, Vec<String>> = catalog
+        .addons
+        .iter()
+        .map(|addon| {
+            let folders = addon.folders.iter().map(|f| f.to_lowercase()).collect();
+            (addon.id.to_ascii_lowercase(), folders)
+        })
+        .collect();
     let mut groups: BTreeMap<String, Vec<PackGroup>> = BTreeMap::new();
     for spec in specs {
         let name = spec.name.trim();
@@ -293,6 +301,20 @@ fn attach_packs(catalog: &mut Catalog, specs: &[PackSpec], warnings: &mut Vec<St
             ));
             continue;
         }
+        // The addon's own folders would meet its own group, and hide that nothing else does.
+        let own = own_folders
+            .get(&addon.to_ascii_lowercase())
+            .map_or(&[][..], Vec::as_slice);
+        let mut met_by = Vec::with_capacity(spec.met_by.len());
+        for prefix in &spec.met_by {
+            let lower = prefix.to_lowercase();
+            match own.iter().find(|folder| folder.starts_with(&lower)) {
+                Some(folder) => warnings.push(format!(
+                    "packs {name} for {addon}: met_by {prefix} matches its own folder {folder}, dropped it"
+                )),
+                None => met_by.push(prefix.clone()),
+            }
+        }
         groups
             .entry(addon.to_ascii_lowercase())
             .or_default()
@@ -300,7 +322,7 @@ fn attach_packs(catalog: &mut Catalog, specs: &[PackSpec], warnings: &mut Vec<St
                 name: name.to_string(),
                 needed: spec.needed,
                 ids,
-                met_by: spec.met_by.clone(),
+                met_by,
             });
     }
     for addon in &mut catalog.addons {
@@ -308,6 +330,44 @@ fn attach_packs(catalog: &mut Catalog, specs: &[PackSpec], warnings: &mut Vec<St
             .remove(&addon.id.to_ascii_lowercase())
             .unwrap_or_default();
     }
+}
+
+/// A former main folder vouches that an installed copy with that main folder is this addon, so
+/// it must never be a folder another entry ships now: that folder is the other addon's. Drops
+/// any such folder from `formerly`, ignoring case, and says which entry ships it.
+pub fn drop_formerly_others_ship<'a>(
+    addons: impl IntoIterator<Item = &'a mut Addon>,
+) -> Vec<String> {
+    let mut addons: Vec<&mut Addon> = addons.into_iter().collect();
+    let ids: Vec<String> = addons.iter().map(|addon| addon.id.clone()).collect();
+    let mut shipped_by: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    for (at, addon) in addons.iter().enumerate() {
+        for folder in &addon.folders {
+            shipped_by
+                .entry(folder.to_lowercase())
+                .or_default()
+                .push(at);
+        }
+    }
+    let mut dropped = Vec::new();
+    for (at, addon) in addons.iter_mut().enumerate() {
+        addon.formerly.retain(|folder| {
+            let other = shipped_by
+                .get(&folder.to_lowercase())
+                .and_then(|owners| owners.iter().find(|&&owner| owner != at));
+            match other {
+                Some(&owner) => {
+                    dropped.push(format!(
+                        "{} no longer vouches for {folder}, which {} ships",
+                        ids[at], ids[owner]
+                    ));
+                    false
+                }
+                None => true,
+            }
+        });
+    }
+    dropped
 }
 
 /// Check everything and fix what can be fixed. `Err` means don't publish.
@@ -337,6 +397,8 @@ pub fn run_gate(mut catalog: Catalog, context: &GateContext<'_>) -> Result<Passe
         true
     });
 
+    // The settle step already did this. Here it covers whatever reached the gate another way.
+    warnings.extend(drop_formerly_others_ship(&mut catalog.addons));
     let held = trim_to_size(
         &mut catalog,
         context.picks,
@@ -912,6 +974,67 @@ mod tests {
             ..Curated::default()
         };
         gate_with(c, &curated, &HandPicked::default(), None, &[]).unwrap()
+    }
+
+    #[test]
+    fn a_former_main_folder_another_entry_ships_is_never_vouched_for() {
+        let mut renamed = addon("gh:a/new", "NewName");
+        renamed.formerly = vec!["Questie".into(), "NewName_Old".into()];
+        let mut both = vec![renamed, addon("gh:questie/questie", "Questie")];
+        let dropped = drop_formerly_others_ship(&mut both);
+        assert_eq!(both[0].formerly, ["NewName_Old"]);
+        assert_eq!(
+            dropped,
+            ["gh:a/new no longer vouches for Questie, which gh:questie/questie ships"]
+        );
+        // A main folder it moved away from but still ships is its own, and stays vouched for.
+        let mut moved = addon("gh:a/hog", "HogTronUI");
+        moved.folders = vec!["HogTronUI".into(), "HogHeals".into()];
+        moved.formerly = vec!["HogHeals".into()];
+        let mut alone = vec![moved];
+        assert!(drop_formerly_others_ship(&mut alone).is_empty());
+        assert_eq!(alone[0].formerly, ["HogHeals"]);
+    }
+
+    #[test]
+    fn the_gate_drops_a_former_main_folder_another_entry_ships() {
+        let mut renamed = addon("gh:a/new", "NewName");
+        renamed.formerly = vec!["QUESTIE".into()];
+        let (out, warnings) = pass(catalog(vec![
+            renamed,
+            addon("gh:questie/questie", "Questie"),
+        ]));
+        assert!(out.addons[0].formerly.is_empty());
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("no longer vouches for QUESTIE")),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn a_met_by_prefix_its_own_addons_folders_match_is_dropped() {
+        let mut spec = group(
+            "gh:rusty-key/spoken-wow",
+            "Quest voices",
+            true,
+            &["gh:rusty-key/spoken-wow/quests-audio"],
+        );
+        spec.met_by = vec!["Spok".into(), "SpokenQuestsAudio".into()];
+        let passed = with_packs(spoken_and_packs(), vec![spec]);
+        assert_eq!(
+            passed.catalog.addons[0].packs[0].met_by,
+            ["SpokenQuestsAudio"]
+        );
+        assert!(
+            passed
+                .warnings
+                .iter()
+                .any(|w| w.contains("met_by Spok matches its own folder spoken")),
+            "{:?}",
+            passed.warnings
+        );
     }
 
     #[test]

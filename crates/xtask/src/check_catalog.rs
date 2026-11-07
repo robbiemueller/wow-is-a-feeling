@@ -123,6 +123,31 @@ fn static_problems(catalog: &Catalog) -> Vec<String> {
             }
         }
     }
+    problems.extend(formerly_shipped_elsewhere(catalog));
+    problems
+}
+
+/// A former main folder vouches that an installed copy with it is this addon, so it can never
+/// be a folder another entry ships: that folder is the other addon's.
+fn formerly_shipped_elsewhere(catalog: &Catalog) -> Vec<String> {
+    let mut problems = Vec::new();
+    for addon in &catalog.addons {
+        for folder in &addon.formerly {
+            let other = catalog.addons.iter().find(|other| {
+                other.id != addon.id
+                    && other
+                        .folders
+                        .iter()
+                        .any(|f| f.to_lowercase() == folder.to_lowercase())
+            });
+            if let Some(other) = other {
+                problems.push(format!(
+                    "{} lists {folder} as a former main folder, but {} ships it",
+                    addon.id, other.id
+                ));
+            }
+        }
+    }
     problems
 }
 
@@ -215,6 +240,18 @@ fn met_by_problems(addon: &Addon, group: &PackGroup) -> Vec<String> {
         if !is_folder_name(prefix) {
             problems.push(format!(
                 "{}'s {} packs have a met_by prefix that can't start a folder name: {prefix:?}",
+                addon.id, group.name
+            ));
+        }
+        // The addon's own folders would meet its own group, and hide that nothing else does.
+        let lower = prefix.to_lowercase();
+        if let Some(own) = addon
+            .folders
+            .iter()
+            .find(|folder| folder.to_lowercase().starts_with(&lower))
+        {
+            problems.push(format!(
+                "{}'s {} packs have a met_by prefix, {prefix}, that its own folder {own} matches",
                 addon.id, group.name
             ));
         }
@@ -388,6 +425,40 @@ mod tests {
     }
 
     const SPOKEN: &str = "rusty-key/spoken-wow";
+
+    #[test]
+    fn a_former_main_folder_must_not_be_another_entrys_folder() {
+        let mut renamed = entry("gh:a/new", "a/new");
+        renamed.folders = vec!["NewName".into()];
+        renamed.formerly = vec!["SPOKEN".into()];
+        let spoken = entry("gh:rusty-key/spoken-wow", SPOKEN);
+        let problems = static_problems(&catalog(vec![renamed, spoken]));
+        assert!(
+            problems.iter().any(|p| p
+                == "gh:a/new lists SPOKEN as a former main folder, but gh:rusty-key/spoken-wow ships it"),
+            "{problems:?}"
+        );
+    }
+
+    #[test]
+    fn a_met_by_prefix_must_not_match_its_own_addons_folders() {
+        let mut spoken = entry("gh:rusty-key/spoken-wow", SPOKEN);
+        let mut quests = entry("gh:rusty-key/spoken-wow/quests-audio", SPOKEN);
+        quests.folders = vec!["SpokenQuestsAudioAlliance".into()];
+        spoken.packs = vec![PackGroup {
+            name: "Quest voices".into(),
+            needed: true,
+            ids: vec!["gh:rusty-key/spoken-wow/quests-audio".into()],
+            met_by: vec!["Spoken".into()],
+        }];
+        let problems = static_problems(&catalog(vec![spoken, quests]));
+        assert!(
+            problems.iter().any(|p| p.contains(
+                "packs have a met_by prefix, Spoken, that its own folder Spoken matches"
+            )),
+            "{problems:?}"
+        );
+    }
 
     #[test]
     fn a_healthy_addon_with_packs_has_no_problems() {

@@ -500,13 +500,21 @@ pub fn stamp_formerly(
         .map(|addon| (addon.id.to_ascii_lowercase(), addon))
         .collect();
     let mut vouched = Vec::new();
-    for candidate in candidates {
+    for candidate in candidates.iter_mut() {
         let addon = &mut candidate.addon;
         let last = listed.get(&addon.id.to_ascii_lowercase()).copied();
         let was = curated
             .pin_of(&addon.id)
             .map_or(&[][..], |pin| &pin.was[..]);
         addon.formerly = former_mains(last, was, addon);
+    }
+    // Only after every entry has its folders: what another one ships now is never vouched for.
+    let refused = crate::gate::drop_formerly_others_ship(
+        candidates.iter_mut().map(|candidate| &mut candidate.addon),
+    );
+    for candidate in candidates.iter() {
+        let addon = &candidate.addon;
+        let last = listed.get(&addon.id.to_ascii_lowercase()).copied();
         let carried = last.map_or(&[][..], |last| &last.formerly[..]);
         for folder in &addon.formerly {
             if !carried.iter().any(|old| old.eq_ignore_ascii_case(folder)) {
@@ -514,6 +522,7 @@ pub fn stamp_formerly(
             }
         }
     }
+    vouched.extend(refused);
     vouched
 }
 
