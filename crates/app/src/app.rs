@@ -160,6 +160,8 @@ pub struct App {
     pub open_sort: bool,
     /// Startup's work is about to end, and its memory can go back once it has.
     pub trim_when_quiet: bool,
+    /// Another copy holds the lock, so this one must not change anything.
+    pub read_only: bool,
 }
 
 impl App {
@@ -193,7 +195,12 @@ impl App {
             sim,
         );
         let now = Instant::now();
-        let script = launch.script.as_deref().and_then(Script::load);
+        // Scripts press buttons, so like the catalog address they're for test rigs alone.
+        let script = launch
+            .script
+            .as_deref()
+            .filter(|_| launch.test_rig)
+            .and_then(Script::load);
         let fun = Fun::new(state.stats.launches, now);
         let pause = if demo { Duration::ZERO } else { PAUSE };
         let mut app = Self {
@@ -256,7 +263,7 @@ impl App {
             list_text: String::new(),
             diagnostics_wanted: false,
             scale_draft: scale,
-            fit_window_in: 2,
+            fit_window_in: if already_running { 0 } else { 2 },
             window_rect: None,
             relaunching: false,
             shut_down: false,
@@ -268,13 +275,13 @@ impl App {
             hover_wait: false,
             open_sort: false,
             trim_when_quiet: !demo && !already_running,
+            read_only: already_running,
             launch,
         };
         if already_running {
             // The other copy owns everything. All this one does is say so and close.
             app.popup = Some(Popup::AlreadyRunning);
             app.game_state = GameState::NotFound;
-            app.shut_down = true;
             return app;
         }
         if app.managed_map().is_some_and(|m| !m.is_empty()) {
@@ -751,7 +758,6 @@ impl App {
         self.is_quiet() && self.popup.is_none()
     }
 
-    /// Enqueue an op from outside `actions.rs`: a dropped zip or a batch's backup.
     pub fn next_op_id(&mut self) -> u64 {
         self.queue.next_id()
     }
@@ -1101,7 +1107,8 @@ impl App {
 
     /// The window is closing. Stop what can stop, let what can't finish, and save.
     pub fn shut_down(&mut self) {
-        if std::mem::replace(&mut self.shut_down, true) || self.demo || self.relaunching {
+        let nothing_to_save = self.demo || self.read_only || self.relaunching;
+        if std::mem::replace(&mut self.shut_down, true) || nothing_to_save {
             return;
         }
         self.queue.cancel_all();

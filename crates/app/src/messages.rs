@@ -13,7 +13,7 @@ const FADE: Duration = Duration::from_secs(1);
 const MAX_SHOWN: usize = 3;
 /// About 30 frames a second is plenty for a fade.
 const FADE_STEP: Duration = Duration::from_millis(33);
-const LINE_HEIGHT: f32 = 24.0;
+const LINE_GAP: f32 = 2.0;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Kind {
@@ -143,7 +143,7 @@ impl Messages {
             );
             painter.galley(at, galley, color);
             message_area(ctx, rect, i, message);
-            y = rect.max.y + (LINE_HEIGHT - 22.0);
+            y = rect.max.y + LINE_GAP;
         }
     }
 }

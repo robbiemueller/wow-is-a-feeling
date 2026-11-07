@@ -1255,6 +1255,11 @@ fn every_settings_page_draws_and_can_be_operated() {
 
     click(&mut h, "Display");
     assert_eq!(app(&h).section, Section::Display);
+    // The slider itself, the way a screen reader or the keyboard would move it.
+    h.get_by_label("UI scale").increment_accesskit();
+    h.step();
+    h.step();
+    assert!((app(&h).state.settings.ui_scale - 1.05).abs() < 0.001);
     app_mut(&mut h).actions.push(Action::SetScale(1.5));
     h.step();
     h.step();
@@ -1384,6 +1389,12 @@ fn the_keyboard_alone_can_drive_the_list() {
             .version,
         "12.0.4"
     );
+
+    // A click on a row leaves the keyboard with the list, so Enter still works after it.
+    click(&mut h, "Bartender4, 4.18.4");
+    press(&mut h, Key::Enter);
+    assert_eq!(app(&h).casting().unwrap().text, "Reinstalling Bartender4");
+    finish_ops(&mut h);
 
     // Ctrl+F focuses search, typing filters, Enter gives the keyboard back without
     // installing anything, Escape clears.

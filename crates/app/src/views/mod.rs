@@ -15,6 +15,12 @@ pub fn draw(app: &mut App, ui: &mut Ui) {
     let full = ui.max_rect();
     let now = Instant::now();
     chrome::window(app, ui, full);
+    if app.read_only {
+        // A second copy has nothing to show, only that it's a second copy.
+        chrome::frame_and_portrait(app, ui, full, now);
+        crate::dialogs::show(app, ui.ctx());
+        return;
+    }
     toolbar::show(app, ui, full);
 
     let top = full.min.y + 94.0;

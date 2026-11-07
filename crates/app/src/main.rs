@@ -116,19 +116,24 @@ fn install_panic_hook() {
     }));
 }
 
-/// Everything about the window except the icon, which is tested by opening one.
-fn viewport(launch: &Launch, state: &State) -> egui::ViewportBuilder {
+/// How the window starts, apart from its icon.
+fn viewport(launch: &Launch, state: &State, already_running: bool) -> egui::ViewportBuilder {
     let settings = &state.settings;
     let mut size = settings.window_size.unwrap_or([1040.0, 700.0]);
     if let Some([w, h]) = launch.size {
         let scale = launch.scale.unwrap_or(settings.ui_scale);
         size = [w * scale, h * scale];
     }
-    let min = if launch.size.is_some() {
+    let mut min = if launch.size.is_some() {
         [320.0, 240.0]
     } else {
         [820.0, 560.0]
     };
+    // A second copy only has one thing to say, so it's a small window that says it.
+    if already_running {
+        size = [520.0, 300.0];
+        min = size;
+    }
     let mut builder = egui::ViewportBuilder::default()
         .with_title("WoW is a Feeling")
         .with_app_id("wow-is-a-feeling")
@@ -137,6 +142,7 @@ fn viewport(launch: &Launch, state: &State) -> egui::ViewportBuilder {
         .with_decorations(false);
     if let Some(pos) = settings.window_pos
         && !launch.demo
+        && !already_running
         && still_on_screen(pos)
     {
         builder = builder.with_position(pos);
@@ -238,7 +244,7 @@ fn main() {
     };
 
     let options = eframe::NativeOptions {
-        viewport: viewport(&launch, &state).with_icon(window_icon()),
+        viewport: viewport(&launch, &state, already_running).with_icon(window_icon()),
         renderer: eframe::Renderer::Glow,
         ..Default::default()
     };
