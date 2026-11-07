@@ -161,6 +161,14 @@ pub fn clean_line(text: &str, max_chars: usize) -> String {
     out
 }
 
+/// The same treatment for text that's allowed to have paragraphs.
+pub fn clean_paragraphs(text: &str) -> String {
+    text.lines()
+        .map(|line| clean_line(line, 2000))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn is_format_control(c: char) -> bool {
     matches!(c, '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{206f}' | '\u{feff}')
 }
@@ -351,7 +359,7 @@ pub fn my_rows(
         .partition(|m| waiting.contains(m.id.as_str()));
 
     let mut rows = Vec::new();
-    let mut push_managed = |id, name, list: Vec<&ManagedAddon>, rows: &mut Vec<Row>| {
+    let push_managed = |id, name, list: Vec<&ManagedAddon>, rows: &mut Vec<Row>| {
         if list.is_empty() {
             return;
         }

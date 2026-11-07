@@ -7,7 +7,11 @@
 use crate::theme;
 use eframe::egui::{
     self, Align2, Color32, ColorImage, FontId, Mesh, Painter, Pos2, Rect, Shape, Stroke,
-    StrokeKind, TextureFilter, TextureHandle, TextureOptions, TextureWrapMode, epaint::Vertex,
+    StrokeKind, TextureFilter, TextureHandle, TextureOptions, TextureWrapMode,
+    epaint::{
+        Vertex,
+        text::{LayoutJob, TextWrapping},
+    },
     pos2, vec2,
 };
 
@@ -307,6 +311,30 @@ pub fn shadow_text(
         theme::SHADOW,
     );
     painter.text(pos, align, text, font, color)
+}
+
+/// Like [`shadow_text`], but cut off with an ellipsis when it won't fit in `max_width`.
+/// Names come from strangers and can be any length.
+pub fn shadow_text_fit(
+    painter: &Painter,
+    pos: Pos2,
+    align: Align2,
+    text: &str,
+    font: FontId,
+    color: Color32,
+    max_width: f32,
+) -> Rect {
+    let mut job = LayoutJob::simple_singleline(text.to_owned(), font, color);
+    job.wrap = TextWrapping::truncate_at_width(max_width.max(1.0));
+    let galley = painter.layout_job(job);
+    let rect = align.anchor_size(pos, galley.size());
+    painter.galley_with_override_text_color(
+        rect.min + vec2(1.0, 1.0),
+        galley.clone(),
+        theme::SHADOW,
+    );
+    painter.galley(rect.min, galley, color);
+    rect
 }
 
 /// A sunken black well with a dark outer line and a thin gold inner line.

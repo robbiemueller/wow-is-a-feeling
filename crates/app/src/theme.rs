@@ -14,15 +14,19 @@ pub const TEXT_DIM: Color32 = Color32::from_rgb(158, 150, 132);
 pub const HINT: Color32 = Color32::from_rgb(196, 188, 166);
 pub const SHADOW: Color32 = Color32::from_black_alpha(220);
 pub const ERROR_RED: Color32 = Color32::from_rgb(255, 48, 32);
-#[allow(dead_code)] // Used by the message overlay.
 pub const SYSTEM_YELLOW: Color32 = Color32::from_rgb(255, 255, 0);
 pub const USE_GREEN: Color32 = Color32::from_rgb(30, 255, 0);
-#[allow(dead_code)] // Used by tooltips.
 pub const FLAVOR: Color32 = Color32::from_rgb(255, 209, 0);
+pub const INSTALLED: Color32 = Color32::from_rgb(140, 200, 120);
 
 pub const INK: Color32 = Color32::from_rgb(46, 30, 12);
 pub const INK_SOFT: Color32 = Color32::from_rgb(92, 68, 38);
 pub const INK_HEAD: Color32 = Color32::from_rgb(74, 42, 8);
+pub const INK_LINK: Color32 = Color32::from_rgb(20, 58, 120);
+pub const INK_LINK_HOVER: Color32 = Color32::from_rgb(120, 30, 12);
+pub const INK_GOOD: Color32 = Color32::from_rgb(28, 96, 28);
+pub const INK_BAD: Color32 = Color32::from_rgb(150, 24, 12);
+pub const INK_GOLD: Color32 = Color32::from_rgb(132, 86, 6);
 
 pub const WELL: Color32 = Color32::from_rgb(10, 8, 6);
 pub const TOOLTIP_FILL: Color32 = Color32::from_rgba_premultiplied(8, 9, 24, 244);

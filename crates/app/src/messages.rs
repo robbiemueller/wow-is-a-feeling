@@ -83,6 +83,7 @@ impl Messages {
             .retain(|m| now.saturating_duration_since(m.born) < HOLD + FADE);
     }
 
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.list.is_empty()
     }
@@ -112,7 +113,7 @@ impl Messages {
         if self.list.is_empty() {
             return;
         }
-        let layer = LayerId::new(Order::Foreground, Id::new("messages"));
+        let layer = LayerId::new(Order::Foreground, Id::unique("messages"));
         let painter = ctx.layer_painter(layer);
         let font = theme::strong(16.0);
         let mut y = full.min.y + 100.0;
@@ -157,7 +158,7 @@ impl Messages {
     }
 
     fn link_area(&self, ctx: &egui::Context, rect: Rect, index: usize, url: &str) {
-        egui::Area::new(Id::new(("message-link", index)))
+        egui::Area::new(Id::unique(("message-link", index)))
             .order(Order::Foreground)
             .fixed_pos(rect.min)
             .show(ctx, |ui| {
