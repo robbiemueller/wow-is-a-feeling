@@ -80,13 +80,16 @@ site/                   Landing page for GitHub Pages.
 
 Staging lives in `<_forever_>/Interface/.wiaf/`, which is on the same volume as `AddOns` and outside it, so the game never scans it.
 
-1. Download to `.wiaf/downloads/<txn>.zip` and verify size and digest when known.
-2. Extract into `.wiaf/staging/<txn>/` through the safe extractor.
-3. Require at least one folder with a TOC. Warn, don't fail, when no folder targets Forever.
-4. Write `.wiaf/journal.json` listing every folder to swap, flushed to disk.
-5. For each folder: rename the old one into `.wiaf/backup/<txn>/`, then rename the new one into `AddOns`. Retry renames with backoff on transient locks from antivirus and cloud-sync tools.
-6. Mark the journal committed, delete the backup and staging, delete the journal.
-7. On any failure, undo in reverse. On startup, a leftover uncommitted journal rolls back; a committed one finishes cleanup.
+1. Hold `.wiaf/j/<txn>.lock` open for the whole transaction, so `recover` leaves a live one alone.
+2. Download to `.wiaf/d/<txn>.zip` and verify size and digest when known. WoWInterface is the exception: its link always serves the newest upload, so a catalog entry's size and MD5 can describe an older file.
+3. Extract into `.wiaf/s/<txn>/` through the safe extractor.
+4. Require at least one folder with a TOC. Warn, don't fail, when no folder targets Forever.
+5. Write `.wiaf/j/<txn>.json` listing every folder to swap, flushed to disk.
+6. Take `.wiaf/swap.lock`. For each folder: rename the old one into `.wiaf/b/<txn>/`, then rename the new one into `AddOns`. Retry renames with backoff on transient locks from antivirus and cloud-sync tools.
+7. Mark the journal committed, delete the backup and staging, delete the journal.
+8. On any failure, undo in reverse. On startup, a leftover pending journal rolls back; a committed one finishes cleanup.
+
+Nothing is deleted until the journal says, durably, which way the transaction went. Staged addon files aren't synced one by one, because that's slow on big addons: a process crash is fully safe, while a power cut just after a commit can leave a new addon incomplete, which a reinstall fixes.
 
 Folders we own are recorded in `state`. Removal deletes only folders no other managed addon claims. Unmanaged folders are never touched, except when a new install contains a folder of the same name, which goes through the same backup-and-swap and is logged. Two addons may claim one folder (shared libraries).
 
@@ -139,8 +142,8 @@ Update checks compare installed versions against the catalog: one request, not o
   2. A zip asset whose name contains `forever` or `camelot`.
   3. Read the TOC inside candidate zips with HTTP range requests.
 - **WoWInterface** has no Forever tag in its metadata, so scan zips: filter `api.mmoui.com/v3/game/WOW/filelist.json` to recently updated addons, download each zip once per version, and read its TOCs. Cache by id and version. Go slowly (one at a time), send an honest User-Agent with the project URL, and never mirror anything. The app downloads straight from their CDN, so their download counts stay intact.
-- **Curated source installs** (`catalog/curated.toml`): addons whose authors publish tags but no packaged zips, such as ElvUI and Details. The app installs GitHub's source archive using `Release.moves`.
-- **Not used, on purpose:** CurseForge and Wago (their terms need approval or a key), the Tukui API (asks for staff permission; ElvUI comes from its public GitHub tags instead), and any scraping of websites. Well-known gaps appear in `Catalog.gaps` with alternatives.
+- **Curated source installs** (`catalog/curated.toml`): addons whose authors publish tags but no packaged zips, such as Details. The app installs GitHub's source archive using `Release.moves`. An addon whose `.pkgmeta` pulls in externals can't be installed this way, because its tags don't contain the libraries it needs.
+- **Not used, on purpose:** CurseForge and Wago (their terms need approval or a key), the Tukui API (asks for staff permission), and any scraping of websites. Well-known gaps appear in `Catalog.gaps` with alternatives. ElvUI is one of them: its tags need 20 externals, and its packaged zips are only on Tukui's CDN. `curated.toml` keeps its entry, so it appears if that changes.
 
 Merge entries from different sources by TOC IDs (`X-WoWI-ID`) or identical folder sets, never by name alone. Prefer GitHub when both exist.
 

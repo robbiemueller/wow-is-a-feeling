@@ -514,7 +514,7 @@ impl Target {
 
 /// Whether a URL passes the checks every request has to pass, without fetching it. A cheap
 /// first look for links that won't be requested until later; the checks still run then.
-pub(crate) fn is_public_url(url: &str) -> bool {
+pub fn is_public_url(url: &str) -> bool {
     Target::parse(url, Reach::Public).is_ok()
 }
 

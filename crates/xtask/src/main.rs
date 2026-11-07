@@ -4,6 +4,8 @@
 //! The secret key never appears in any output, and `sign` only takes it from the
 //! environment, so it can live in a CI secret and never touch a command line.
 
+mod check_catalog;
+
 use std::collections::BTreeMap;
 use std::env;
 use std::fs::{self, File, OpenOptions};
@@ -29,6 +31,8 @@ Release chores for WoW is a Feeling.
       Write <dir>/latest.json with the sha256 and size of each known asset found.
   verify-latest <latest.json>
       Check <latest.json>.minisig against the public key built into the app.
+  check-catalog <catalog.json> <how-many> <max-megabytes>
+      Check a catalog's references, and really install a sample of it into temp folders.
 ";
 
 const SECRET_KEY_VAR: &str = "MINISIGN_SECRET_KEY";
@@ -69,6 +73,15 @@ fn main() -> ExitCode {
             .map(|latest| println!("Wrote {}", latest.display())),
         ["verify-latest", file] => {
             verify_latest(Path::new(file), UPDATE_PUBLIC_KEY).map(|summary| println!("{summary}"))
+        }
+        ["check-catalog", file, how_many, max_megabytes] => {
+            match (how_many.parse(), max_megabytes.parse()) {
+                (Ok(how_many), Ok(max_megabytes)) => {
+                    check_catalog::run(Path::new(file), how_many, max_megabytes)
+                        .map(|summary| println!("{summary}"))
+                }
+                _ => Err(USAGE.to_string()),
+            }
         }
         _ => Err(USAGE.to_string()),
     };
