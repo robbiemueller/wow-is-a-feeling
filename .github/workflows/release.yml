@@ -1,7 +1,7 @@
 name: Release
 
-# To release: set the version in Cargo.toml, merge that, then push the matching tag, like
-# v0.2.0.
+# To release: set the version in Cargo.toml, commit the Cargo.lock that changes with it, write
+# the version's section in CHANGELOG.md, merge that, then push the matching tag, like v0.2.0.
 #
 # Every installed app trusts the signing key and can't stop trusting it, so the jobs keep it
 # away from as much as they can, and each job holds only what it needs:
@@ -288,12 +288,11 @@ jobs:
         with:
           name: manifest
           path: manifest
+      - run: chmod +x signer/xtask-sign
       - name: Sign latest.json
         env:
           MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
-        run: |
-          chmod +x signer/xtask-sign
-          signer/xtask-sign manifest/latest.json
+        run: signer/xtask-sign manifest/latest.json
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: signature
@@ -361,6 +360,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
+          # With --draft, gh won't stop at a release that already has this tag, so stop here.
+          if gh release view "$GITHUB_REF_NAME" --json url --jq .url; then
+            echo "::error::$GITHUB_REF_NAME already has a release or a draft, so nothing changed. To try again, delete the draft and run this job again. A published release stays as it is, and a new one needs a new version."
+            exit 1
+          fi
+
           jq -r .notes release/latest.json > notes.md
           gh release create "$GITHUB_REF_NAME" release/* --draft --verify-tag \
             --title "WoW is a Feeling $GITHUB_REF_NAME" \

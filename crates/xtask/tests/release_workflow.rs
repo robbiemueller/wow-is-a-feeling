@@ -247,6 +247,9 @@ if [ "$GH_TOKEN" != fake-token ] || [ "$GH_REPO" != owner/repo ]; then
   exit 1
 fi
 case "$1 $2" in
+  "release view")
+    [ -d ../../github ]
+    ;;
   "release create")
     mkdir -p ../../github
     for arg in "$@"; do
@@ -699,20 +702,16 @@ fn the_key_is_in_one_step_of_one_small_job() {
             keyed_steps += 1;
             assert_eq!(
                 step.script().unwrap(),
-                "chmod +x signer/xtask-sign\nsigner/xtask-sign manifest/latest.json\n"
+                "signer/xtask-sign manifest/latest.json\n"
             );
-        } else {
-            let uses = step.field("uses").unwrap_or_else(|| {
-                panic!(
-                    "the signing job runs more than xtask-sign: {}",
-                    step.label()
-                )
-            });
+        } else if let Some(uses) = step.field("uses") {
             assert!(
                 uses.starts_with("actions/download-artifact@")
                     || uses.starts_with("actions/upload-artifact@"),
                 "{uses}"
             );
+        } else {
+            assert_eq!(step.script().unwrap(), "chmod +x signer/xtask-sign\n");
         }
     }
     assert_eq!(keyed_steps, 1);
@@ -889,6 +888,23 @@ fn the_chain_publishes_exactly_what_was_hashed_and_signed() {
         fs::read(rig.root.join("github").join("latest.json")).unwrap(),
         json
     );
+}
+
+/// With --draft, gh itself wouldn't notice, and a second draft would sit beside the first.
+#[test]
+fn a_tag_that_already_has_a_release_is_left_alone() {
+    let Some(rig) = Rig::new() else { return };
+    rig.signed_release();
+    rig.run_job("publish", &[]).unwrap();
+    fs::remove_dir_all(rig.work("publish")).unwrap();
+
+    let failure = rig.run_job("publish", &[]).unwrap_err();
+    assert_eq!(failure.step, "Publish");
+    assert!(
+        failure.output.contains("already has a release"),
+        "{failure:?}"
+    );
+    assert_eq!(rig.log().matches("gh release create").count(), 1);
 }
 
 #[test]
