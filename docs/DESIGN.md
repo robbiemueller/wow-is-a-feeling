@@ -34,7 +34,7 @@ Traps found in real addons:
 - Zips that are only partly for Forever (DBM-Core 4 of 8 folders, BigWigs 4 of 12).
 - Junk top-level folders (`__MACOSX`, `images`, `OpenMe`).
 - Folder names with a leading `!` (`!BugGrabber`).
-- Big zips: Questie and OpenMap are around 90 MB.
+- Big zips: Questie and OpenMap are around 90 MB, and voice and map packs reach 1.3 GB.
 - `/releases/latest` can point at another flavor (VuhDo's latest is a vanilla build), so scan recent releases.
 - Tags with slashes and `+` (`bundle/v12.6.2+v1.0.11`).
 - Same-named repos that are different projects (`ForeverPlus`, `ForeverUI`). Link sources by TOC IDs, never by name alone.
@@ -70,7 +70,7 @@ site/                   Landing page for GitHub Pages.
 | `gameproc` | Is the game running? Checked only before acting, never polled |
 | `listfile` | Plain-text addon list export and import |
 | `net` | HTTP with ETag support, streaming downloads with progress and cancel |
-| `extract` | Safe zip extraction: no traversal, no bombs, no executables |
+| `extract` | Safe zip extraction: no traversal, no bombs, no file types known to run on a double-click |
 | `install` | Staging, journaled atomic swap, rollback, crash recovery |
 | `backup` | WTF settings backup and restore |
 | `selfupdate` | Signed app updates through GitHub Releases |
@@ -97,10 +97,12 @@ Folders we own are recorded in `state`. Removal deletes only folders no other ma
 
 Never call `ZipArchive::extract`. Hand-roll it on top of `zip`:
 
+- Open zips with `ArchiveOffset::Known(0)`, like the catalog scan, so both read the same file list. Data in front of a zip gets it refused.
 - Use `enclosed_name()`; reject symlinks, `:`, Windows device names, trailing dots or spaces, and case-only duplicates.
 - Never trust declared sizes. Wrap readers in `take(limit)`, with per-file, per-archive, entry-count and ratio caps.
+- Cap what planning has to hold or walk: 64 MB of file list, 1,024 bytes and 64 levels per path, 20,000 folders. Real zips reach 11 MB, 139 bytes, 11 levels and 1,698 folders.
 - Skip junk (`__MACOSX`, `.git`, `.github`, `.DS_Store`, `Thumbs.db`).
-- Never write executables or scripts (`exe dll scr com msi bat cmd ps1 sh jar vbs app dylib so`). Skip them, log them, and report them in the result. Dev scripts appear in real source archives, so skipping beats failing.
+- Don't write executables, scripts, shortcuts or disk images (`exe dll scr com msi bat cmd ps1 sh jar vbs app dylib so`, then `js py url reg iso zip` and the rest of the list in `extract.rs`). Skip them, log them, and report them in the result. Dev scripts appear in real source archives, so skipping beats failing. A list only stops what it names, so this keeps out known lures rather than promising nothing runnable gets through. Nothing the game loads is on it.
 - Only keep top-level folders that contain a TOC.
 
 ### Self-update
@@ -109,7 +111,7 @@ Checked once at launch, in the background, after the first frame. Never silent: 
 
 - `https://github.com/robbiemueller/wow-is-a-feeling/releases/latest/download/latest.json` plus `latest.json.minisig`. That URL is a plain redirect, so it doesn't touch GitHub's REST rate limit.
 - Verify the signature over `latest.json` with the public key embedded in the app, using `minisign-verify`, then compare versions, download the asset, and check its SHA-256 from the signed file.
-- Windows and a bare Linux binary: swap with `self-replace`. AppImage: replace `$APPIMAGE`. macOS: replace the whole `.app`.
+- Windows: rename the running exe aside and the verified download into its place, and rename it back if that fails, so a working exe stays at the path. The old file is only deleted after that, with `self-replace`. Bare Linux binary: swap with `self-replace`. AppImage: replace `$APPIMAGE`, believed only when the running exe is inside `$APPDIR`, because child processes inherit both. macOS: replace the whole `.app`.
 
 `latest.json`:
 
