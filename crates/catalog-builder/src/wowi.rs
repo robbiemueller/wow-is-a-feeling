@@ -3,18 +3,16 @@
 //! at a time, and send an honest User-Agent. Nothing is mirrored: the app downloads
 //! from their CDN, so their counts stay right.
 
-use std::collections::BTreeMap;
 use std::io::Cursor;
 
 use feeling_core::catalog::{Addon, ExternalIds, Release, Source};
-use feeling_core::toc;
 use serde::{Deserialize, Serialize};
 
 use crate::detect::FOREVER_EPOCH;
 use crate::http::{Channel, Http, SMALL_BODY, ZIP_BODY};
 use crate::model::{Candidate, ZipScan};
 use crate::text::{clean_author, clean_name, clean_summary, zip_stem};
-use crate::zipscan::{is_junk_folder, scan_zip};
+use crate::zipscan::{addon_folders, scan_zip};
 
 const API: &str = "https://api.mmoui.com/v3/game/WOW";
 
@@ -112,20 +110,8 @@ pub fn select_rows(rows: Vec<Row>, seeds: &[u64], limit: Option<usize>) -> Vec<R
 /// From a zip listing: is there any folder with a TOC the client could load?
 /// Saves downloading zips that only ship, say, `_Vanilla` TOCs.
 pub fn has_loadable_toc(files: &[String]) -> bool {
-    let mut by_folder: BTreeMap<&str, Vec<String>> = BTreeMap::new();
-    for path in files {
-        let mut parts = path.split(['/', '\\']);
-        if let (Some(folder), Some(file), None) = (parts.next(), parts.next(), parts.next())
-            && !folder.is_empty()
-            && !is_junk_folder(folder)
-            && file.to_ascii_lowercase().ends_with(".toc")
-        {
-            by_folder.entry(folder).or_default().push(file.to_string());
-        }
-    }
-    by_folder
-        .iter()
-        .any(|(folder, names)| toc::pick_toc(folder, names).is_some())
+    let paths: Vec<(String, usize)> = files.iter().map(|f| (f.replace('\\', "/"), 0)).collect();
+    !addon_folders(&paths).is_empty()
 }
 
 /// `listfiles/{id}.json` gives `[{"UID":..,"FileList":[..]}]`.
@@ -395,7 +381,14 @@ mod tests {
             "Foo/Foo_Vanilla.toc",
             "Foo/Foo_TBC.toc"
         ])));
-        assert!(!has_loadable_toc(&list(&["Foo/Sub/Sub.toc"])));
+        assert!(
+            has_loadable_toc(&list(&["Wrapper/Sub/Sub.toc"])),
+            "the installer unwraps this"
+        );
+        assert!(
+            has_loadable_toc(&list(&["Foo.toc", "core.lua"])),
+            "and this"
+        );
         assert!(!has_loadable_toc(&list(&[
             "__MACOSX/__MACOSX.toc",
             "images/images.toc",

@@ -27,7 +27,6 @@ const MAX_RATE_WAIT_SECS: u64 = 65 * 60;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Channel {
     GraphQl,
-    Rest,
     Search,
     CodeSearch,
     Raw,
@@ -37,7 +36,7 @@ pub enum Channel {
 }
 
 impl Channel {
-    const COUNT: usize = 8;
+    const COUNT: usize = 7;
 
     fn index(self) -> usize {
         self as usize
@@ -57,14 +56,13 @@ impl Channel {
     fn uses_token(self) -> bool {
         matches!(
             self,
-            Channel::GraphQl | Channel::Rest | Channel::Search | Channel::CodeSearch
+            Channel::GraphQl | Channel::Search | Channel::CodeSearch
         )
     }
 
     pub fn label(self) -> &'static str {
         match self {
             Channel::GraphQl => "github graphql",
-            Channel::Rest => "github rest",
             Channel::Search => "github search",
             Channel::CodeSearch => "github code search",
             Channel::Raw => "raw.githubusercontent",
@@ -76,7 +74,6 @@ impl Channel {
 
     pub const ALL: [Channel; Channel::COUNT] = [
         Channel::GraphQl,
-        Channel::Rest,
         Channel::Search,
         Channel::CodeSearch,
         Channel::Raw,
@@ -555,7 +552,7 @@ mod tests {
             reply(200, &[], b"ok"),
         ]);
         let got = client(None)
-            .get(Channel::Rest, &format!("{base}/x"))
+            .get(Channel::Search, &format!("{base}/x"))
             .unwrap();
         assert_eq!(got.body, b"ok");
         assert_eq!(seen.lock().unwrap().len(), 3);

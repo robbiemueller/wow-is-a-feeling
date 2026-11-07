@@ -16,8 +16,9 @@ pub const FOREVER_EPOCH: i64 = 1_782_864_000;
 /// After this many releases that were read and don't target Forever, older ones
 /// aren't opened any more. Keeps a first run sane for active retail-only repos.
 const MAX_NEGATIVE_READS: u32 = 4;
-/// Zips opened per release when nothing in the names helps.
-const MAX_ZIPS_PER_RELEASE: usize = 3;
+/// Zips opened per release when nothing in the names helps. A real release can have
+/// several zips with the game in their name, such as a game client beside the addon.
+const MAX_ZIPS_PER_RELEASE: usize = 5;
 /// A newer release this far past the Forever one means support really was dropped,
 /// rather than the author publishing per-flavor releases in close succession.
 const DROPPED_AFTER_SECS: i64 = 45 * 24 * 60 * 60;

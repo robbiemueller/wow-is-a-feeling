@@ -148,7 +148,10 @@ pub fn clean_summary(raw: &str) -> String {
         }
     }
     let joined = words.join(" ");
-    truncate_at_word(joined.trim(), 240)
+    truncate_at_word(
+        joined.trim_start_matches(['•', '-', '*', ' ']).trim_end(),
+        240,
+    )
 }
 
 /// Links are for the addon's page, and summaries read better without them.
@@ -233,6 +236,9 @@ fn is_flavor_label(inner: &str) -> bool {
                 | "mainline"
                 | "classic"
                 | "midnight"
+                | "core"
+                | "beta"
+                | "alpha"
         )
 }
 
@@ -375,7 +381,12 @@ mod tests {
         assert_eq!(clean_name("Questie"), "Questie");
         assert_eq!(clean_name("Foo [Forever]"), "Foo");
         assert_eq!(clean_name("Foo (Camelot) v1.2.3"), "Foo");
-        assert_eq!(clean_name("Titan Panel [Core] 9.3.5"), "Titan Panel [Core]");
+        assert_eq!(clean_name("Titan Panel [Core] 9.3.5"), "Titan Panel");
+        assert_eq!(clean_name("Fightclub [BETA]"), "Fightclub");
+        assert_eq!(
+            clean_name("Titan Panel [Reputation]"),
+            "Titan Panel [Reputation]"
+        );
         assert_eq!(clean_name("Prat 3.0"), "Prat 3.0");
         assert_eq!(clean_name("<DBM Core>"), "DBM Core");
         assert_eq!(
@@ -424,6 +435,15 @@ mod tests {
             clean_summary("@localization(locale=\"enUS\", key=\"Notes\")@"),
             ""
         );
+    }
+
+    #[test]
+    fn summaries_lose_leading_bullets() {
+        assert_eq!(
+            clean_summary("• Ask anything • Quest help"),
+            "Ask anything • Quest help"
+        );
+        assert_eq!(clean_summary("- Handy"), "Handy");
     }
 
     #[test]

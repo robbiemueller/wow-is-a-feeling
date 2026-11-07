@@ -52,9 +52,22 @@ pub struct RepoState {
     /// Detection results by tag.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub releases: BTreeMap<String, ReleaseVerdict>,
+    /// The newest tag at the last proper look. While it stays the same, nothing needs reading.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub newest_tag: Option<String>,
+    /// Unix seconds of the last proper look.
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    pub looked_at: i64,
+    /// Something failed at the last look, so it needs another.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub incomplete: bool,
 }
 
 fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+
+fn is_zero_i64(n: &i64) -> bool {
     *n == 0
 }
 

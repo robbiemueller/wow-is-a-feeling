@@ -16,6 +16,8 @@ const GRAPHQL_URL: &str = "https://api.github.com/graphql";
 /// and blanks out asset nodes, depending on how many assets they cover, so the
 /// size adapts as the run goes.
 const MAX_BATCH: usize = 50;
+/// The quick first look asks so little per repository that bigger batches are fine.
+const MAX_HEAD_BATCH: usize = 100;
 /// Repositories last pushed before this can't have a Forever build.
 const PUSHED_SINCE: &str = "2026-07-01";
 
@@ -50,6 +52,14 @@ const REPO_FRAGMENT: &str = "fragment F on Repository {
       releaseAssets(first: 40) { nodes { name size downloadCount downloadUrl digest } }
     }
   }
+}";
+
+/// The quick first look: enough to reject a repository or to see that it has no
+/// new release, in which case nothing else needs fetching. About 2 points per 100.
+const HEAD_FRAGMENT: &str = "fragment F on Repository {
+  nameWithOwner stargazerCount isArchived isFork isTemplate isEmpty isMirror isDisabled
+  licenseInfo { spdxId }
+  releases(first: 1, orderBy: {field: CREATED_AT, direction: DESC}) { nodes { tagName isDraft } }
 }";
 
 /// A repository as the rest of the pipeline sees it.
@@ -287,7 +297,7 @@ pub fn parse_iso_time(text: &str) -> Option<i64> {
     Some(seconds)
 }
 
-fn repo_query(names: &[String]) -> String {
+fn repo_query(names: &[String], fragment: &str) -> String {
     let mut query = String::from("query { rateLimit { cost remaining resetAt }\n");
     for (i, name) in names.iter().enumerate() {
         let (owner, repo) = name.split_once('/').unwrap_or((name, ""));
@@ -296,7 +306,7 @@ fn repo_query(names: &[String]) -> String {
         ));
     }
     query.push_str("}\n");
-    query.push_str(REPO_FRAGMENT);
+    query.push_str(fragment);
     query
 }
 
@@ -376,8 +386,14 @@ fn read_batch(names: &[String], body: &[u8]) -> Result<BatchReply, String> {
 
 /// Fetches one batch into `into`, splitting it when GitHub can't manage it.
 /// Returns true when the batch was too big, so the caller can ask for less next time.
-fn fetch_batch(http: &Http, url: &str, names: &[String], into: &mut BatchResult) -> bool {
-    let body = serde_json::json!({ "query": repo_query(names) }).to_string();
+fn fetch_batch(
+    http: &Http,
+    url: &str,
+    fragment: &str,
+    names: &[String],
+    into: &mut BatchResult,
+) -> bool {
+    let body = serde_json::json!({ "query": repo_query(names, fragment) }).to_string();
     let mut waits = 0;
     let mut too_big = false;
     let outcome = loop {
@@ -412,8 +428,8 @@ fn fetch_batch(http: &Http, url: &str, names: &[String], into: &mut BatchResult)
                 names.len()
             );
             let (left, right) = names.split_at(names.len() / 2);
-            too_big |= fetch_batch(http, url, left, into);
-            too_big |= fetch_batch(http, url, right, into);
+            too_big |= fetch_batch(http, url, fragment, left, into);
+            too_big |= fetch_batch(http, url, fragment, right, into);
         }
         Err(problem) => {
             eprintln!("{}: {problem}", names[0]);
@@ -425,17 +441,17 @@ fn fetch_batch(http: &Http, url: &str, names: &[String], into: &mut BatchResult)
 
 /// The next batch size: halve after trouble, and creep back up after success,
 /// because each query that comes back too big is a wasted one.
-fn next_batch_size(current: usize, too_big: bool) -> usize {
+fn next_batch_size(current: usize, too_big: bool, max: usize) -> usize {
     if too_big {
         (current / 2).max(1)
     } else {
-        (current + 2).min(MAX_BATCH)
+        (current + 2).min(max)
     }
 }
 
-fn fetch_repos_at(http: &Http, url: &str, names: &[String]) -> BatchResult {
+fn fetch_all(http: &Http, url: &str, fragment: &str, max: usize, names: &[String]) -> BatchResult {
     let mut result = BatchResult::default();
-    let mut size = MAX_BATCH;
+    let mut size = max;
     let mut at = 0;
     let mut queries = 0;
     while at < names.len() {
@@ -444,16 +460,22 @@ fn fetch_repos_at(http: &Http, url: &str, names: &[String]) -> BatchResult {
         }
         queries += 1;
         let end = (at + size).min(names.len());
-        let too_big = fetch_batch(http, url, &names[at..end], &mut result);
-        size = next_batch_size(size, too_big);
+        let too_big = fetch_batch(http, url, fragment, &names[at..end], &mut result);
+        size = next_batch_size(size, too_big, max);
         at = end;
     }
     result
 }
 
-/// Fetch metadata for every repository.
+/// A quick look at every repository. The answers have flags and the newest tag,
+/// but no release assets.
+pub fn fetch_heads(http: &Http, names: &[String]) -> BatchResult {
+    fetch_all(http, GRAPHQL_URL, HEAD_FRAGMENT, MAX_HEAD_BATCH, names)
+}
+
+/// Everything about the repositories that need a proper look.
 pub fn fetch_repos(http: &Http, names: &[String]) -> BatchResult {
-    fetch_repos_at(http, GRAPHQL_URL, names)
+    fetch_all(http, GRAPHQL_URL, REPO_FRAGMENT, MAX_BATCH, names)
 }
 
 /// A repository found in the strongbox catalogue.
@@ -889,12 +911,34 @@ mod tests {
     }
 
     #[test]
+    fn a_head_answer_has_the_flags_and_the_newest_tag() {
+        let names = vec!["A/a".to_string()];
+        let body = serde_json::json!({"data": {"r0": {
+            "nameWithOwner": "A/a", "stargazerCount": 5, "isArchived": true, "isFork": false,
+            "isTemplate": false, "isEmpty": false, "isMirror": false, "isDisabled": false,
+            "licenseInfo": {"spdxId": "MIT"},
+            "releases": {"nodes": [{"tagName": "v9", "isDraft": false}]}
+        }}})
+        .to_string();
+        let BatchReply::Answered(batch) = read_batch(&names, body.as_bytes()).unwrap() else {
+            panic!("expected an answer");
+        };
+        let head = &batch.found["A/a"];
+        assert!(head.archived);
+        assert_eq!(head.stars, 5);
+        assert_eq!(head.license.as_deref(), Some("MIT"));
+        assert_eq!(head.releases[0].tag, "v9");
+        assert!(head.releases[0].assets.is_empty());
+    }
+
+    #[test]
     fn batch_sizes_adapt() {
-        assert_eq!(next_batch_size(50, true), 25);
-        assert_eq!(next_batch_size(1, true), 1);
-        assert_eq!(next_batch_size(25, false), 27);
-        assert_eq!(next_batch_size(1, false), 3);
-        assert_eq!(next_batch_size(50, false), 50);
+        assert_eq!(next_batch_size(50, true, 50), 25);
+        assert_eq!(next_batch_size(1, true, 50), 1);
+        assert_eq!(next_batch_size(25, false, 50), 27);
+        assert_eq!(next_batch_size(1, false, 50), 3);
+        assert_eq!(next_batch_size(50, false, 50), 50);
+        assert_eq!(next_batch_size(99, false, 100), 100);
     }
 
     #[test]
@@ -917,7 +961,8 @@ mod tests {
             reply(200, &[], &answer(50, 10)), // what's left, in one go
         ]);
         let http = client(Some("t"));
-        let result = fetch_repos_at(&http, &format!("{base}/graphql"), &names);
+        let url = format!("{base}/graphql");
+        let result = fetch_all(&http, &url, REPO_FRAGMENT, MAX_BATCH, &names);
         assert_eq!(result.found.len(), 60);
         assert!(result.failed.is_empty());
         assert_eq!(seen.lock().unwrap().len(), 4);
@@ -926,7 +971,7 @@ mod tests {
     #[test]
     fn query_uses_aliases_and_stays_small() {
         let names: Vec<String> = ["A/a", "B/b"].iter().map(|s| s.to_string()).collect();
-        let query = repo_query(&names);
+        let query = repo_query(&names, REPO_FRAGMENT);
         assert!(query.contains("r0: repository(owner: \"A\", name: \"a\")"));
         assert!(query.contains("r1: repository(owner: \"B\", name: \"b\")"));
         assert!(query.contains("fragment F on Repository"));
@@ -975,7 +1020,13 @@ mod tests {
         let http = client(Some("t"));
         let names: Vec<String> = ["A/a", "B/b"].iter().map(|s| s.to_string()).collect();
         let mut result = BatchResult::default();
-        fetch_batch(&http, &format!("{base}/graphql"), &names, &mut result);
+        fetch_batch(
+            &http,
+            &format!("{base}/graphql"),
+            REPO_FRAGMENT,
+            &names,
+            &mut result,
+        );
         assert_eq!(result.found.len(), 1);
         assert_eq!(result.found["A/a"].name, "A/a");
         assert_eq!(result.failed, ["B/b"]);
@@ -997,7 +1048,13 @@ mod tests {
         let http = client(Some("t"));
         let names = vec!["A/a".to_string()];
         let mut result = BatchResult::default();
-        fetch_batch(&http, &format!("{base}/graphql"), &names, &mut result);
+        fetch_batch(
+            &http,
+            &format!("{base}/graphql"),
+            REPO_FRAGMENT,
+            &names,
+            &mut result,
+        );
         assert_eq!(result.found.len(), 1);
         assert_eq!(seen.lock().unwrap().len(), 2);
     }

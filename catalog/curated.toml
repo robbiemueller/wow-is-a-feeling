@@ -40,11 +40,11 @@ addons = [
 
 [[kits]]
 name = "Raid night"
-description = "Boss timers, nameplates you can read, numbers for afterward, and a warning when you're standing in the bad stuff."
+description = "Boss timers, nameplates you can read, frames for your whole raid, numbers for afterward, and a warning when you're standing in the bad stuff."
 addons = [
   "gh:DeadlyBossMods/DeadlyBossMods",
-  "gh:BigWigsMods/BigWigs",
   "gh:Tercioo/Plater-Nameplates",
+  "gh:michaelnpsp/Grid2",
   "gh:Tercioo/Details-Damage-Meter",
   "wowi:17996",
 ]
@@ -53,7 +53,7 @@ addons = [
 name = "Leatrix Plus"
 reason = "It's only published on CurseForge, whose rules don't let a free app like this one offer it."
 website = "https://www.curseforge.com/wow/addons/leatrix-plus"
-alternatives = ["gh:funkydude/SexyMap", "gh:Peterodox/Plumber"]
+alternatives = ["gh:Peterodox/Plumber", "gh:Stanzilla/AdvancedInterfaceOptions"]
 
 [[gaps]]
 name = "Leatrix Maps"
@@ -89,13 +89,13 @@ alternatives = ["gh:Tercioo/Plater-Nameplates", "gh:Backupiseasy/ThreatPlates"]
 name = "AtlasLoot"
 reason = "Its Forever build is only on CurseForge, whose rules don't let a free app like this one offer it."
 website = "https://www.curseforge.com/wow/addons/atlasloot-forever"
-alternatives = ["wowi:3896"]
+alternatives = ["gh:arithmandar/Atlas", "direct:foreverdb"]
 
 [[gaps]]
 name = "DungeonJournal"
 reason = "It's only published on CurseForge, whose rules don't let a free app like this one offer it."
 website = "https://www.curseforge.com/wow/addons/dungeonjournal"
-alternatives = ["wowi:3896"]
+alternatives = ["gh:arithmandar/Atlas", "direct:foreverdb"]
 
 [[gaps]]
 name = "RareScanner"
@@ -113,7 +113,7 @@ alternatives = ["gh:funkydude/BugSack"]
 name = "ForeverPlus"
 reason = "The original is only published on CurseForge, whose rules don't let a free app like this one offer it."
 website = "https://www.curseforge.com/wow/addons/foreverplus"
-alternatives = ["gh:fallenguards/classicuiforever"]
+alternatives = ["gh:xIGBClutchIx/ForeverPlusPlus", "gh:fallenguards/classicuiforever"]
 unrelated = ["gh:7hedubz/ForeverPlus"]
 
 [[gaps]]
@@ -131,8 +131,8 @@ alternatives = ["gh:EllesmereGaming/EllesmereUI", "gh:fallenguards/classicuifore
 
 # Tags but no packaged zips. The app installs GitHub's source archive using the
 # moves worked out here. A .pkgmeta with externals is refused, because the archive
-# wouldn't include those libraries. That is ElvUI's situation today: it stays
-# listed so it appears by itself if that ever changes.
+# wouldn't include those libraries, and so is one with git submodules. That is
+# ElvUI's situation today: it stays listed so it appears by itself if that changes.
 [[source]]
 repo = "tukui-org/ElvUI"
 folders = ["ElvUI", "ElvUI_Libraries", "ElvUI_Options"]
@@ -143,13 +143,23 @@ repo = "Tercioo/Details-Damage-Meter"
 [[source]]
 repo = "CaptainBritish/GnomeLevelUp"
 
-# Their own manifest, with a checksum. GPL-3.0, attribution in the summary.
+[[source]]
+repo = "Azeroth-Pilot-Reloaded/azeroth-pilot-reloaded"
+
+[[source]]
+repo = "iraizo/AutoLayer"
+
+[[source]]
+repo = "davidmeen/TomeOfTeleportation"
+
+# Their own manifest, with a checksum. GPL-3.0, and the name and link credit them.
 [[direct]]
 id = "direct:foreverdb"
 manifest = "https://foreverdb.net/downloads/addon-manifest.json"
 key = "addon"
 site = "https://foreverdb.net"
 name = "ForeverDB"
+summary = "The ForeverDB database in the game: gear upgrades on tooltips, the best quest reward, routes and more."
 author = "ForeverDB"
 website = "https://foreverdb.net"
 
@@ -157,9 +167,64 @@ website = "https://foreverdb.net"
 # These accounts mirror other people's addons. Authors have filed DMCA notices
 # against mirrors, and we never want to send players to one.
 owners = ["hippuli", "curseforge-mirror"]
-repos = ["andi-74/foreverdungeonjournal-mirror"]
+repos = [
+  "andi-74/foreverdungeonjournal-mirror",
+  # Unofficial mirrors and ports of ElvUI, whose code is all rights reserved.
+  "ogri-la/elvui",
+  "ogri-la/tukui",
+  "orbit0r/ElvUI-Forever",
+  # A code template for addon authors, not something to play with.
+  "RGXMods/RGX-Hello",
+  # Bots for a private server kit, not for the live game.
+  "Karrz1/Karrz-playerbots-wow-forever",
+]
 ids = []
 
+# Names and summaries where an addon's own text doesn't work on its own, and
+# boosts where the numbers undercount: GitHub only shows us recent releases, and a
+# source install has no downloads to count at all. A boost of 1 is worth roughly
+# ten times the downloads.
+[overrides."gh:Questie/Questie"]
+summary = "Shows quest givers, objectives and turn-ins on your map and minimap."
+boost = 3.0
+
 [overrides."gh:Tercioo/Details-Damage-Meter"]
+summary = "See damage, healing and more for everyone in your group."
 category = "combat"
-boost = 4.0
+boost = 8.0
+
+[overrides."gh:DeadlyBossMods/DeadlyBossMods"]
+name = "Deadly Boss Mods"
+summary = "Timers and warnings for raid and dungeon bosses."
+boost = 2.5
+
+[overrides."gh:DeadlyBossMods/DBM-Dungeons"]
+name = "Deadly Boss Mods: Dungeons"
+
+[overrides."gh:Tercioo/Plater-Nameplates"]
+boost = 2.0
+
+[overrides."gh:RestedXP/RXPGuides"]
+boost = 1.5
+
+[overrides."gh:EllesmereGaming/EllesmereUI"]
+summary = "A complete interface replacement with its own in-game editor."
+boost = 1.5
+
+[overrides."gh:Nevcairiel/GatherMate2"]
+category = "professions"
+
+[overrides."gh:kemayo/wow-silverdragon"]
+category = "maps"
+
+[overrides."gh:AznamirWoW/PallyPower"]
+category = "combat"
+
+[overrides."gh:vuhdo-io/VuhDo"]
+name = "VuhDo"
+
+[overrides."gh:RaiderIO/raiderio-addon"]
+name = "Raider.IO"
+
+[overrides."direct:foreverdb"]
+category = "misc"

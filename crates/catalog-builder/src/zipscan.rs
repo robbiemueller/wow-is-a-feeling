@@ -3,10 +3,10 @@
 //! details. Nothing is extracted. Works over anything that reads and seeks, so
 //! remote range readers and in-memory downloads share this code.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek};
 
-use feeling_core::toc::{self, Toc};
+use feeling_core::toc::{self, TOC_SUFFIXES, Toc};
 use zip::ZipArchive;
 use zip::read::{ArchiveOffset, Config};
 use zip::result::ZipError;
@@ -29,6 +29,12 @@ const JUNK_FOLDERS: [&str; 8] = [
     "openme",
     "screenshots",
     "docs",
+];
+
+/// TOC suffixes for other game versions.
+const OTHER_GAME_SUFFIXES: [&str; 11] = [
+    "Vanilla", "Classic", "TBC", "BCC", "Wrath", "WOTLK", "WOTLKC", "Cata", "Mists", "MOP",
+    "Standard",
 ];
 
 /// Top-level folders that are packaging leftovers, not addons.
@@ -71,36 +77,13 @@ pub fn scan_zip<R: Read + Seek>(reader: R, hints: &[&str]) -> Result<ZipScan, Sc
         other => ScanError::Invalid(other.to_string()),
     })?;
 
-    let mut tocs_by_folder: BTreeMap<String, Vec<(String, usize)>> = BTreeMap::new();
-    for index in 0..archive.len() {
-        let Some(Ok(raw)) = archive.name_for_index(index) else {
-            continue;
-        };
-        let name = raw.replace('\\', "/");
-        let mut parts = name.split('/');
-        let (Some(folder), Some(file), None) = (parts.next(), parts.next(), parts.next()) else {
-            continue;
-        };
-        if folder.is_empty() || is_junk_folder(folder) || !is_toc_name(file) {
-            continue;
-        }
-        tocs_by_folder
-            .entry(folder.to_string())
-            .or_default()
-            .push((file.to_string(), index));
-    }
-
-    let mut picked: Vec<(String, usize)> = Vec::new();
-    for (folder, files) in &tocs_by_folder {
-        let names: Vec<String> = files.iter().map(|(name, _)| name.clone()).collect();
-        if let Some(choice) = toc::pick_toc(folder, &names) {
-            let index = files
-                .iter()
-                .find(|(name, _)| name == choice)
-                .map_or(0, |(_, index)| *index);
-            picked.push((folder.clone(), index));
-        }
-    }
+    let paths: Vec<(String, usize)> = (0..archive.len())
+        .filter_map(|index| {
+            let name = archive.name_for_index(index)?.ok()?;
+            Some((name.replace('\\', "/"), index))
+        })
+        .collect();
+    let mut picked = addon_folders(&paths);
 
     let hints: Vec<String> = hints
         .iter()
@@ -122,8 +105,152 @@ pub fn scan_zip<R: Read + Seek>(reader: R, hints: &[&str]) -> Result<ZipScan, Sc
     Ok(summarize(folders, &hints))
 }
 
+/// The addon folders a zip's layout gives, each with the index of the TOC the
+/// client would load. That's normally every top-level folder with a TOC named after
+/// it. Hand-made zips also put the TOC at the root, leave a version in the folder's
+/// name, or wrap everything in one more folder. The installer knows those layouts
+/// too, so they're listed under the names they get installed as.
+pub fn addon_folders(paths: &[(String, usize)]) -> Vec<(String, usize)> {
+    let mut root = Vec::new();
+    let mut tops: BTreeMap<&str, Vec<(String, usize)>> = BTreeMap::new();
+    let mut wrapped: BTreeMap<(&str, &str), Vec<(String, usize)>> = BTreeMap::new();
+    for (path, index) in paths {
+        let parts: Vec<&str> = path.split('/').collect();
+        let junk = parts
+            .iter()
+            .rev()
+            .skip(1)
+            .any(|part| part.is_empty() || is_junk_folder(part));
+        match parts.as_slice() {
+            _ if junk => {}
+            [file] if is_toc_name(file) => root.push(((*file).to_string(), *index)),
+            [top, file] if is_toc_name(file) => {
+                tops.entry(top)
+                    .or_default()
+                    .push(((*file).to_string(), *index));
+            }
+            [top, child, file] if is_toc_name(file) => {
+                wrapped
+                    .entry((top, child))
+                    .or_default()
+                    .push(((*file).to_string(), *index));
+            }
+            _ => {}
+        }
+    }
+
+    let mut found: Vec<(String, usize)> = tops
+        .iter()
+        .filter_map(|(top, files)| Some(((*top).to_string(), loaded_toc(top, files)?)))
+        .collect();
+    if let Some(folder) = root_folder(&root)
+        && let Some(index) = loaded_toc(&folder, &root)
+        && !found
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case(&folder))
+    {
+        found.push((folder, index));
+    }
+    if !found.is_empty() {
+        return found;
+    }
+
+    // One folder, with TOCs named for something else: `Repo-main/Foo.toc` can only work as `Foo`.
+    if let [(_, files)] = tops.iter().collect::<Vec<_>>().as_slice() {
+        let mut bases: Vec<&str> = files.iter().map(|(name, _)| toc_base(name)).collect();
+        bases.sort_unstable();
+        bases.dedup();
+        if let [only] = bases.as_slice()
+            && let Some(index) = loaded_toc(only, files)
+        {
+            return vec![((*only).to_string(), index)];
+        }
+    }
+    // Nothing else explains the zip, so one wrapper around real addon folders.
+    let wrappers: BTreeSet<&str> = wrapped.keys().map(|(top, _)| *top).collect();
+    if tops.is_empty() && wrappers.len() == 1 {
+        return wrapped
+            .iter()
+            .filter_map(|((_, child), files)| {
+                Some(((*child).to_string(), loaded_toc(child, files)?))
+            })
+            .collect();
+    }
+    Vec::new()
+}
+
+/// The TOC the client would load for `folder`, out of `files`.
+fn loaded_toc(folder: &str, files: &[(String, usize)]) -> Option<usize> {
+    let names: Vec<String> = files.iter().map(|(name, _)| name.clone()).collect();
+    let choice = toc::pick_toc(folder, &names)?;
+    files
+        .iter()
+        .find(|(name, _)| name == choice)
+        .map(|(_, index)| *index)
+}
+
+/// The folder a zip's root-level TOCs belong in. TOCs for Forever decide first, and
+/// alphabetical order settles the rest, because that's what the installer does.
+fn root_folder(files: &[(String, usize)]) -> Option<String> {
+    let stems: Vec<&str> = files.iter().map(|(name, _)| toc_stem(name)).collect();
+    TOC_SUFFIXES
+        .iter()
+        .filter(|suffix| !suffix.is_empty())
+        .find_map(|suffix| {
+            stems
+                .iter()
+                .filter_map(|stem| strip_suffix_ignoring_case(stem, suffix))
+                .filter(|base| !base.is_empty())
+                .min()
+        })
+        .or_else(|| {
+            stems
+                .iter()
+                .map(|stem| stem_base(stem))
+                .filter(|base| !base.is_empty())
+                .min()
+        })
+        .map(str::to_string)
+}
+
+fn toc_stem(file: &str) -> &str {
+    &file[..file.len() - 4]
+}
+
+/// `Foo_Vanilla.toc` and `Foo-Forever.toc` both belong to `Foo`.
+fn toc_base(file: &str) -> &str {
+    stem_base(toc_stem(file))
+}
+
+fn stem_base(stem: &str) -> &str {
+    let known = TOC_SUFFIXES
+        .iter()
+        .filter(|suffix| !suffix.is_empty())
+        .find_map(|suffix| strip_suffix_ignoring_case(stem, suffix));
+    if let Some(base) = known {
+        return base;
+    }
+    match stem.rfind(['_', '-']) {
+        Some(cut)
+            if OTHER_GAME_SUFFIXES
+                .iter()
+                .any(|f| stem[cut + 1..].eq_ignore_ascii_case(f)) =>
+        {
+            &stem[..cut]
+        }
+        _ => stem,
+    }
+}
+
+fn strip_suffix_ignoring_case<'a>(text: &'a str, suffix: &str) -> Option<&'a str> {
+    let cut = text.len().checked_sub(suffix.len())?;
+    let tail = text.get(cut..)?;
+    tail.eq_ignore_ascii_case(suffix).then(|| &text[..cut])
+}
+
 fn is_toc_name(file: &str) -> bool {
-    file.len() > 4
+    !file.starts_with('.')
+        && file.len() > 4
         && file
             .get(file.len() - 4..)
             .is_some_and(|ext| ext.eq_ignore_ascii_case(".toc"))
@@ -411,21 +538,138 @@ mod tests {
                 ("Foo/sub/Sub.toc", "## Interface: 16001\n"),
                 ("Bar/Baz.toc", "## Interface: 16001\n"),
                 ("Vanilla/Vanilla_Vanilla.toc", "## Interface: 11508\n"),
-                ("loose.toc", "## Interface: 16001\n"),
             ],
             &["Foo"],
         );
         assert_eq!(scan.folders, ["Foo"]);
     }
 
+    fn names_for(paths: &[&str]) -> Vec<String> {
+        let paths: Vec<(String, usize)> = paths
+            .iter()
+            .enumerate()
+            .map(|(i, p)| ((*p).to_string(), i))
+            .collect();
+        addon_folders(&paths)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect()
+    }
+
     #[test]
-    fn a_wrapper_folder_is_not_an_addon() {
+    fn a_wrapper_around_addon_folders_is_looked_through() {
         let scan = scan(
-            &[("Foo-1.0/Foo/Foo.toc", "## Interface: 16001\n")],
+            &[
+                ("Foo-1.0/README.md", "hi"),
+                (
+                    "Foo-1.0/Foo/Foo.toc",
+                    "## Interface: 16001\n## Title: Foo\n",
+                ),
+                (
+                    "Foo-1.0/Foo_Options/Foo_Options.toc",
+                    "## Interface: 16001\n",
+                ),
+                ("Foo-1.0/tools/readme.txt", "hi"),
+            ],
             &["Foo"],
         );
-        assert!(scan.folders.is_empty());
-        assert!(!scan.forever);
+        assert_eq!(scan.folders, ["Foo", "Foo_Options"]);
+        assert!(scan.forever);
+        assert_eq!(scan.title.as_deref(), Some("Foo"));
+    }
+
+    #[test]
+    fn two_wrappers_are_not_a_layout_anyone_can_install() {
+        assert!(names_for(&["W1/A/A.toc", "W2/B/B.toc"]).is_empty());
+    }
+
+    #[test]
+    fn a_real_addon_folder_beside_a_lookalike_wrapper_wins() {
+        assert_eq!(
+            names_for(&["Main/Main.toc", "Extras/Optional/Optional.toc"]),
+            ["Main"]
+        );
+    }
+
+    #[test]
+    fn a_toc_at_the_root_names_the_folder() {
+        for (toc, folder) in [
+            ("MyAddon.toc", "MyAddon"),
+            ("MyAddon_Forever.toc", "MyAddon"),
+            ("MyAddon-Forever.toc", "MyAddon"),
+            ("MyAddon_Camelot.toc", "MyAddon"),
+            ("MyAddon-camelot.TOC", "MyAddon"),
+            ("MyAddon_Mainline.toc", "MyAddon"),
+            ("My_Addon.toc", "My_Addon"),
+        ] {
+            assert_eq!(
+                names_for(&[toc, "core.lua", "Libs/x.lua"]),
+                [folder],
+                "{toc}"
+            );
+        }
+        // A real zip: SimpleDatatexts is zipped by hand from inside its folder.
+        let scan = scan(
+            &[
+                ("SimpleDatatexts.toc", "## Interface: 120105\n"),
+                (
+                    "SimpleDatatexts_Forever.toc",
+                    "## Interface: 16001\n## Title: Simple\n",
+                ),
+                ("Core.lua", ""),
+                (
+                    ".release/SimpleDatatexts/SimpleDatatexts.toc",
+                    "## Interface: 120105\n",
+                ),
+            ],
+            &["SimpleDatatexts"],
+        );
+        assert_eq!(scan.folders, ["SimpleDatatexts"]);
+        assert!(scan.forever);
+        assert_eq!(scan.title.as_deref(), Some("Simple"));
+    }
+
+    #[test]
+    fn root_tocs_that_only_fit_another_game_load_nothing() {
+        assert!(names_for(&["MyAddon_Vanilla.toc"]).is_empty());
+        assert!(
+            names_for(&["._MyAddon.toc"]).is_empty(),
+            "hidden macOS files aren't TOCs"
+        );
+        assert_eq!(
+            names_for(&[
+                "Foo.toc",
+                "Foo_Forever.toc",
+                "Foo_Vanilla.toc",
+                "Other_Forever.toc"
+            ]),
+            ["Foo"],
+            "several TOCs at the root: the same pick as the installer's"
+        );
+    }
+
+    #[test]
+    fn a_folder_with_a_version_in_its_name_is_listed_as_it_installs() {
+        assert_eq!(
+            names_for(&["Foo-1.2.3/Foo.toc", "Foo-1.2.3/core.lua"]),
+            ["Foo"]
+        );
+        assert_eq!(
+            names_for(&[
+                "Foo-main/Foo.toc",
+                "Foo-main/Foo_Forever.toc",
+                "Foo-main/Foo_Vanilla.toc"
+            ]),
+            ["Foo"]
+        );
+        assert!(
+            names_for(&["Mix/One.toc", "Mix/Two.toc"]).is_empty(),
+            "no way to tell which"
+        );
+        assert!(
+            names_for(&["Foo/Foo_Vanilla.toc"]).is_empty(),
+            "the name fits, but not for this game"
+        );
     }
 
     #[test]

@@ -327,12 +327,28 @@ fn from_wowi_category(id: &str) -> Option<&'static str> {
 }
 
 fn from_keywords(words: &[String]) -> Option<&'static str> {
+    let has = |word: &str| words.iter().any(|w| w == word);
+    // Raid frames are unit frames, whatever "raid" means elsewhere.
+    if has("raid") && (has("frames") || has("frame") || has("unitframes")) {
+        return Some("interface");
+    }
     KEYWORDS.iter().find_map(|(category, keys)| {
         words
             .iter()
             .any(|w| keys.contains(&w.as_str()))
             .then_some(*category)
     })
+}
+
+/// In running text, "library" usually means books. Real libraries say so in their
+/// names and folders, which is checked earlier.
+fn from_summary_keywords(words: &[String]) -> Option<&'static str> {
+    let words: Vec<String> = words
+        .iter()
+        .filter(|w| !matches!(w.as_str(), "library" | "libraries"))
+        .cloned()
+        .collect();
+    from_keywords(&words)
 }
 
 /// `Ace3`, `LibStub` and `LibSharedMedia-3.0` go in libraries whatever else they say.
@@ -367,7 +383,7 @@ pub fn categorize(candidate: &Candidate, overrides: Option<&Override>) -> String
         let words: Vec<String> = candidate.topics.iter().flat_map(|t| tokens(t)).collect();
         from_keywords(&words)
     };
-    let from_summary = || from_keywords(&tokens(&candidate.addon.summary));
+    let from_summary = || from_summary_keywords(&tokens(&candidate.addon.summary));
     let generic = || {
         candidate
             .toc_category
@@ -467,6 +483,16 @@ mod tests {
         assert_eq!(categorize(&c, None), "interface");
         c.toc_category = Some("Boss Encounters".into());
         assert_eq!(categorize(&c, None), "bosses");
+    }
+
+    #[test]
+    fn raid_frames_are_not_about_bosses_and_books_are_not_libraries() {
+        let mut c = candidate("VoidBox");
+        c.addon.summary = "Minimalist healer raid frames with click-casting".into();
+        assert_eq!(categorize(&c, None), "interface");
+        c.addon.name = "Lorekeeper".into();
+        c.addon.summary = "Collect and store ingame text items in an adaptive library.".into();
+        assert_eq!(categorize(&c, None), "misc");
     }
 
     #[test]

@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::github::RepoInfo;
 use crate::model::Candidate;
 use crate::text::{normalize, tokens};
+use crate::tier::popularity;
 
 /// Why a repository isn't worth looking at, or `None` if it is.
 pub fn repo_rejection(info: &RepoInfo, hand_picked: bool) -> Option<&'static str> {
@@ -101,6 +102,57 @@ pub fn drop_redundant_forks(candidates: Vec<Candidate>) -> (Vec<Candidate>, Vec<
             dropped.push(candidate.addon.id);
         } else {
             kept.push(candidate);
+        }
+    }
+    (kept, dropped)
+}
+
+/// Copies that aren't GitHub forks: same display name, same main folder, in another
+/// repository. Installing one would overwrite the other, and a player can't tell
+/// them apart. The hand-picked or best-known one stays. Different projects that
+/// happen to share a folder keep different names, so they aren't touched.
+pub fn drop_copies(
+    candidates: Vec<Candidate>,
+    hand_picked: &BTreeSet<String>,
+) -> (Vec<Candidate>, Vec<String>) {
+    let identity = |c: &Candidate| {
+        let main = c
+            .addon
+            .folders
+            .first()
+            .map_or_else(String::new, |f| f.to_ascii_lowercase());
+        (main, normalize(&c.addon.name))
+    };
+    let is_picked = |c: &Candidate| {
+        let repo = c.addon.id.strip_prefix("gh:").unwrap_or(&c.addon.id);
+        hand_picked.contains(&repo.to_ascii_lowercase())
+    };
+    let mut best: BTreeMap<(String, String), (bool, f64, String)> = BTreeMap::new();
+    for candidate in &candidates {
+        let rank = (
+            is_picked(candidate),
+            popularity(candidate, 0.0),
+            candidate.addon.id.clone(),
+        );
+        let slot = best
+            .entry(identity(candidate))
+            .or_insert_with(|| rank.clone());
+        let better = rank
+            .0
+            .cmp(&slot.0)
+            .then(rank.1.total_cmp(&slot.1))
+            .then(slot.2.cmp(&rank.2));
+        if better.is_gt() {
+            *slot = rank;
+        }
+    }
+    let mut kept = Vec::with_capacity(candidates.len());
+    let mut dropped = Vec::new();
+    for candidate in candidates {
+        if best[&identity(&candidate)].2 == candidate.addon.id {
+            kept.push(candidate);
+        } else {
+            dropped.push(candidate.addon.id);
         }
     }
     (kept, dropped)
@@ -284,6 +336,47 @@ mod tests {
         let (kept, dropped) = drop_redundant_forks(vec![a, b]);
         assert_eq!(dropped, ["gh:b/Fork"]);
         assert_eq!(kept[0].addon.id, "gh:a/Fork");
+    }
+
+    #[test]
+    fn copies_under_the_same_name_and_main_folder_go_away() {
+        let mut real = gh("Questie/Questie", &["Questie", "QuestieDB"]);
+        real.addon.name = "Questie".into();
+        real.addon.downloads = 130_000;
+        let mut port = gh("someone/Questie-Forever", &["Questie"]);
+        port.addon.name = "Questie".into();
+        port.addon.downloads = 4_000;
+        let mut other = gh("third/FightClub", &["Questie"]);
+        other.addon.name = "Olympus Fight Club".into();
+        let (kept, dropped) = drop_copies(vec![port, real, other], &BTreeSet::new());
+        assert_eq!(dropped, ["gh:someone/Questie-Forever"]);
+        assert_eq!(kept.len(), 2, "a different name is a different project");
+    }
+
+    #[test]
+    fn a_hand_picked_repo_survives_a_more_popular_copy() {
+        let mut picked = gh("Tercioo/Details-Damage-Meter", &["Details"]);
+        picked.addon.name = "Details!".into();
+        let mut copy = gh("someone/Details", &["Details"]);
+        copy.addon.name = "Details".into();
+        copy.addon.downloads = 50_000;
+        let hand_picked = BTreeSet::from(["tercioo/details-damage-meter".to_string()]);
+        let (kept, dropped) = drop_copies(vec![copy, picked], &hand_picked);
+        assert_eq!(dropped, ["gh:someone/Details"]);
+        assert_eq!(kept[0].addon.id, "gh:Tercioo/Details-Damage-Meter");
+    }
+
+    #[test]
+    fn equal_copies_are_settled_the_same_way_every_time() {
+        let a = gh("a/One", &["Foo"]);
+        let b = gh("b/Two", &["Foo"]);
+        let mut a2 = a.clone();
+        a2.addon.name = "Foo".into();
+        let mut b2 = b.clone();
+        b2.addon.name = "Foo".into();
+        let (first, _) = drop_copies(vec![a2.clone(), b2.clone()], &BTreeSet::new());
+        let (second, _) = drop_copies(vec![b2, a2], &BTreeSet::new());
+        assert_eq!(first[0].addon.id, second[0].addon.id);
     }
 
     fn info(name: &str) -> RepoInfo {

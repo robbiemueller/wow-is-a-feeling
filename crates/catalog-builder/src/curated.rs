@@ -241,6 +241,8 @@ pub struct SourcePlan {
 pub enum Refusal {
     /// `.pkgmeta` pulls in libraries from elsewhere, and the archive doesn't have them.
     Externals(usize),
+    /// Git submodules aren't part of a source archive either.
+    Submodules,
     /// No folder has a TOC we could find.
     NoToc,
     /// The TOCs exist but none targets Forever.
@@ -253,6 +255,10 @@ impl std::fmt::Display for Refusal {
             Refusal::Externals(count) => write!(
                 f,
                 ".pkgmeta lists {count} externals, so a source archive would be missing libraries"
+            ),
+            Refusal::Submodules => write!(
+                f,
+                "the repository uses git submodules, which a source archive doesn't include"
             ),
             Refusal::NoToc => write!(f, "no folder has a TOC the client could load"),
             Refusal::NotForever => write!(f, "no TOC targets Forever"),
@@ -270,6 +276,9 @@ pub fn plan_source_install(
 ) -> Result<Result<SourcePlan, Refusal>, String> {
     if !meta.externals.is_empty() {
         return Ok(Err(Refusal::Externals(meta.externals.len())));
+    }
+    if read_file(".gitmodules")?.is_some_and(|text| text.contains("path")) {
+        return Ok(Err(Refusal::Submodules));
     }
     let package = meta.package_as.as_deref().unwrap_or(repo_name);
     let main = spec.folders.first().map_or(package, String::as_str);
@@ -461,7 +470,7 @@ pub fn process_source(
                 break;
             }
             // The same recipe applies to older tags, so looking further won't help.
-            Err(refusal @ Refusal::Externals(_)) => {
+            Err(refusal @ (Refusal::Externals(_) | Refusal::Submodules)) => {
                 refused = Some(refusal.to_string());
                 break;
             }
@@ -857,6 +866,21 @@ mod tests {
         });
         assert_eq!(result.unwrap().unwrap_err(), Refusal::Externals(2));
         assert_eq!(reads, 0);
+    }
+
+    #[test]
+    fn git_submodules_refuse_the_install() {
+        let tree = files(&[
+            ("Foo.toc", "## Interface: 16001\n"),
+            (
+                ".gitmodules",
+                "[submodule \"Libs/Ace3\"]\n\tpath = Libs/Ace3\n\turl = https://x.test/ace3\n",
+            ),
+        ]);
+        assert_eq!(
+            plan(&SourceSpec::default(), "Foo", "", &tree).unwrap_err(),
+            Refusal::Submodules
+        );
     }
 
     #[test]

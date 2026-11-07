@@ -10,7 +10,7 @@ use crate::http::{Channel, FetchError, Http, ZIP_BODY};
 
 const BLOCK: u64 = 32 * 1024;
 /// The first read fetches this much from the end: the directory usually fits.
-const TAIL: u64 = 128 * 1024;
+const TAIL: u64 = 64 * 1024;
 /// Sequential reads double their request size up to this many blocks.
 const MAX_RUN: u64 = 32;
 /// A zip's directory and TOCs never need this much. Past it, something is wrong
