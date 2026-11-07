@@ -110,6 +110,17 @@ impl Script {
             "adopt" => app.actions.push(Action::Adopt(rest.to_owned())),
             "zip" => app.actions.push(Action::ZipDropped(PathBuf::from(rest))),
             "updateall" => app.actions.push(Action::UpdateAll),
+            "checkapp" => app.actions.push(Action::CheckUpdateNow),
+            // What the update prompt's main button does, for a rig testing a real update.
+            "updateapp" => match app.popup.take() {
+                Some(crate::dialogs::Popup::AppUpdate(info)) => {
+                    app.actions.push(Action::UpdateNow(info));
+                }
+                other => {
+                    app.popup = other;
+                    self.log("no update is being offered");
+                }
+            },
             "select" => app
                 .actions
                 .push(Action::Select(Selection::Addon(rest.to_owned()))),
