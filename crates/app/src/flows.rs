@@ -964,6 +964,41 @@ fn a_required_addon_from_a_stranger_stays_out_and_the_player_is_told() {
 }
 
 #[test]
+fn a_dropped_zips_folder_that_a_catalog_addon_lists_but_does_not_bring_stays_shared() {
+    let rig = Rig::new();
+    // The catalog's list comes from one build, and this build of Foo leaves Side out.
+    let foo = |version: &str| publish_bundle(&rig.site, FOO, &["Foo", "Side"], &["Foo"], version);
+    rig.site.publish(&catalog_of(vec![foo("1.0")]));
+    let mut h = rig.launch_settled();
+    let zip = rig.home.path().join("Side.zip");
+    fs::write(&zip, addon_zip("Side", "mine")).unwrap();
+    drop_file(&mut h, zip);
+    finish_ops(&mut h);
+    assert!(managed(&h, "local:Side").is_some());
+
+    click(&mut h, "Browse");
+    click(&mut h, "Foo Addon, 1.0");
+    click(&mut h, "Install");
+    assert!(has_label(&h, "Side: part of Side"));
+    click(&mut h, "Replace them");
+    finish_ops(&mut h);
+    assert_eq!(rig.version_on_disk("Side").as_deref(), Some("mine"));
+    assert!(
+        managed(&h, "local:Side").is_some(),
+        "the zip didn't bring Side, so the dropped one still has it"
+    );
+    close(h);
+
+    // So Foo doesn't own it alone, and its next version, without it too, leaves it there.
+    rig.site.publish(&catalog_of(vec![foo("2.0")]));
+    let mut h = rig.launch_settled();
+    click(&mut h, "Update all (1)");
+    finish_ops(&mut h);
+    assert_eq!(rig.version_on_disk("Foo").as_deref(), Some("2.0"));
+    assert_eq!(rig.version_on_disk("Side").as_deref(), Some("mine"));
+}
+
+#[test]
 fn a_required_addon_nobody_reviewed_is_left_for_the_player_to_install() {
     let rig = Rig::new();
     // Old enough to trust, but no person picked it, and it could be anyone's Foo.

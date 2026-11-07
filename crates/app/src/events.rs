@@ -382,7 +382,9 @@ impl App {
                 now,
             },
         );
-        for stale in ops::stale_records(&record.managed, &id, origin, &folders) {
+        // Only what the zip really brought replaced anything. A folder kept in the record
+        // because another addon claims it is still that addon's too.
+        for stale in ops::stale_records(&record.managed, &id, origin, &outcome.folders) {
             record.managed.remove(&stale);
         }
         record.managed.insert(id.clone(), new_record);
