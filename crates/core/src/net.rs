@@ -1,9 +1,9 @@
 //! HTTP for everything the app fetches: catalog with ETags, addon zips, update files.
 //!
 //! The app only ever talks to the public internet over https. Redirects are followed by
-//! hand so every hop goes through the same URL check, and a URL that a stranger wrote
-//! (a README's image, say) also goes through a resolver that refuses private addresses,
-//! because a name can point anywhere.
+//! hand so every hop goes through the same URL check. A URL that a stranger wrote (a
+//! README's image, say) has to stay on a short list of hosts, and goes through a resolver
+//! that refuses private addresses, because a name can point anywhere.
 
 use std::borrow::Cow;
 use std::fs::{self, File};
@@ -58,6 +58,17 @@ const INTERNAL_SUFFIXES: [&str; 11] = [
     ".mshome.net",
 ];
 
+/// The only places a link from an addon's page can lead. Nearly every real screenshot is on
+/// one of these, and keeping to them means a page can't make the app contact anyone else: no
+/// tracking pixels, and the README's list of hosts stays true.
+const SCREENSHOT_HOSTS: [&str; 5] = [
+    "github.com",
+    "githubusercontent.com",
+    "mmoui.com",
+    "imgur.com",
+    "postimg.cc",
+];
+
 /// How far a long-running operation has got, in bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Progress {
@@ -83,6 +94,8 @@ enum Reach {
     Public,
     /// The same, plus plain http to this machine, so a test can serve files locally.
     PublicAndLoopback,
+    /// https to [`SCREENSHOT_HOSTS`] only, for links a stranger wrote.
+    Screenshots,
 }
 
 /// A shared HTTP client. Cheap to clone; clones share their connection pools.
@@ -136,11 +149,11 @@ impl Http {
     }
 
     /// Fetch a URL a stranger wrote, such as an image in a README or on an addon's page.
-    /// Beyond the usual rules, a name that resolves to this machine or the local network
-    /// is refused at connect time, on every hop, and no client relaxes that.
+    /// Every hop has to stay on [`SCREENSHOT_HOSTS`], and a name that resolves to this
+    /// machine or the local network is refused at connect time. No client relaxes that.
     pub fn get_untrusted(&self, url: &str, max_bytes: u64) -> Result<Vec<u8>> {
-        let start = Target::parse(url, Reach::Public)?;
-        let opened = follow_redirects(&self.stranger_agent, start, None, Reach::Public)
+        let start = Target::parse(url, Reach::Screenshots)?;
+        let opened = follow_redirects(&self.stranger_agent, start, None, Reach::Screenshots)
             .map_err(|failure| failure.error)?;
         read_limited(opened, max_bytes)
     }
@@ -504,6 +517,11 @@ impl Target {
                 "Refused to connect to {host} because it isn't a public web address."
             )));
         }
+        if reach == Reach::Screenshots && !is_screenshot_host(&host) {
+            return Err(Error::Other(format!(
+                "Refused to load a picture from {host}, which isn't on this app's short list."
+            )));
+        }
         Ok(Target {
             url,
             host,
@@ -516,6 +534,19 @@ impl Target {
 /// first look for links that won't be requested until later; the checks still run then.
 pub fn is_public_url(url: &str) -> bool {
     Target::parse(url, Reach::Public).is_ok()
+}
+
+/// Whether [`Http::get_untrusted`] would try this link at all.
+pub fn is_screenshot_url(url: &str) -> bool {
+    Target::parse(url, Reach::Screenshots).is_ok()
+}
+
+fn is_screenshot_host(host: &str) -> bool {
+    let name = host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase();
+    SCREENSHOT_HOSTS.iter().any(|allowed| {
+        name.strip_suffix(allowed)
+            .is_some_and(|rest| rest.is_empty() || rest.ends_with('.'))
+    })
 }
 
 /// Whether `host` is a name on the public internet. An address written as numbers is
@@ -1375,6 +1406,59 @@ mod tests {
         ] {
             assert!(Target::parse(url, Reach::Public).is_ok(), "{url}");
         }
+    }
+
+    #[test]
+    fn a_strangers_link_has_to_stay_on_the_short_list() {
+        for url in [
+            "https://raw.githubusercontent.com/a/b/HEAD/shot.png",
+            "https://user-images.githubusercontent.com/1/shot.png",
+            "https://github.com/user-attachments/assets/abc",
+            "https://GitHub.com./a/b/raw/HEAD/shot.png",
+            "https://cdn-wow.mmoui.com/preview/pvw29.jpg",
+            "https://i.imgur.com/abc.png",
+            "https://imgur.com/abc.png",
+            "https://i.postimg.cc/abc/shot.png",
+        ] {
+            assert!(is_screenshot_url(url), "{url}");
+        }
+        let http = Http::new();
+        for url in [
+            "https://tracker.example.com/pixel.png",
+            "https://notgithub.com/shot.png",
+            "https://github.com.evil.example/shot.png",
+            "https://evilimgur.com/shot.png",
+            "https://media.forgecdn.net/shot.png",
+            "http://i.imgur.com/abc.png",
+            "https://127.0.0.1/shot.png",
+        ] {
+            assert!(!is_screenshot_url(url), "{url}");
+            let result = http.get_untrusted(url, 10);
+            assert!(matches!(result, Err(Error::Other(_))), "{url}: {result:?}");
+        }
+    }
+
+    #[test]
+    fn a_strangers_link_cannot_redirect_off_the_short_list() {
+        let page = serve(|_, stream| {
+            respond(
+                stream,
+                "302 Found",
+                &[("Location", "https://tracker.example.com/pixel.png")],
+                b"",
+            );
+        });
+        let start = Target::parse(&format!("{}/x", page.base), Reach::PublicAndLoopback).unwrap();
+        let Err(failure) = follow_redirects(&Http::new().agent, start, None, Reach::Screenshots)
+        else {
+            panic!("followed a redirect off the short list");
+        };
+        assert!(
+            matches!(failure.error, Error::Other(_)),
+            "{:?}",
+            failure.error
+        );
+        assert_eq!(page.hits.load(Ordering::SeqCst), 1);
     }
 
     #[test]

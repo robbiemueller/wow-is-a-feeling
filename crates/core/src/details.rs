@@ -206,7 +206,7 @@ fn fetch_wowi(http: &Http, id: u64, addon: &Addon, endpoints: &Endpoints<'_>) ->
             .images
             .iter()
             .filter_map(|url| absolute_https(url))
-            .filter(|url| net::is_public_url(url))
+            .filter(|url| net::is_screenshot_url(url))
             .take(MAX_IMAGES)
             .collect(),
     })
@@ -838,7 +838,8 @@ pub fn image_urls_from_markdown(markdown: &str, raw_base: &str) -> Vec<String> {
         let Some(url) = candidate.filter(|url| !is_badge(url)) else {
             continue;
         };
-        let Some(url) = resolve_image(url, raw_base).filter(|url| net::is_public_url(url)) else {
+        let Some(url) = resolve_image(url, raw_base).filter(|url| net::is_screenshot_url(url))
+        else {
             continue;
         };
         if !images.contains(&url) {
@@ -978,7 +979,7 @@ mod tests {
                 stream,
                 "200 OK",
                 &[],
-                b"# Title\n\n[![Build](https://img.shields.io/x.svg)](https://ci)\n\nHello **world**.\n\n![shot](https://cdn.example/shot.png)\n",
+                b"# Title\n\n[![Build](https://img.shields.io/x.svg)](https://ci)\n\nHello **world**.\n\n![shot](https://i.imgur.com/shot.png)\n",
             ),
             "/owner/repo/HEAD/CHANGELOG.md" => respond(stream, "200 OK", &[], b"## 1.0\n- First\n"),
             other => panic!("unexpected request for {other}"),
@@ -988,7 +989,7 @@ mod tests {
             fetch_from(&Http::allowing_loopback(), &github(), &endpoints(&server)).unwrap();
         assert_eq!(details.about, "Title\n\nHello world.");
         assert_eq!(details.changelog.as_deref(), Some("1.0\n\n• First"));
-        assert_eq!(details.images, ["https://cdn.example/shot.png"]);
+        assert_eq!(details.images, ["https://i.imgur.com/shot.png"]);
     }
 
     #[test]
@@ -1119,10 +1120,10 @@ mod tests {
         });
         let big = Addon {
             images: vec![
-                "https://cdn.example/1.png".into(),
-                "http://cdn.example/2.png".into(),
-                "https://cdn.example/3.png".into(),
-                "https://cdn.example/4.png".into(),
+                "https://i.imgur.com/1.png".into(),
+                "http://i.imgur.com/2.png".into(),
+                "https://i.imgur.com/3.png".into(),
+                "https://i.imgur.com/4.png".into(),
             ],
             ..addon(Source::Wowi { id: 5086 })
         };
@@ -1132,9 +1133,9 @@ mod tests {
         assert_eq!(
             details.images,
             [
-                "https://cdn.example/1.png",
-                "https://cdn.example/2.png",
-                "https://cdn.example/3.png"
+                "https://i.imgur.com/1.png",
+                "https://i.imgur.com/2.png",
+                "https://i.imgur.com/3.png"
             ]
         );
     }
@@ -1321,7 +1322,7 @@ mod tests {
         ] {
             let _ = markdown_to_text(nasty);
             let _ = bbcode_to_text(nasty);
-            let _ = image_urls_from_markdown(nasty, "https://raw.example");
+            let _ = image_urls_from_markdown(nasty, "https://raw.githubusercontent.com/a/b/HEAD");
         }
     }
 
@@ -1443,7 +1444,7 @@ mod tests {
             let markdown = started.elapsed();
             let _ = bbcode_to_text(case);
             let bbcode = started.elapsed() - markdown;
-            let _ = image_urls_from_markdown(case, "https://raw.example");
+            let _ = image_urls_from_markdown(case, "https://raw.githubusercontent.com/a/b/HEAD");
             let images = started.elapsed() - markdown - bbcode;
             let limit = std::time::Duration::from_secs(10);
             let shown: String = case.chars().take(12).collect();
@@ -1489,8 +1490,8 @@ mod tests {
 ![Ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)
 ![Shot one](docs/images/one.png "A title")
 <img src="./docs/two.jpg" width="400">
-<IMG SRC='https://cdn.example/three.png'>
-![Too many](https://cdn.example/four.png)
+<IMG SRC='https://i.imgur.com/three.png'>
+![Too many](https://i.imgur.com/four.png)
 "#;
         let raw = "https://raw.githubusercontent.com/a/b/HEAD";
         assert_eq!(
@@ -1498,7 +1499,7 @@ mod tests {
             [
                 "https://raw.githubusercontent.com/a/b/HEAD/docs/images/one.png",
                 "https://raw.githubusercontent.com/a/b/HEAD/docs/two.jpg",
-                "https://cdn.example/three.png",
+                "https://i.imgur.com/three.png",
             ]
         );
     }
@@ -1528,10 +1529,10 @@ mod tests {
             ["https://raw.githubusercontent.com/a/b/HEAD/a b/x y.png"]
         );
         assert_eq!(
-            one("http://plain.example/x.png"),
-            ["https://plain.example/x.png"]
+            one("http://i.imgur.com/x.png"),
+            ["https://i.imgur.com/x.png"]
         );
-        assert_eq!(one("//cdn.example/x.png"), ["https://cdn.example/x.png"]);
+        assert_eq!(one("//i.imgur.com/x.png"), ["https://i.imgur.com/x.png"]);
         assert_eq!(
             one("https://github.com/o/r/blob/main/img/x.png?raw=true"),
             ["https://raw.githubusercontent.com/o/r/main/img/x.png"]
@@ -1568,15 +1569,22 @@ mod tests {
             "https://me@10.0.0.1:444/x.png",
             "https://router/x.png",
             "https://2130706433/x.png",
+            "https://tracker.example.com/pixel.png",
         ] {
             assert!(
-                image_urls_from_markdown(&format!("![x]({url})"), "https://raw.example").is_empty(),
+                image_urls_from_markdown(
+                    &format!("![x]({url})"),
+                    "https://raw.githubusercontent.com/a/b/HEAD"
+                )
+                .is_empty(),
                 "{url}"
             );
         }
-        let fine =
-            image_urls_from_markdown("![x](https://cdn.example/a.png)", "https://raw.example");
-        assert_eq!(fine, ["https://cdn.example/a.png"]);
+        let fine = image_urls_from_markdown(
+            "![x](https://i.imgur.com/a.png)",
+            "https://raw.githubusercontent.com/a/b/HEAD",
+        );
+        assert_eq!(fine, ["https://i.imgur.com/a.png"]);
     }
 
     #[test]
@@ -1590,12 +1598,12 @@ mod tests {
                 "http://192.168.1.1/b.png".into(),
                 "//localhost/c.png".into(),
                 "https://router/d.png".into(),
-                "https://cdn.example/fine.png".into(),
+                "https://i.imgur.com/fine.png".into(),
             ],
             ..addon(Source::Wowi { id: 1 })
         };
         let details = fetch_from(&Http::allowing_loopback(), &page, &endpoints(&server)).unwrap();
-        assert_eq!(details.images, ["https://cdn.example/fine.png"]);
+        assert_eq!(details.images, ["https://i.imgur.com/fine.png"]);
     }
 
     #[test]
@@ -1610,7 +1618,10 @@ mod tests {
     #[test]
     fn repeated_images_count_once() {
         let md = "![a](x.png) ![b](x.png) ![c](y.png)";
-        assert_eq!(image_urls_from_markdown(md, "https://raw.example").len(), 2);
+        assert_eq!(
+            image_urls_from_markdown(md, "https://raw.githubusercontent.com/a/b/HEAD").len(),
+            2
+        );
     }
 
     #[test]
