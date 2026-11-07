@@ -51,10 +51,50 @@ const JUNK_NAMES: [&str; 8] = [
 /// Never written, because nothing in an addon needs them and players do double-click
 /// things. Skipped and reported rather than fatal, since dev scripts turn up in real
 /// source archives. The last few aren't in the design's list, but a shortcut or an
-/// HTML application in an addon folder is the same lure as an `.exe`.
+/// HTML application in an addon folder is the same lure as an `.exe`. Checked on every
+/// segment of a path, so nothing inside a `Foo.app/` bundle gets written either.
 const BLOCKED_EXTENSIONS: [&str; 19] = [
     "exe", "dll", "scr", "com", "msi", "bat", "cmd", "ps1", "sh", "jar", "vbs", "app", "dylib",
     "so", "lnk", "pif", "hta", "cpl", "wsf",
+];
+
+/// The same lure, on file names only, because a folder called `Foo.Terminal` is just a
+/// folder: script hosts and shortcuts that run on a double-click, then disk images and
+/// archives that put a program one click away. The game reads none of these. It loads
+/// what its TOCs list, which is `lua`, `xml`, `blp`, `tga`, `ogg`, `mp3`, `ttf` and so on.
+const BLOCKED_FILE_EXTENSIONS: [&str; 32] = [
+    "vbe",
+    "jse",
+    "js",
+    "wsh",
+    "msc",
+    "chm",
+    "reg",
+    "msp",
+    "url",
+    "website",
+    "scf",
+    "library-ms",
+    "searchconnector-ms",
+    "appref-ms",
+    "application",
+    "xbap",
+    "settingcontent-ms",
+    "xll",
+    "diagcab",
+    "py",
+    "pyw",
+    "pyz",
+    "command",
+    "terminal",
+    "iso",
+    "img",
+    "vhd",
+    "vhdx",
+    "zip",
+    "7z",
+    "rar",
+    "cab",
 ];
 
 /// `Foo_Vanilla.toc`, `Foo-Classic.toc` and friends: TOC names the Forever client
@@ -605,15 +645,16 @@ fn is_junk_path(path: &str) -> bool {
     })
 }
 
-/// Checks every segment, so nothing inside a `Foo.app/` bundle gets written either.
-fn is_blocked_path(path: &str) -> bool {
-    path.split('/').any(|segment| {
-        segment.rsplit_once('.').is_some_and(|(_, ext)| {
-            BLOCKED_EXTENSIONS
-                .iter()
-                .any(|blocked| ext.eq_ignore_ascii_case(blocked))
-        })
-    })
+fn is_blocked_path(path: &str, is_dir: bool) -> bool {
+    let has_extension_in = |name: &str, list: &[&str]| {
+        name.rsplit_once('.')
+            .is_some_and(|(_, ext)| list.iter().any(|blocked| ext.eq_ignore_ascii_case(blocked)))
+    };
+    let file_name = path.rsplit('/').next().unwrap_or(path);
+    (!is_dir && has_extension_in(file_name, &BLOCKED_FILE_EXTENSIONS))
+        || path
+            .split('/')
+            .any(|segment| has_extension_in(segment, &BLOCKED_EXTENSIONS))
 }
 
 fn is_toc_name(name: &str) -> bool {
@@ -871,11 +912,11 @@ fn plan_from_mapped(
     allow_executables: bool,
     limits: &Limits,
 ) -> Result<Plan> {
-    let is_held_back = |dest: &str| !allow_executables && is_blocked_path(dest);
+    let is_held_back = |dest: &str, is_dir| !allow_executables && is_blocked_path(dest, is_dir);
     // Case-folded top-level name to its spelling.
     let mut folders: HashMap<String, String> = HashMap::new();
     for (entry, dest) in &mapped {
-        if is_held_back(dest) {
+        if is_held_back(dest, entry.is_dir) {
             continue;
         }
         match dest.split_once('/') {
@@ -905,7 +946,7 @@ fn plan_from_mapped(
                 "it has two folders that differ only by capital letters ({spelling} and {top})."
             )));
         }
-        if is_held_back(&dest) {
+        if is_held_back(&dest, entry.is_dir) {
             log::warn!("Skipped an executable in a zip: {}", printable(&dest));
             plan.skipped.push(dest);
             continue;
@@ -2402,6 +2443,67 @@ mod tests {
     }
 
     #[test]
+    fn scripts_shortcuts_and_disk_images_are_skipped_and_reported() {
+        let mut names: Vec<String> = BLOCKED_FILE_EXTENSIONS
+            .iter()
+            .flat_map(|ext| {
+                [
+                    format!("Foo/lure.{ext}"),
+                    format!("Foo/deep/er/LURE.{}", ext.to_ascii_uppercase()),
+                ]
+            })
+            .collect();
+        let mut entries = vec![
+            RawEntry::new("Foo/Foo.toc", TOC),
+            RawEntry::new("Foo/fine.lua", b"ok"),
+        ];
+        entries.extend(names.iter().map(|n| RawEntry::new(n, b"payload")));
+        let fixture = Fixture::new();
+        let extracted = fixture.extract(&raw_zip(&entries), &[]).unwrap();
+        assert_eq!(paths(&fixture), ["Foo/Foo.toc", "Foo/fine.lua"]);
+        names.sort();
+        assert_eq!(extracted.skipped_files, names);
+    }
+
+    #[test]
+    fn what_the_game_loads_is_never_held_back() {
+        let kept = [
+            "toc", "lua", "xml", "blp", "tga", "ogg", "mp3", "wav", "ttf", "otf", "m2", "skin",
+            "anim", "bone", "phys", "wmo", "bls", "txt", "md", "json", "png", "jpg", "html",
+        ];
+        let mut entries = vec![RawEntry::new("Foo/Foo.toc", TOC)];
+        entries.extend(
+            kept.iter()
+                .map(|ext| RawEntry::new(format!("Foo/media/file.{ext}"), b"1")),
+        );
+        let fixture = Fixture::new();
+        let extracted = fixture.extract(&raw_zip(&entries), &[]).unwrap();
+        assert!(extracted.skipped_files.is_empty());
+        assert_eq!(fixture.tree().len(), kept.len() + 1);
+    }
+
+    #[test]
+    fn a_folder_named_like_a_blocked_file_type_is_still_a_folder() {
+        let fixture = Fixture::new();
+        let bytes = raw_zip(&[
+            RawEntry::new("Foo.Terminal/Foo.Terminal.toc", TOC),
+            RawEntry::new("Foo.Terminal/Libs/Bar.Command/bar.lua", b"1"),
+            RawEntry::new("Foo.Terminal/Empty.Reg/", b""),
+            RawEntry::new("Foo.Py/Foo.Py.toc", TOC),
+        ]);
+        let extracted = fixture.extract(&bytes, &[]).unwrap();
+        assert_eq!(extracted.folders, ["Foo.Py", "Foo.Terminal"]);
+        assert!(extracted.skipped_files.is_empty());
+        assert!(
+            fixture
+                .dest()
+                .join("Foo.Terminal/Libs/Bar.Command/bar.lua")
+                .is_file()
+        );
+        assert!(fixture.dest().join("Foo.Terminal/Empty.Reg").is_dir());
+    }
+
+    #[test]
     fn executables_in_dropped_folders_are_not_reported() {
         let fixture = Fixture::new();
         let bytes = raw_zip(&[
@@ -2420,10 +2522,12 @@ mod tests {
             RawEntry::new("Foo/shell.lua", b"1"),
             RawEntry::new("Foo/com", b"2"),
             RawEntry::new("Foo/app/thing.lua", b"3"),
+            RawEntry::new("Foo/js", b"4"),
+            RawEntry::new("Foo/zip/thing.py.lua", b"5"),
         ]);
         let extracted = fixture.extract(&bytes, &[]).unwrap();
         assert!(extracted.skipped_files.is_empty());
-        assert_eq!(fixture.tree().len(), 4);
+        assert_eq!(fixture.tree().len(), 6);
     }
 
     #[test]
