@@ -459,15 +459,13 @@ mod tests {
 
     #[test]
     fn stops_before_downloading_a_whole_archive() {
-        let data = sample(200 * 1024 * 1024);
-        let size = data.len() as u64;
-        let mut reader = RangeReader::new(
-            Memory {
-                data,
-                calls: vec![],
-            },
-            size,
-        );
+        struct Endless;
+        impl RangeSource for Endless {
+            fn fetch(&mut self, start: u64, end: u64) -> io::Result<RangeReply> {
+                Ok(RangeReply::Partial(vec![0; (end - start + 1) as usize]))
+            }
+        }
+        let mut reader = RangeReader::new(Endless, 1 << 40);
         let mut sink = Vec::new();
         let error = reader.read_to_end(&mut sink).unwrap_err();
         assert!(

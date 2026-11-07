@@ -14,7 +14,10 @@ use crate::github::{self, RepoInfo};
 use crate::http::{Channel, Http, unix_now};
 use crate::model::{Candidate, ZipScan};
 use crate::rangezip::{HttpRange, RangeReader};
-use crate::text::{clean_author, clean_name, clean_summary, clean_version, encode_path};
+use crate::text::{
+    clean_author, clean_name, clean_summary, clean_version, encode_path, round_sig,
+    says_nothing_new,
+};
 use crate::zipscan::{parse_toc, scan_zip};
 
 /// `catalog/seeds.toml`.
@@ -495,11 +498,10 @@ pub fn source_candidate(info: &RepoInfo, build: &SourceBuild) -> Candidate {
     if name.is_empty() {
         name = main.to_string();
     }
-    let summary = scan
-        .notes
-        .as_deref()
-        .or(info.description.as_deref())
-        .unwrap_or_default();
+    let mut summary = clean_summary(scan.notes.as_deref().unwrap_or_default());
+    if says_nothing_new(&summary, &name) {
+        summary = clean_summary(info.description.as_deref().unwrap_or_default());
+    }
     let mut author = clean_author(scan.author.as_deref().unwrap_or_default());
     if author.is_empty() {
         author = info.name.split('/').next().unwrap_or_default().to_string();
@@ -508,7 +510,7 @@ pub fn source_candidate(info: &RepoInfo, build: &SourceBuild) -> Candidate {
         addon: Addon {
             id: format!("gh:{}", info.name),
             name,
-            summary: clean_summary(summary),
+            summary,
             author,
             source: Source::Github {
                 repo: info.name.clone(),
@@ -523,7 +525,7 @@ pub fn source_candidate(info: &RepoInfo, build: &SourceBuild) -> Candidate {
             }),
             folders: scan.folders.clone(),
             deps: scan.external_deps(),
-            stars: info.stars,
+            stars: u32::try_from(round_sig(u64::from(info.stars), 3)).unwrap_or(info.stars),
             ids: scan.external_ids(),
             ..Addon::default()
         },

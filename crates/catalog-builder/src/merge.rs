@@ -110,7 +110,8 @@ pub fn drop_redundant_forks(candidates: Vec<Candidate>) -> (Vec<Candidate>, Vec<
 /// Copies that aren't GitHub forks: same display name, same main folder, in another
 /// repository. Installing one would overwrite the other, and a player can't tell
 /// them apart. The hand-picked or best-known one stays. Different projects that
-/// happen to share a folder keep different names, so they aren't touched.
+/// happen to share a folder keep different names, so they aren't touched. Only
+/// repositories compete here, because WoWInterface entries merge on stricter rules.
 pub fn drop_copies(
     candidates: Vec<Candidate>,
     hand_picked: &BTreeSet<String>,
@@ -127,8 +128,9 @@ pub fn drop_copies(
         let repo = c.addon.id.strip_prefix("gh:").unwrap_or(&c.addon.id);
         hand_picked.contains(&repo.to_ascii_lowercase())
     };
+    let is_repo = |c: &Candidate| c.addon.id.starts_with("gh:");
     let mut best: BTreeMap<(String, String), (bool, f64, String)> = BTreeMap::new();
-    for candidate in &candidates {
+    for candidate in candidates.iter().filter(|c| is_repo(c)) {
         let rank = (
             is_picked(candidate),
             popularity(candidate, 0.0),
@@ -149,7 +151,7 @@ pub fn drop_copies(
     let mut kept = Vec::with_capacity(candidates.len());
     let mut dropped = Vec::new();
     for candidate in candidates {
-        if best[&identity(&candidate)].2 == candidate.addon.id {
+        if !is_repo(&candidate) || best[&identity(&candidate)].2 == candidate.addon.id {
             kept.push(candidate);
         } else {
             dropped.push(candidate.addon.id);
@@ -364,6 +366,16 @@ mod tests {
         let (kept, dropped) = drop_copies(vec![copy, picked], &hand_picked);
         assert_eq!(dropped, ["gh:someone/Details"]);
         assert_eq!(kept[0].addon.id, "gh:Tercioo/Details-Damage-Meter");
+    }
+
+    #[test]
+    fn a_wowi_entry_is_never_treated_as_a_copy() {
+        let mut repo = gh("a/Foo", &["Foo", "FooExtra"]);
+        repo.addon.name = "Foo".into();
+        let listing = wowi(1, "Foo", &["Foo"]);
+        let (kept, dropped) = drop_copies(vec![repo, listing], &BTreeSet::new());
+        assert!(dropped.is_empty());
+        assert_eq!(kept.len(), 2);
     }
 
     #[test]

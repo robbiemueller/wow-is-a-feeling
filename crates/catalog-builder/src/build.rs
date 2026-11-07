@@ -22,7 +22,8 @@ use crate::model::{Candidate, ZipScan};
 use crate::rangezip::{HttpRange, RangeReader};
 use crate::state::{RepoState, State, write_atomic};
 use crate::text::{
-    clean_author, clean_name, clean_summary, clean_version, round_sig, valid_repo_name,
+    clean_author, clean_name, clean_summary, clean_version, round_sig, says_nothing_new,
+    valid_repo_name,
 };
 use crate::tier::assign_tiers;
 use crate::wowi::{self, WowiState};
@@ -190,7 +191,7 @@ pub fn github_candidate(
         name = clean_name(main);
     }
     let mut summary = clean_summary(scan.notes.as_deref().unwrap_or_default());
-    if summary.is_empty() {
+    if says_nothing_new(&summary, &name) {
         summary = clean_summary(info.description.as_deref().unwrap_or_default());
     }
     let mut author = clean_author(scan.author.as_deref().unwrap_or_default());
@@ -816,13 +817,16 @@ pub fn run(options: &Options) -> Result<(), String> {
     for id in &dropped {
         eprintln!("{id}: dropped, a fork with the same folders as a listed repository");
     }
-    let (github_entries, copies) = merge::drop_copies(github_entries, &curated.named_repos());
+    let (candidates, merged) = merge::merge_wowi(github_entries, wowi_entries);
+    // After the merge, so WoWInterface's counts help tell the original from a copy.
+    let mut hand_picked = curated.named_repos();
+    hand_picked.extend(seeds.repos.iter().map(|repo| repo.to_ascii_lowercase()));
+    let (mut candidates, copies) = merge::drop_copies(candidates, &hand_picked);
     for id in &copies {
         eprintln!(
             "{id}: dropped, a copy with the same name and main folder as a listed repository"
         );
     }
-    let (mut candidates, merged) = merge::merge_wowi(github_entries, wowi_entries);
     candidates.extend(direct);
     candidates.retain(|c| !curated.exclude.ids.contains(&c.addon.id));
     finish_candidates(&mut candidates, &curated);
@@ -992,6 +996,22 @@ mod tests {
         assert_eq!(c.addon.name, "Questie", "the folder, not the repo");
         assert_eq!(c.addon.summary, "Repo text");
         assert_eq!(c.addon.author, "Questie", "the owner");
+
+        let mut plain = build("v1", "https://github.com/a.zip");
+        plain.scan = ZipScan {
+            title: Some("Basic Chat Mods".into()),
+            notes: Some("Basic Chat Mods".into()),
+            ..plain.scan
+        };
+        let repeat = Chosen {
+            stable: Some(plain),
+            ..Chosen::default()
+        };
+        let c2 = github_candidate(&info(), &repeat, 0).unwrap();
+        assert_eq!(
+            c2.addon.summary, "Repo text",
+            "a note repeating the name adds nothing"
+        );
         assert_eq!(c.addon.downloads, 150);
 
         let bigger = github_candidate(&info(), &chosen, 10_000).unwrap();

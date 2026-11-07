@@ -564,10 +564,13 @@ struct CodeHit {
     repository: RepoHit,
 }
 
+/// Reads up to GitHub's limit of 10 pages. A short page doesn't mean the last page:
+/// code search drops hits it won't show after counting them, so only an empty
+/// page or having seen everything ends it.
 fn search_pages<T: serde::de::DeserializeOwned>(
     http: &Http,
     channel: Channel,
-    endpoint: &str,
+    url: &str,
     query: &str,
     extra: &str,
     mut take: impl FnMut(T),
@@ -576,7 +579,7 @@ fn search_pages<T: serde::de::DeserializeOwned>(
     let mut seen = 0u64;
     for page in 1..=10 {
         let url = format!(
-            "https://api.github.com/search/{endpoint}?q={}&per_page=100&page={page}{extra}",
+            "{url}?q={}&per_page=100&page={page}{extra}",
             encode_query(query)
         );
         let reply = http.get(channel, &url).map_err(|e| e.to_string())?;
@@ -586,7 +589,7 @@ fn search_pages<T: serde::de::DeserializeOwned>(
         let count = parsed.items.len() as u64;
         seen += count;
         parsed.items.into_iter().for_each(&mut take);
-        if count < 100 || seen >= total {
+        if count == 0 || seen >= total {
             break;
         }
     }
@@ -603,7 +606,7 @@ pub fn search_topics(http: &Http) -> Vec<String> {
             let result = search_pages::<RepoHit>(
                 http,
                 Channel::Search,
-                "repositories",
+                "https://api.github.com/search/repositories",
                 &query,
                 order,
                 |hit| {
@@ -628,7 +631,8 @@ pub fn search_topics(http: &Http) -> Vec<String> {
 pub fn search_code(http: &Http) -> Vec<String> {
     let mut found = Vec::new();
     for query in CODE_QUERIES {
-        let result = search_pages::<CodeHit>(http, Channel::CodeSearch, "code", query, "", |hit| {
+        let url = "https://api.github.com/search/code";
+        let result = search_pages::<CodeHit>(http, Channel::CodeSearch, url, query, "", |hit| {
             found.push(hit.repository.full_name);
         });
         if let Err(problem) = result {
@@ -908,6 +912,67 @@ mod tests {
         };
         assert_eq!(batch.found.len(), 1);
         assert_eq!(batch.failed, ["B/b"]);
+    }
+
+    #[test]
+    fn search_keeps_going_past_short_pages_and_stops_when_done() {
+        let page = |names: &[&str]| {
+            let items: Vec<serde_json::Value> = names
+                .iter()
+                .map(|n| serde_json::json!({"repository": {"full_name": n}}))
+                .collect();
+            serde_json::json!({"total_count": 4, "items": items})
+                .to_string()
+                .into_bytes()
+        };
+        let (base, seen) = serve(vec![
+            reply(200, &[], &page(&["a/1"])),
+            reply(200, &[], &page(&["a/2", "a/3"])),
+            reply(200, &[], &page(&["a/4"])),
+        ]);
+        let http = client(Some("t"));
+        let mut found = Vec::new();
+        let total = search_pages::<CodeHit>(
+            &http,
+            Channel::CodeSearch,
+            &format!("{base}/search/code"),
+            "q",
+            "",
+            |hit| found.push(hit.repository.full_name),
+        )
+        .unwrap();
+        assert_eq!(total, 4);
+        assert_eq!(found, ["a/1", "a/2", "a/3", "a/4"]);
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            3,
+            "no fourth page after seeing everything"
+        );
+    }
+
+    #[test]
+    fn search_stops_at_an_empty_page_even_if_the_total_promises_more() {
+        let (base, seen) = serve(vec![
+            reply(
+                200,
+                &[],
+                br#"{"total_count": 500, "items": [{"full_name": "a/1"}]}"#,
+            ),
+            reply(200, &[], br#"{"total_count": 500, "items": []}"#),
+        ]);
+        let http = client(Some("t"));
+        let mut found = Vec::new();
+        search_pages::<RepoHit>(
+            &http,
+            Channel::Search,
+            &format!("{base}/search/repositories"),
+            "q",
+            "",
+            |hit| found.push(hit.full_name),
+        )
+        .unwrap();
+        assert_eq!(found, ["a/1"]);
+        assert_eq!(seen.lock().unwrap().len(), 2);
     }
 
     #[test]

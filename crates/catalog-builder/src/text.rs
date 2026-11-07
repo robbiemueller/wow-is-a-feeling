@@ -154,6 +154,11 @@ pub fn clean_summary(raw: &str) -> String {
     )
 }
 
+/// A note that only repeats the addon's name tells a player nothing.
+pub fn says_nothing_new(summary: &str, name: &str) -> bool {
+    summary.is_empty() || normalize(summary) == normalize(name)
+}
+
 /// Links are for the addon's page, and summaries read better without them.
 fn looks_like_link(word: &str) -> bool {
     let word = word.trim_matches(|c: char| !c.is_alphanumeric());
@@ -435,6 +440,13 @@ mod tests {
             clean_summary("@localization(locale=\"enUS\", key=\"Notes\")@"),
             ""
         );
+    }
+
+    #[test]
+    fn a_summary_repeating_the_name_says_nothing() {
+        assert!(says_nothing_new("Basic Chat Mods", "BasicChatMods"));
+        assert!(says_nothing_new("", "Foo"));
+        assert!(!says_nothing_new("Chat tweaks", "BasicChatMods"));
     }
 
     #[test]

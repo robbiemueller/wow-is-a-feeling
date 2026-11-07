@@ -246,6 +246,10 @@ pub fn examine(row: &Row, probe: &mut dyn WowiProbe) -> Result<Option<Candidate>
         return Ok(None);
     }
     let bytes = probe.download(row.id)?;
+    // A new version waiting for approval answers with a normal 200 and a web page.
+    if !bytes.starts_with(b"PK") {
+        return Err("WoWInterface sent a web page instead of the zip, usually because this version is waiting for approval".to_string());
+    }
     let size = bytes.len() as u64;
     let scan = scan_zip(Cursor::new(&bytes), &[&row.name]).map_err(|e| e.to_string())?;
     if !scan.forever || scan.folders.is_empty() {
@@ -511,7 +515,11 @@ mod tests {
         probe.zip = Err("HTTP 503".into());
         assert!(examine(&row(1, 1, RECENT), &mut probe).is_err());
 
-        let mut probe = fake(b"<html>Sorry, this file is unavailable</html>".to_vec());
+        let mut probe = fake(b"<!DOCTYPE html PUBLIC>World of Warcraft AddOns".to_vec());
+        let waiting = examine(&row(1, 1, RECENT), &mut probe).unwrap_err();
+        assert!(waiting.contains("waiting for approval"), "{waiting}");
+
+        let mut probe = fake(b"PK but not really a zip".to_vec());
         assert!(examine(&row(1, 1, RECENT), &mut probe).is_err());
 
         let mut probe = fake(good);

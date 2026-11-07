@@ -216,6 +216,17 @@ const KEYWORDS: [(&str, &[&str]); 12] = [
             "dispel",
             "clique",
             "hekili",
+            "paladin",
+            "shaman",
+            "warlock",
+            "hunter",
+            "mage",
+            "druid",
+            "priest",
+            "rogue",
+            "warrior",
+            "totem",
+            "totems",
         ],
     ),
     (
@@ -326,10 +337,14 @@ fn from_wowi_category(id: &str) -> Option<&'static str> {
     }
 }
 
-fn from_keywords(words: &[String]) -> Option<&'static str> {
+/// Raid frames are unit frames, whatever "raid" means elsewhere.
+fn mentions_raid_frames(words: &[String]) -> bool {
     let has = |word: &str| words.iter().any(|w| w == word);
-    // Raid frames are unit frames, whatever "raid" means elsewhere.
-    if has("raid") && (has("frames") || has("frame") || has("unitframes")) {
+    has("raid") && (has("frames") || has("frame") || has("unitframes"))
+}
+
+fn from_keywords(words: &[String]) -> Option<&'static str> {
+    if mentions_raid_frames(words) {
         return Some("interface");
     }
     KEYWORDS.iter().find_map(|(category, keys)| {
@@ -340,12 +355,15 @@ fn from_keywords(words: &[String]) -> Option<&'static str> {
     })
 }
 
-/// In running text, "library" usually means books. Real libraries say so in their
-/// names and folders, which is checked earlier.
+/// In running text, "library" usually means books, and "party or raid" just says
+/// who an addon works with. Real libraries and boss mods say so in their names.
 fn from_summary_keywords(words: &[String]) -> Option<&'static str> {
+    if mentions_raid_frames(words) {
+        return Some("interface");
+    }
     let words: Vec<String> = words
         .iter()
-        .filter(|w| !matches!(w.as_str(), "library" | "libraries"))
+        .filter(|w| !matches!(w.as_str(), "library" | "libraries" | "raid" | "raids"))
         .cloned()
         .collect();
     from_keywords(&words)
@@ -493,6 +511,14 @@ mod tests {
         c.addon.name = "Lorekeeper".into();
         c.addon.summary = "Collect and store ingame text items in an adaptive library.".into();
         assert_eq!(categorize(&c, None), "misc");
+        c.addon.summary = "A five-dice game, solo or with your party or raid".into();
+        assert_eq!(
+            categorize(&c, None),
+            "misc",
+            "\"raid\" alone says who it's for"
+        );
+        c.addon.summary = "Raid/Party Shaman Totem Coordination".into();
+        assert_eq!(categorize(&c, None), "combat");
     }
 
     #[test]
