@@ -1,17 +1,19 @@
-//! Reads what we need from an addon zip: which top-level folders have a TOC the
-//! client would load, whether any of them targets Forever, and the main folder's
-//! details. Nothing is extracted. Works over anything that reads and seeks, so
-//! remote range readers and in-memory downloads share this code.
+//! Reads what we need from an addon zip: which top-level folders an install would
+//! write, whether any of them targets Forever, and the main folder's details. Nothing
+//! is extracted. Works over anything that reads and seeks, so remote range readers and
+//! in-memory downloads share this code. Names go through the installer's own cleaning
+//! and layout rules, so a zip can't show the catalog one list and install another.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek};
 
+use feeling_core::extract::{clean_entry_path, planned_folders};
 use feeling_core::toc::{self, TOC_SUFFIXES, Toc};
 use zip::ZipArchive;
 use zip::read::{ArchiveOffset, Config};
 use zip::result::ZipError;
 
-use crate::model::ZipScan;
+use crate::model::{MAX_DEPS, ZipScan, is_short_id};
 use crate::text::{clean_author, normalize};
 
 /// No real TOC comes close to this, and it stops a hostile one from filling memory.
@@ -19,6 +21,14 @@ const MAX_TOC_BYTES: u64 = 256 * 1024;
 /// Huge packs exist, and each TOC can cost a request. The main folder is read
 /// first, so this only limits how sure we are about the long tail of a pack.
 const MAX_FOLDERS_READ: usize = 64;
+/// Far more than any real zip brings: the largest today has 32. A zip past this is
+/// treated as having no usable folders, so it never reaches the catalog or the scan cache.
+pub const MAX_FOLDERS: usize = 256;
+/// Longer than any real folder name, and the most the catalog's gate accepts.
+const MAX_FOLDER_NAME_BYTES: usize = 120;
+/// Title, notes and category from a TOC are kept in the public scan cache. Real ones are
+/// well under this, so a longer one is only ever someone padding that file.
+const MAX_TEXT_BYTES: usize = 1024;
 
 const JUNK_FOLDERS: [&str; 8] = [
     "__macosx",
@@ -65,44 +75,92 @@ impl std::fmt::Display for ScanError {
 
 /// Scan a zip. `hints` are names the main folder is likely to match, such as the
 /// repository and the zip's own name. Fails only when the zip can't be read at
-/// all: a zip with no usable folders is a successful scan with an empty list.
-pub fn scan_zip<R: Read + Seek>(reader: R, hints: &[&str]) -> Result<ZipScan, ScanError> {
-    // Known(0) stops the zip crate from scanning the whole file for a prefix,
-    // which over HTTP would mean downloading it. Nobody prepends data to addons.
+/// all: a zip with no usable folders is a successful scan with an empty list, and so
+/// is one an install would refuse, because it won't get better by being read again.
+pub fn scan_zip<R: Read + Seek>(mut reader: R, hints: &[&str]) -> Result<ZipScan, ScanError> {
+    // Known(0) stops the zip crate from scanning the whole file for a prefix, which over
+    // HTTP would mean downloading it. A zip that only opens that way is refused below.
     let config = Config {
         archive_offset: ArchiveOffset::Known(0),
     };
-    let mut archive = ZipArchive::with_config(config, reader).map_err(|e| match e {
+    ZipArchive::with_config(config, &mut reader).map_err(|e| match e {
         ZipError::Io(io) => ScanError::Io(io.to_string()),
         other => ScanError::Invalid(other.to_string()),
     })?;
+    // Nobody prepends data to addons. A zip that claims to start past its first byte has
+    // two directories to choose from, and readers disagree about which one is real. This
+    // second look costs nothing for a normal zip: the same bytes are already at hand.
+    let mut archive = match ZipArchive::new(reader) {
+        Ok(archive) if archive.offset() == 0 => archive,
+        _ => return Ok(ZipScan::default()),
+    };
 
-    let paths: Vec<(String, usize)> = (0..archive.len())
-        .filter_map(|index| {
-            let name = archive.name_for_index(index)?.ok()?;
-            Some((name.replace('\\', "/"), index))
+    let Some(names) = entry_names(&archive) else {
+        return Ok(ZipScan::default());
+    };
+    let Ok(planned) = planned_folders(&names) else {
+        return Ok(ZipScan::default());
+    };
+    let too_long = |folder: &String| folder.len() > MAX_FOLDER_NAME_BYTES;
+    if planned.len() > MAX_FOLDERS || planned.iter().any(too_long) {
+        return Ok(ZipScan::default());
+    }
+
+    let paths: Vec<(String, usize)> = names
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, is_dir))| !is_dir)
+        .filter_map(|(index, (name, _))| Some((clean_entry_path(name).ok()?, index)))
+        .collect();
+    let loadable = addon_folders(&paths);
+    let mut picked: Vec<(String, Option<usize>)> = planned
+        .into_iter()
+        .map(|folder| {
+            let toc = loadable
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case(&folder))
+                .map(|(_, index)| *index);
+            (folder, toc)
         })
         .collect();
-    let mut picked = addon_folders(&paths);
 
     let hints: Vec<String> = hints
         .iter()
         .map(|h| normalize(h))
         .filter(|h| !h.is_empty())
         .collect();
-    picked.sort_by_key(|(folder, _)| std::cmp::Reverse(best_match(folder, &hints)));
+    // A folder the game wouldn't load still gets installed, so it's listed, but it can't
+    // be what the addon is named after.
+    picked.sort_by_key(|(folder, toc)| {
+        (toc.is_none(), std::cmp::Reverse(best_match(folder, &hints)))
+    });
 
     let mut folders = Vec::with_capacity(picked.len());
     for (position, (folder, index)) in picked.iter().enumerate() {
-        let parsed = (position < MAX_FOLDERS_READ)
-            .then(|| read_toc(&mut archive, *index))
-            .flatten();
+        let parsed = index
+            .filter(|_| position < MAX_FOLDERS_READ)
+            .and_then(|index| read_toc(&mut archive, index));
         folders.push(Folder {
             name: folder.clone(),
             toc: parsed,
         });
     }
     Ok(summarize(folders, &hints))
+}
+
+/// Every entry's name and whether it's a directory, read the way the installer reads
+/// them. `None` when a name can't be read, which the installer refuses too.
+fn entry_names<R: Read + Seek>(archive: &ZipArchive<R>) -> Option<Vec<(String, bool)>> {
+    const S_IFMT: u32 = 0o170000;
+    const S_IFDIR: u32 = 0o040000;
+    (0..archive.len())
+        .map(|index| {
+            let entry = archive.by_index_data(index).ok()?;
+            let name = entry.name().ok()?.into_owned();
+            let is_dir = entry.is_dir() || entry.unix_mode().is_some_and(|m| m & S_IFMT == S_IFDIR);
+            Some((name, is_dir))
+        })
+        .collect()
 }
 
 /// The addon folders a zip's layout gives, each with the index of the TOC the
@@ -297,17 +355,34 @@ fn summarize(mut folders: Vec<Folder>, hints: &[String]) -> ZipScan {
         ..ZipScan::default()
     };
     if let Some(ForeverToc { toc, .. }) = folders.into_iter().next().and_then(|f| f.toc) {
-        scan.title = toc.title;
-        scan.notes = toc.notes;
+        scan.title = toc.title.map(bounded_text);
+        scan.notes = toc.notes.map(bounded_text);
         // Kept in the public scan cache, so no addresses from here on.
         scan.author = toc.author.as_deref().map(clean_author);
-        scan.deps = toc.deps;
-        scan.category = toc.category;
-        scan.curse = toc.curse_id;
-        scan.wowi = toc.wowi_id;
-        scan.wago = toc.wago_id;
+        scan.deps = toc
+            .deps
+            .into_iter()
+            .filter(|dep| dep.len() <= MAX_FOLDER_NAME_BYTES)
+            .take(MAX_DEPS)
+            .collect();
+        scan.category = toc.category.map(bounded_text);
+        scan.curse = toc.curse_id.filter(|id| is_short_id(id));
+        scan.wowi = toc.wowi_id.filter(|id| is_short_id(id));
+        scan.wago = toc.wago_id.filter(|id| is_short_id(id));
     }
     scan
+}
+
+/// Cuts free text from a TOC to size, at a character boundary.
+fn bounded_text(mut text: String) -> String {
+    if text.len() > MAX_TEXT_BYTES {
+        let mut end = MAX_TEXT_BYTES;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+    }
+    text
 }
 
 /// How well a folder name matches the hints. Higher is better, and ties go to
@@ -528,21 +603,283 @@ mod tests {
     }
 
     #[test]
-    fn junk_folders_and_folders_without_a_loadable_toc_do_not_count() {
+    fn folders_the_game_wouldnt_load_are_listed_because_they_get_installed_but_never_lead() {
         let scan = scan(
             &[
                 ("__MACOSX/Foo/._Foo.toc", "junk"),
                 ("__MACOSX/__MACOSX.toc", "## Interface: 16001\n"),
                 ("images/images.toc", "## Interface: 16001\n"),
                 ("OpenMe/readme.txt", "hello"),
-                ("Foo/Foo.toc", "## Interface: 16001\n"),
+                ("Foo/Foo.toc", "## Interface: 16001\n## Title: Foo\n"),
                 ("Foo/sub/Sub.toc", "## Interface: 16001\n"),
                 ("Bar/Baz.toc", "## Interface: 16001\n"),
                 ("Vanilla/Vanilla_Vanilla.toc", "## Interface: 11508\n"),
             ],
+            &["Bar", "images"],
+        );
+        assert_eq!(scan.folders[0], "Foo", "the only folder the client loads");
+        assert_eq!(scan.title.as_deref(), Some("Foo"));
+        let mut rest = scan.folders[1..].to_vec();
+        rest.sort();
+        assert_eq!(rest, ["Bar", "Vanilla", "images"]);
+    }
+
+    /// What the real installer writes for this zip.
+    fn installed_folders(bytes: &[u8]) -> Vec<String> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("addon.zip");
+        std::fs::write(&path, bytes).unwrap();
+        let dest = dir.path().join("out");
+        feeling_core::extract::extract(
+            &path,
+            &dest,
+            &[],
+            feeling_core::extract::Limits::default(),
+            &mut |_| {},
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .map(|extracted| extracted.folders)
+        .unwrap_or_default()
+    }
+
+    fn sorted(mut names: Vec<String>) -> Vec<String> {
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn the_scan_lists_exactly_what_the_installer_writes() {
+        const TOC: &str = "## Interface: 16001\n## Title: Harmless\n";
+        let cases: &[&[(&str, &str)]] = &[
+            // Names the installer cleans up, which a plain reading misses.
+            &[
+                ("Harmless/Harmless.toc", TOC),
+                ("./DBM-Core/DBM-Core.toc", TOC),
+            ],
+            &[
+                ("Harmless/Harmless.toc", TOC),
+                ("DBM-Core//DBM-Core.toc", TOC),
+            ],
+            &[
+                ("Harmless/Harmless.toc", TOC),
+                ("DBM-Core/./DBM-Core.toc", TOC),
+            ],
+            &[
+                ("Harmless/Harmless.toc", TOC),
+                ("DBM-Core\\DBM-Core.toc", TOC),
+            ],
+            // A TOC not named after its folder: the game can't load it, the folder still lands.
+            &[
+                ("Harmless/Harmless.toc", TOC),
+                ("DBM-Core/whatever.toc", TOC),
+            ],
+            &[
+                ("Harmless/Harmless.toc", TOC),
+                ("DBM-Core/DBM-Core_Vanilla.toc", TOC),
+            ],
+            // Layouts both sides have always known.
+            &[("Harmless/Harmless.toc", TOC), ("Harmless/core.lua", "x")],
+            &[("Harmless.toc", TOC), ("core.lua", "x")],
+            &[
+                ("Harmless-1.2.3/Harmless.toc", TOC),
+                ("Harmless-1.2.3/core.lua", "x"),
+            ],
+            &[
+                ("Wrap/Harmless/Harmless.toc", TOC),
+                ("Wrap/Other/Other.toc", TOC),
+            ],
+            &[
+                ("Main/Main.toc", TOC),
+                ("Extras/Optional/Optional.toc", TOC),
+            ],
+            &[("Main/Main.toc", TOC), ("Root.toc", TOC), ("core.lua", "x")],
+            // Leftovers the installer skips.
+            &[
+                ("Harmless/Harmless.toc", TOC),
+                ("__MACOSX/__MACOSX.toc", TOC),
+            ],
+            &[("Harmless/Harmless.toc", TOC), (".git/.git.toc", TOC)],
+            &[("Harmless/Harmless.toc", TOC), ("images/images.toc", TOC)],
+            &[("Harmless/Harmless.toc", TOC), ("docs/readme.txt", "x")],
+            // Things it refuses outright, or finds nothing in.
+            &[("Harmless/Harmless.toc", TOC), ("../Evil/Evil.toc", TOC)],
+            &[("Harmless/Harmless.toc", TOC), ("/Evil/Evil.toc", TOC)],
+            &[("Harmless/Harmless.toc", TOC), ("Evil:x/Evil.toc", TOC)],
+            &[("Harmless/Harmless.toc", TOC), ("harmless/Other.toc", TOC)],
+            &[("readme.txt", "x")],
+        ];
+        for files in cases {
+            let bytes = make_zip(files);
+            let scanned = scan_zip(Cursor::new(&bytes), &["Harmless"]).unwrap();
+            assert_eq!(
+                sorted(scanned.folders),
+                installed_folders(&bytes),
+                "{files:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_hidden_folder_shows_up_beside_the_one_the_addon_is_named_for() {
+        for hidden in [
+            "./DBM-Core/DBM-Core.toc",
+            "DBM-Core//DBM-Core.toc",
+            "DBM-Core/whatever.toc",
+        ] {
+            let scan = scan(
+                &[
+                    (
+                        "Harmless/Harmless.toc",
+                        "## Interface: 16001\n## Title: Harmless\n",
+                    ),
+                    (hidden, "## Interface: 16001\n"),
+                ],
+                &["Harmless"],
+            );
+            assert_eq!(scan.folders[0], "Harmless", "{hidden}");
+            assert!(
+                scan.folders.iter().any(|f| f == "DBM-Core"),
+                "{hidden}: {scan:?}"
+            );
+        }
+    }
+
+    /// One file with two directories: the EOCD's offset points at the first, and its size
+    /// makes the second look like the one sitting right before it.
+    fn two_directories(first: &[u8], second: &[u8]) -> Vec<u8> {
+        const EOCD_LEN: usize = 22;
+        let field = |bytes: &[u8], at: usize| {
+            usize::try_from(u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap())).unwrap()
+        };
+        let eocd = |bytes: &[u8]| bytes.len() - EOCD_LEN;
+        let cd_offset = |bytes: &[u8]| field(bytes, eocd(bytes) + 16);
+        let cd_size = |bytes: &[u8]| field(bytes, eocd(bytes) + 12);
+        assert!(cd_offset(first) >= cd_offset(second), "pad the first zip");
+
+        // Everything from the first zip but its end record, then the second zip's entry.
+        let mut out = first[..eocd(first)].to_vec();
+        let local_at = out.len();
+        out.extend_from_slice(&second[..eocd(second)]);
+        let directory_at = local_at + cd_offset(second);
+
+        // A reader that trusts the size adds this much to every offset in the directory.
+        let shift = directory_at - cd_offset(first);
+        let local_field = directory_at + 42;
+        let adjusted = u32::try_from(local_at - shift).unwrap();
+        out[local_field..local_field + 4].copy_from_slice(&adjusted.to_le_bytes());
+
+        let mut end = first[eocd(first)..].to_vec();
+        end[12..16].copy_from_slice(&u32::try_from(cd_size(second)).unwrap().to_le_bytes());
+        out.extend_from_slice(&end);
+        out
+    }
+
+    #[test]
+    fn a_zip_with_two_directories_is_refused_rather_than_read_one_way() {
+        let padding = "x".repeat(4096);
+        let first_toc = format!("## Interface: 16001\n## Title: Harmless\n## Notes: {padding}\n");
+        let first = make_zip(&[("Harmless/Harmless.toc", first_toc.as_str())]);
+        let second = make_zip(&[("DBM-Core/DBM-Core.toc", "## Interface: 16001\n")]);
+        let both = two_directories(&first, &second);
+
+        // Readers really do disagree about this file, which is the trick being closed.
+        let strict = ZipArchive::with_config(
+            Config {
+                archive_offset: ArchiveOffset::Known(0),
+            },
+            Cursor::new(&both),
+        )
+        .unwrap();
+        assert_eq!(
+            strict.name_for_index(0).unwrap().unwrap(),
+            "Harmless/Harmless.toc"
+        );
+        let detecting = ZipArchive::new(Cursor::new(&both)).unwrap();
+        assert_ne!(detecting.offset(), 0);
+        assert_eq!(
+            detecting.name_for_index(0).unwrap().unwrap(),
+            "DBM-Core/DBM-Core.toc"
+        );
+
+        let scan = scan_zip(Cursor::new(&both), &["Harmless"]).unwrap();
+        assert!(scan.folders.is_empty(), "{scan:?}");
+        assert!(!scan.forever);
+    }
+
+    fn folders_zip(count: usize) -> Vec<u8> {
+        let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+        let options = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+        for at in 0..count {
+            writer
+                .start_file(format!("Pack{at}/Pack{at}.toc"), options)
+                .unwrap();
+            writer.write_all(b"## Interface: 16001\n").unwrap();
+        }
+        writer.finish().unwrap().into_inner()
+    }
+
+    #[test]
+    fn a_zip_with_too_many_folders_is_an_empty_scan_not_a_failure() {
+        let allowed = scan_zip(Cursor::new(folders_zip(MAX_FOLDERS)), &["Pack0"]).unwrap();
+        assert_eq!(allowed.folders.len(), MAX_FOLDERS);
+        assert!(allowed.forever);
+
+        // Empty rather than invalid: an error would never be remembered, and the whole
+        // zip would be downloaded again on every run.
+        let too_many = scan_zip(Cursor::new(folders_zip(MAX_FOLDERS + 1)), &["Pack0"]).unwrap();
+        assert_eq!(too_many, ZipScan::default());
+    }
+
+    #[test]
+    fn an_absurdly_long_folder_name_is_an_empty_scan() {
+        let long = "x".repeat(MAX_FOLDER_NAME_BYTES + 1);
+        let path = format!("{long}/{long}.toc");
+        let bytes = make_zip(&[(path.as_str(), "## Interface: 16001\n")]);
+        assert_eq!(
+            scan_zip(Cursor::new(bytes), &["x"]).unwrap(),
+            ZipScan::default()
+        );
+    }
+
+    #[test]
+    fn text_from_a_toc_is_kept_short_before_it_reaches_the_scan_cache() {
+        let long = "é".repeat(MAX_TEXT_BYTES);
+        let deps: Vec<String> = (0..MAX_DEPS + 40).map(|i| format!("Lib{i}")).collect();
+        let toc = format!(
+            "## Interface: 16001\n## Title: {long}\n## Notes: {long}\n## X-Category: {long}\n\
+             ## Author: {long}\n## Dependencies: {}, {}\n## X-WoWI-ID: 1{zeros}\n\
+             ## X-Curse-Project-ID: 2{zeros}\n## X-Wago-ID: a{zeros}\n",
+            "x".repeat(MAX_FOLDER_NAME_BYTES + 1),
+            deps.join(", "),
+            zeros = "0".repeat(40),
+        );
+        let scan = scan(&[("Foo/Foo.toc", toc.as_str())], &["Foo"]);
+        for text in [&scan.title, &scan.notes, &scan.category, &scan.author] {
+            assert!(text.as_ref().unwrap().len() <= MAX_TEXT_BYTES, "{text:?}");
+        }
+        assert_eq!(scan.deps.len(), MAX_DEPS);
+        assert_eq!(
+            scan.deps[0], "Lib0",
+            "the name too long to be a folder is gone"
+        );
+        assert_eq!((scan.wowi, scan.curse, scan.wago), (None, None, None));
+    }
+
+    #[test]
+    fn real_sized_toc_fields_pass_the_bounds_untouched() {
+        let scan = scan(
+            &[(
+                "Foo/Foo.toc",
+                "## Interface: 16001\n## Title: Foo\n## Dependencies: Ace3, !BugGrabber\n\
+                 ## X-WoWI-ID: 5086\n## X-Curse-Project-ID: 1725334\n## X-Wago-ID: kGr9ReKy\n",
+            )],
             &["Foo"],
         );
-        assert_eq!(scan.folders, ["Foo"]);
+        assert_eq!(scan.title.as_deref(), Some("Foo"));
+        assert_eq!(scan.deps, ["!BugGrabber", "Ace3"]);
+        assert_eq!(scan.wowi.as_deref(), Some("5086"));
+        assert_eq!(scan.curse.as_deref(), Some("1725334"));
+        assert_eq!(scan.wago.as_deref(), Some("kGr9ReKy"));
     }
 
     fn names_for(paths: &[&str]) -> Vec<String> {

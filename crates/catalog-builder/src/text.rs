@@ -10,6 +10,98 @@ pub fn normalize(text: &str) -> String {
         .collect()
 }
 
+/// A name as a reader sees it: case, punctuation and look-alike letters from other
+/// alphabets don't count, so `Quеstie` with a Cyrillic `е` folds to the same text as
+/// `Questie`. For telling whether two addons would pass for each other, never for display.
+pub fn fold_name(text: &str) -> String {
+    text.chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(fold_letter)
+        .collect()
+}
+
+/// A folder name with the same look-alikes folded, keeping its punctuation: `Foo_Bar`
+/// and `FooBar` are different folders on disk, however alike they read.
+pub fn fold_folder(text: &str) -> String {
+    text.chars().flat_map(fold_letter).collect()
+}
+
+fn fold_letter(c: char) -> impl Iterator<Item = char> {
+    // Capitals first: a capital Eta reads as H, and its small letter reads as n.
+    let (plain, lowered) = match capital_lookalike(c) {
+        Some(latin) => (Some(latin), None),
+        None => (None, Some(c.to_lowercase())),
+    };
+    plain
+        .into_iter()
+        .chain(lowered.into_iter().flatten().map(small_lookalike))
+}
+
+/// Capitals from other alphabets that read as a Latin capital, given in lower case.
+fn capital_lookalike(c: char) -> Option<char> {
+    Some(match c {
+        'А' | 'Α' => 'a',
+        'В' | 'Β' => 'b',
+        'С' | 'Ϲ' => 'c',
+        'Ԁ' => 'd',
+        'Е' | 'Ё' | 'Ε' => 'e',
+        'Н' | 'Η' | 'Һ' => 'h',
+        'І' | 'Ї' | 'Ι' | 'Ӏ' => 'i',
+        'Ј' => 'j',
+        'К' | 'Κ' => 'k',
+        'М' | 'Μ' => 'm',
+        'Ν' => 'n',
+        'О' | 'Ο' => 'o',
+        'Р' | 'Ρ' => 'p',
+        'Ԛ' => 'q',
+        'Ѕ' => 's',
+        'Т' | 'Τ' => 't',
+        'У' | 'Υ' | 'Ү' => 'y',
+        'Ԝ' => 'w',
+        'Х' | 'Χ' => 'x',
+        'Ζ' => 'z',
+        _ => return None,
+    })
+}
+
+/// Small letters that read as a Latin one: other alphabets, accents and full-width forms.
+fn small_lookalike(c: char) -> char {
+    match c {
+        'а' | 'α' | 'ɑ' | 'à' | 'á' | 'â' | 'ã' | 'ä' | 'å' | 'ā' | 'ă' | 'ą' => 'a',
+        'в' | 'β' | 'ь' => 'b',
+        'с' | 'ϲ' | 'ç' | 'ć' | 'ĉ' | 'ċ' | 'č' => 'c',
+        'ԁ' | 'ď' | 'đ' => 'd',
+        'е' | 'ё' | 'ε' | 'è' | 'é' | 'ê' | 'ë' | 'ē' | 'ĕ' | 'ė' | 'ę' | 'ě' => 'e',
+        'ɡ' | 'ĝ' | 'ğ' | 'ġ' | 'ģ' => 'g',
+        'н' | 'һ' | 'ĥ' | 'ħ' => 'h',
+        'і' | 'ї' | 'ι' | 'ı' | 'ì' | 'í' | 'î' | 'ï' | 'ĩ' | 'ī' | 'ĭ' | 'į' => 'i',
+        'ј' | 'ϳ' | 'ĵ' => 'j',
+        'к' | 'κ' | 'ķ' => 'k',
+        'ӏ' | 'ĺ' | 'ļ' | 'ľ' | 'ŀ' | 'ł' => 'l',
+        'м' => 'm',
+        'п' | 'η' | 'ñ' | 'ń' | 'ņ' | 'ň' => 'n',
+        'о' | 'ο' | 'σ' | 'ò' | 'ó' | 'ô' | 'õ' | 'ö' | 'ō' | 'ŏ' | 'ő' | 'ø' => 'o',
+        'р' | 'ρ' => 'p',
+        'ԛ' => 'q',
+        'г' | 'ŕ' | 'ŗ' | 'ř' => 'r',
+        'ѕ' | 'ſ' | 'ś' | 'ŝ' | 'ş' | 'š' => 's',
+        'т' | 'τ' | 'ţ' | 'ť' | 'ŧ' => 't',
+        'и' | 'μ' | 'υ' | 'ù' | 'ú' | 'û' | 'ü' | 'ũ' | 'ū' | 'ŭ' | 'ů' | 'ű' | 'ų' => {
+            'u'
+        }
+        'ν' | 'ѵ' => 'v',
+        'ԝ' | 'ω' | 'ŵ' => 'w',
+        'х' | 'χ' => 'x',
+        'у' | 'γ' | 'ү' | 'ý' | 'ÿ' | 'ŷ' => 'y',
+        'ζ' | 'ź' | 'ż' | 'ž' => 'z',
+        // Full-width letters and digits sit at a fixed distance from their plain forms.
+        '\u{ff41}'..='\u{ff5a}' | '\u{ff10}'..='\u{ff19}' => {
+            char::from_u32(u32::from(c) - 0xfee0).unwrap_or(c)
+        }
+        other => other,
+    }
+}
+
 /// Splits on punctuation and on camelCase, keeping the whole word as well:
 /// `GatherMate2` gives `gathermate2`, `gather`, `mate`.
 pub fn tokens(text: &str) -> Vec<String> {
@@ -356,6 +448,48 @@ pub fn valid_repo_name(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn folding_a_name_sees_through_case_punctuation_and_look_alikes() {
+        for same in [
+            "Questie",
+            "QUESTIE",
+            "Quest-ie!",
+            "Qu\u{0435}stie",        // Cyrillic small e
+            "\u{051A}uestie",        // Cyrillic capital qa
+            "Questi\u{0435}",        // Cyrillic small e at the end
+            "Qu\u{03B5}st\u{0456}e", // Greek epsilon and Cyrillic i
+            "Qu\u{00E9}stie",        // A plain accent
+            "Que\u{0301}stie",       // A combining accent
+            "Ques\u{200B}tie",       // A zero-width space
+            "\u{FF31}\u{FF55}estie", // Full-width letters
+        ] {
+            assert_eq!(fold_name(same), "questie", "{same}");
+        }
+        assert_eq!(
+            fold_name("\u{0391}\u{03A4}\u{039A}\u{0391}"),
+            "atka",
+            "Greek capitals"
+        );
+        assert_eq!(
+            fold_name("\u{0422}\u{043E}m\u{0422}\u{043E}m"),
+            "tomtom",
+            "both alphabets"
+        );
+        assert_eq!(fold_name("!BugGrabber"), "buggrabber");
+        assert_eq!(fold_name("Forever++"), "forever");
+        assert_ne!(fold_name("Questie Reloaded"), "questie");
+        assert_ne!(fold_name("Bagnon"), fold_name("Baganator"));
+        assert_eq!(fold_name("--!!"), "", "nothing left to compare");
+    }
+
+    #[test]
+    fn folding_a_folder_keeps_what_makes_it_a_different_folder_on_disk() {
+        assert_eq!(fold_folder("DBM-Core"), "dbm-core");
+        assert_eq!(fold_folder("Qu\u{0435}stie"), "questie");
+        assert_ne!(fold_folder("Foo_Bar"), fold_folder("FooBar"));
+        assert_ne!(fold_folder("!BugGrabber"), fold_folder("BugGrabber"));
+    }
 
     #[test]
     fn tokens_split_camel_case_and_digits() {

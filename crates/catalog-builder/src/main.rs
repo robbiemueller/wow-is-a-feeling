@@ -11,6 +11,8 @@ mod http;
 mod merge;
 mod model;
 mod rangezip;
+#[cfg(test)]
+mod replay;
 mod state;
 mod text;
 mod tier;
@@ -25,10 +27,12 @@ use build::Options;
 const USAGE: &str =
     "Usage: feeling-catalog build --out <dir> --seeds <seeds.toml> --curated <curated.toml>
          [--previous <catalog.json>] [--state <catalog-state.json>]
-         [--limit N] [--wowi-limit N] [--no-wowi] [--max-minutes N]
+         [--limit N] [--wowi-limit N] [--no-wowi] [--max-minutes N] [--accept-smaller]
 
-Reads GITHUB_TOKEN from the environment. Writes catalog.json and catalog-state.json to --out.
---max-minutes stops starting new downloads after that long, and still writes everything.";
+Reads GITHUB_TOKEN from the environment. Writes catalog.json, catalog-held.json and
+catalog-state.json to --out.
+--max-minutes stops starting new downloads after that long, and still writes everything.
+--accept-smaller publishes even if many addons went missing, after you've looked at why.";
 
 fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Options, String> {
     match args.next().as_deref() {
@@ -40,6 +44,10 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Options, String>
     while let Some(flag) = args.next() {
         if flag == "--no-wowi" {
             options.no_wowi = true;
+            continue;
+        }
+        if flag == "--accept-smaller" {
+            options.accept_smaller = true;
             continue;
         }
         let value = args
@@ -104,6 +112,7 @@ mod tests {
         assert_eq!(options.curated, PathBuf::from("c"));
         assert_eq!(options.limit, None);
         assert!(!options.no_wowi);
+        assert!(!options.accept_smaller);
     }
 
     #[test]
@@ -121,8 +130,10 @@ mod tests {
             "--no-wowi",
             "--max-minutes",
             "270",
+            "--accept-smaller",
         ]);
         let options = parse(&args).unwrap();
+        assert!(options.accept_smaller);
         assert_eq!(options.previous, Some(PathBuf::from("p")));
         assert_eq!(options.state, Some(PathBuf::from("st")));
         assert_eq!(options.limit, Some(5));
