@@ -1,534 +1,1151 @@
-//! The window: frame, toolbar, quest log and parchment.
+//! The running app: its state, what the views look up, and one frame of work. Starting up
+//! lives in `startup.rs`, and what happens when a worker reports back in `events.rs`.
 
-use crate::skin::{self, Skin, shadow_text};
-use crate::widgets::{self, ButtonKind, Glyph};
-use crate::{Launch, demo, theme};
-use eframe::egui::{
-    self, Align2, Color32, CursorIcon, Frame, Rect, ResizeDirection, RichText, ScrollArea, Sense,
-    Stroke, StrokeKind, TextEdit, Ui, UiBuilder, ViewportCommand, pos2, vec2,
+use crate::actions::Action;
+use crate::args::Launch;
+use crate::cursor::Cursors;
+use crate::details_cache::{DetailsCache, PAUSE};
+use crate::dialogs::{FolderBrowser, Popup, RemovePlan};
+use crate::easter::{self, Facts};
+use crate::fun::Fun;
+use crate::messages::{Kind, Messages};
+use crate::model::{
+    self, CatalogBundle, CatalogStatus, GameState, HeaderId, Row, Section, Selection, Tab,
 };
-use feeling_core::catalog::{CATEGORIES, Catalog};
-use std::collections::HashSet;
+use crate::ops::{self, Casting, Queue};
+use crate::script::Script;
+use crate::skin::Skin;
+use crate::views::{self, toolbar};
+use crate::worker::{Dirs, Event, FoundGame, OpEnv, Worker};
+use crate::{demo, theme};
+use eframe::egui::{self, Key, Modifiers, TextureHandle, Ui, Vec2, ViewportCommand, vec2};
+use feeling_core::backup::BackupEntry;
+use feeling_core::catalog::{CATALOG_URL, Channel};
+use feeling_core::scan::{self, AddonGroup, Adoption, LocalFolder};
+use feeling_core::search::SortBy;
+use feeling_core::state::{ManagedAddon, State};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::fs::File;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const ROW_HEIGHT: f32 = 23.0;
+pub const LOOT_LINE_FOR: Duration = Duration::from_secs(8);
+const MIN_POINTS: Vec2 = vec2(820.0, 560.0);
+/// How long closing the window waits for running operations to stop, in the worst case.
+const SHUTDOWN_WAIT: Duration = Duration::from_secs(3);
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Tab {
-    MyAddons,
-    Browse,
-    Settings,
+pub const GAME_RUNNING: &str = "WoW is running. Type /reload in game to load updates. \
+                            New addons appear after restarting the game.";
+
+/// What the parchment is showing.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum PageKind {
+    Addon(String),
+    Other(String),
+    Kit(usize),
+    Gap(usize),
+    NoGame,
+    Empty,
+    NoCatalog,
+    Loading,
+    Nothing,
 }
 
-enum Row {
-    Header {
-        id: &'static str,
-        name: &'static str,
-        count: usize,
-        open: bool,
-    },
-    Addon(usize),
+/// What `main` already worked out before the window opened.
+pub struct Startup {
+    pub dirs: Dirs,
+    pub state: State,
+    pub lock: Option<File>,
+    pub already_running: bool,
+}
+
+/// Numbers for `--frame-report`, kept where its thread can read them.
+#[derive(Default, Clone)]
+pub struct ReportMarks {
+    pub first_frame_ms: Option<u128>,
+    pub catalog_ms: Option<u128>,
+    pub addons: usize,
+    pub search_ms: f64,
+    pub search_worst_ms: f64,
 }
 
 pub struct App {
-    skin: Skin,
-    launch: Launch,
-    frames: u32,
-    tab: Tab,
-    query: String,
-    catalog: Catalog,
-    collapsed: HashSet<&'static str>,
-    rows: Vec<Row>,
-    selected: Option<usize>,
+    pub ctx: egui::Context,
+    pub skin: Skin,
+    pub launch: Launch,
+    pub worker: Worker,
+    pub rx: Receiver<Event>,
+    pub demo: bool,
+    pub started: Instant,
+    pub state: State,
+    pub lock: Arc<Mutex<Option<File>>>,
+
+    pub game: Option<FoundGame>,
+    pub game_state: GameState,
+    pub write_problem: Option<String>,
+
+    pub bundle: Option<Arc<CatalogBundle>>,
+    pub catalog_status: CatalogStatus,
+    /// A fetch is on its way, even if a cached copy is already showing.
+    pub catalog_fetching: bool,
+
+    pub folders: Vec<LocalFolder>,
+    pub folder_lookup: HashMap<String, usize>,
+    pub scanned: bool,
+    pub scan_running: bool,
+    pub scan_again: bool,
+    /// What the fake AddOns folder holds, in `--demo`.
+    pub demo_disk: Vec<LocalFolder>,
+
+    pub groups: Vec<AddonGroup>,
+    pub adoptions: Vec<Adoption>,
+    pub updates: Vec<String>,
+
+    pub tab: Tab,
+    pub tab_chosen: bool,
+    pub default_tab_set: bool,
+    pub section: Section,
+    pub query: String,
+    pub sort: SortBy,
+    pub toggled: HashSet<HeaderId>,
+    pub rows: Vec<Row>,
+    pub rows_dirty: bool,
+    pub local_dirty: bool,
+    pub sel_my: Option<Selection>,
+    pub sel_browse: Option<Selection>,
+    pub list_offset: f32,
+    pub pending_scroll: Option<usize>,
+    /// Which row the selection was last made on.
+    pub row_hint: Option<usize>,
+    pub list_to_top: bool,
+    pub page_to_top: bool,
+    pub focus_search: bool,
+
+    pub popup: Option<Popup>,
+    pub popup_queue: VecDeque<Popup>,
+    pub messages: Messages,
+    pub loot: Option<(String, Instant)>,
+    pub queue: Queue,
+    pub demo_casting: Option<Casting>,
+    pub cancelled_ops: usize,
+    pub details: DetailsCache<TextureHandle>,
+    pub fun: Fun,
+    pub cursors: Cursors,
+    pub channel_choice: HashMap<String, Channel>,
+    pub changelog_open: bool,
+    pub actions: Vec<Action>,
+    /// What to carry on with once the player has chosen a game folder.
+    pub after_folder: Vec<Action>,
+    pub backups: Option<Vec<BackupEntry>>,
+    pub list_text: String,
+    pub diagnostics_wanted: bool,
+    /// The slider's position, which only becomes the real scale when it's let go.
+    pub scale_draft: f32,
+    /// Frames left before checking that the window still fits the scale.
+    pub fit_window_in: u8,
+    pub window_rect: Option<(egui::Pos2, Vec2)>,
+    pub relaunching: bool,
+    pub shut_down: bool,
+
+    pub frames: Arc<AtomicU64>,
+    pub marks: Arc<Mutex<ReportMarks>>,
+    pub script: Option<Script>,
+    pub shot_frames: u32,
+    pub shot_taken: bool,
+    pub hover_wait: bool,
+    /// Show the sort menu open on the next frame, for a screenshot.
+    pub open_sort: bool,
+    /// Startup's work is about to end, and its memory can go back once it has.
+    pub trim_when_quiet: bool,
+    /// Another copy holds the lock, so this one must not change anything.
+    pub read_only: bool,
 }
 
 impl App {
-    pub fn new(cc: &eframe::CreationContext<'_>, launch: Launch) -> Self {
-        theme::install(&cc.egui_ctx);
-        let catalog = demo::catalog();
+    pub fn new(ctx: &egui::Context, launch: Launch, startup: Startup) -> Self {
+        theme::install(ctx);
+        // The one scale setting is the slider, so egui's own shortcuts stay out of it.
+        ctx.options_mut(|o| o.zoom_with_keyboard = false);
+        let Startup {
+            dirs,
+            state,
+            lock,
+            already_running,
+        } = startup;
+        let scale = launch
+            .scale
+            .unwrap_or(state.settings.ui_scale)
+            .clamp(0.8, 2.0);
+        ctx.set_zoom_factor(scale);
+
+        let (tx, rx) = mpsc::channel();
+        let demo = launch.demo;
+        let catalog_url = catalog_url_for(&launch);
+        let sim = Duration::from_millis(launch.sim_ms.unwrap_or(1200));
+        let worker = Worker::new(
+            ctx.clone(),
+            tx,
+            dirs,
+            demo,
+            launch.test_rig,
+            catalog_url,
+            sim,
+        );
+        let now = Instant::now();
+        // Scripts press buttons, so like the catalog address they're for test rigs alone.
+        let script = launch
+            .script
+            .as_deref()
+            .filter(|_| launch.test_rig)
+            .and_then(Script::load);
+        let fun = Fun::new(state.stats.launches, now);
+        let pause = if demo { Duration::ZERO } else { PAUSE };
         let mut app = Self {
-            skin: Skin::load(&cc.egui_ctx),
-            launch,
-            frames: 0,
+            ctx: ctx.clone(),
+            skin: Skin::load(ctx),
+            worker,
+            rx,
+            demo,
+            started: now,
+            state,
+            lock: Arc::new(Mutex::new(lock)),
+            game: None,
+            game_state: GameState::Searching,
+            write_problem: None,
+            bundle: None,
+            catalog_status: CatalogStatus::Loading,
+            catalog_fetching: false,
+            folders: Vec::new(),
+            folder_lookup: HashMap::new(),
+            scanned: false,
+            scan_running: false,
+            scan_again: false,
+            demo_disk: Vec::new(),
+            groups: Vec::new(),
+            adoptions: Vec::new(),
+            updates: Vec::new(),
             tab: Tab::Browse,
+            tab_chosen: false,
+            default_tab_set: false,
+            section: Section::Game,
             query: String::new(),
-            catalog,
-            collapsed: HashSet::new(),
+            sort: SortBy::Popular,
+            toggled: HashSet::new(),
             rows: Vec::new(),
-            selected: Some(0),
+            rows_dirty: true,
+            local_dirty: true,
+            sel_my: None,
+            sel_browse: None,
+            list_offset: 0.0,
+            pending_scroll: None,
+            row_hint: None,
+            list_to_top: false,
+            page_to_top: false,
+            focus_search: false,
+            popup: None,
+            popup_queue: VecDeque::new(),
+            messages: Messages::default(),
+            loot: None,
+            queue: Queue::default(),
+            demo_casting: None,
+            cancelled_ops: 0,
+            details: DetailsCache::new(pause),
+            fun,
+            cursors: Cursors::default(),
+            channel_choice: HashMap::new(),
+            changelog_open: false,
+            actions: Vec::new(),
+            after_folder: Vec::new(),
+            backups: None,
+            list_text: String::new(),
+            diagnostics_wanted: false,
+            scale_draft: scale,
+            fit_window_in: if already_running { 0 } else { 2 },
+            window_rect: None,
+            relaunching: false,
+            shut_down: false,
+            frames: Arc::new(AtomicU64::new(0)),
+            marks: Arc::new(Mutex::new(ReportMarks::default())),
+            script,
+            shot_frames: 0,
+            shot_taken: false,
+            hover_wait: false,
+            open_sort: false,
+            trim_when_quiet: !demo && !already_running,
+            read_only: already_running,
+            launch,
         };
-        app.rebuild_rows();
+        if already_running {
+            // The other copy owns everything. All this one does is say so and close.
+            app.popup = Some(Popup::AlreadyRunning);
+            app.game_state = GameState::NotFound;
+            return app;
+        }
+        if app.managed_map().is_some_and(|m| !m.is_empty()) {
+            app.tab = Tab::MyAddons;
+        }
+        if demo {
+            app.start_demo();
+        } else {
+            app.start_real();
+        }
+        app.apply_launch_flags();
+        app.start_frame_report();
         app
     }
 
-    fn rebuild_rows(&mut self) {
-        self.rows.clear();
-        for (id, name) in CATEGORIES {
-            let members: Vec<usize> = self
-                .catalog
-                .addons
+    // --- Lookups the views share -------------------------------------------------------
+
+    pub fn managed_map(&self) -> Option<&BTreeMap<String, ManagedAddon>> {
+        self.state.current().map(|record| &record.managed)
+    }
+
+    pub fn managed(&self, id: &str) -> Option<&ManagedAddon> {
+        self.managed_map()?.get(id)
+    }
+
+    pub fn selection(&self) -> Option<&Selection> {
+        match self.tab {
+            Tab::MyAddons => self.sel_my.as_ref(),
+            Tab::Browse => self.sel_browse.as_ref(),
+            Tab::Settings => None,
+        }
+    }
+
+    pub fn group(&self, primary: &str) -> Option<&AddonGroup> {
+        self.groups.iter().find(|g| g.primary == primary)
+    }
+
+    pub fn adoption_for(&self, addon_id: &str) -> Option<&Adoption> {
+        self.adoptions.iter().find(|a| a.addon_id == addon_id)
+    }
+
+    /// The catalog match for an unmanaged group, by any of its folders.
+    pub fn adoption_for_folder(&self, primary: &str) -> Option<&Adoption> {
+        let group = self.group(primary)?;
+        self.adoptions.iter().find(|adoption| {
+            adoption
+                .folders
                 .iter()
-                .enumerate()
-                .filter(|(_, a)| a.category == id)
-                .map(|(i, _)| i)
-                .collect();
-            if members.is_empty() {
-                continue;
-            }
-            let open = !self.collapsed.contains(id);
-            self.rows.push(Row::Header {
-                id,
-                name,
-                count: members.len(),
-                open,
-            });
-            if open {
-                self.rows.extend(members.into_iter().map(Row::Addon));
-            }
-        }
+                .any(|f| group.folders.iter().any(|g| g.eq_ignore_ascii_case(f)))
+        })
     }
 
-    fn window_chrome(&mut self, ui: &mut Ui, full: Rect) {
-        let ctx = ui.ctx().clone();
-        let painter = ui.painter().clone();
-        self.skin.stone(&painter, full);
-
-        // A darker band behind the title, so the gold reads against the stone.
-        let band = Rect::from_min_max(full.min, pos2(full.max.x, full.min.y + 46.0));
-        skin::v_gradient(
-            &painter,
-            band,
-            Color32::from_black_alpha(150),
-            Color32::from_black_alpha(20),
-        );
-        skin::rule(
-            &painter,
-            pos2(full.min.x + 8.0, band.max.y),
-            pos2(full.max.x - 8.0, band.max.y),
-        );
-
-        // Drag the title bar to move the window; double click to maximize.
-        let drag_rect = Rect::from_min_max(
-            pos2(full.min.x + 88.0, full.min.y),
-            pos2(full.max.x - 70.0, band.max.y),
-        );
-        let drag = ui.interact(
-            drag_rect,
-            ui.scope_id().with("title-drag"),
-            Sense::click_and_drag(),
-        );
-        if drag.drag_started() {
-            ctx.send_viewport_cmd(ViewportCommand::StartDrag);
-        }
-        if drag.double_clicked() {
-            let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
-            ctx.send_viewport_cmd(ViewportCommand::Maximized(!maximized));
-        }
-
-        shadow_text(
-            &painter,
-            pos2(full.min.x + 94.0, band.center().y - 1.0),
-            Align2::LEFT_CENTER,
-            "WoW is a Feeling",
-            theme::display(23.0),
-            theme::GOLD,
-        );
-
-        let close =
-            Rect::from_min_size(pos2(full.max.x - 36.0, full.min.y + 14.0), vec2(20.0, 20.0));
-        if widgets::chrome_button(ui, close, "close", Glyph::Close, "Close").clicked() {
-            ctx.send_viewport_cmd(ViewportCommand::Close);
-        }
-        let minimize = close.translate(vec2(-25.0, 0.0));
-        if widgets::chrome_button(ui, minimize, "minimize", Glyph::Minimize, "Minimize").clicked() {
-            ctx.send_viewport_cmd(ViewportCommand::Minimized(true));
-        }
+    pub fn toc_notes(&self, folder: &str) -> Option<String> {
+        let index = *self.folder_lookup.get(&folder.to_lowercase())?;
+        self.folders.get(index)?.toc.notes.clone()
     }
 
-    fn resize_grips(&self, ui: &mut Ui, full: Rect) {
-        let ctx = ui.ctx().clone();
-        let t = 5.0;
-        let c = 14.0;
-        let (l, r, top, b) = (full.min.x, full.max.x, full.min.y, full.max.y);
-        let grips = [
-            (
-                Rect::from_min_max(pos2(l, top), pos2(l + c, top + t)),
-                ResizeDirection::NorthWest,
-                CursorIcon::ResizeNwSe,
-            ),
-            (
-                Rect::from_min_max(pos2(r - c, top), pos2(r, top + t)),
-                ResizeDirection::NorthEast,
-                CursorIcon::ResizeNeSw,
-            ),
-            (
-                Rect::from_min_max(pos2(l, b - c), pos2(l + c, b)),
-                ResizeDirection::SouthWest,
-                CursorIcon::ResizeNeSw,
-            ),
-            (
-                Rect::from_min_max(pos2(r - c, b - c), pos2(r, b)),
-                ResizeDirection::SouthEast,
-                CursorIcon::ResizeNwSe,
-            ),
-            (
-                Rect::from_min_max(pos2(l + c, top), pos2(r - c, top + t)),
-                ResizeDirection::North,
-                CursorIcon::ResizeVertical,
-            ),
-            (
-                Rect::from_min_max(pos2(l + c, b - t), pos2(r - c, b)),
-                ResizeDirection::South,
-                CursorIcon::ResizeVertical,
-            ),
-            (
-                Rect::from_min_max(pos2(l, top + c), pos2(l + t, b - c)),
-                ResizeDirection::West,
-                CursorIcon::ResizeHorizontal,
-            ),
-            (
-                Rect::from_min_max(pos2(r - t, top + c), pos2(r, b - c)),
-                ResizeDirection::East,
-                CursorIcon::ResizeHorizontal,
-            ),
-        ];
-        for (i, (rect, dir, cursor)) in grips.into_iter().enumerate() {
-            let resp = ui
-                .interact(rect, ui.scope_id().with(("resize", i)), Sense::drag())
-                .on_hover_cursor(cursor);
-            if resp.drag_started() {
-                ctx.send_viewport_cmd(ViewportCommand::BeginResize(dir));
+    /// Does anything of this addon's on disk say it runs on Forever? An addon whose folders
+    /// haven't been seen gets the benefit of the doubt.
+    pub fn targets_forever(&self, record: &ManagedAddon) -> bool {
+        let mut seen = false;
+        for folder in &record.folders {
+            if let Some(&i) = self.folder_lookup.get(&folder.to_lowercase()) {
+                seen = true;
+                if self.folders[i].targets_forever {
+                    return true;
+                }
             }
         }
+        !seen
     }
 
-    fn toolbar(&mut self, ui: &mut Ui, full: Rect) {
-        let y = full.min.y + 56.0;
-        let h = 28.0;
-        let left = full.min.x + 102.0;
-        let update = Rect::from_min_size(pos2(full.max.x - 136.0, y + 1.0), vec2(116.0, 26.0));
-        let sort = Rect::from_min_size(pos2(update.min.x - 150.0, y + 1.0), vec2(140.0, 26.0));
-        let search = Rect::from_min_max(pos2(left, y), pos2(sort.min.x - 10.0, y + h));
-
-        skin::well(ui.painter(), search, Color32::BLACK);
-        let edit = TextEdit::singleline(&mut self.query)
-            .id_salt("search")
-            .hint_text(
-                RichText::new("Search addons, or type /help")
-                    .color(theme::HINT)
-                    .font(theme::body(15.0)),
-            )
-            .font(theme::body(15.0))
-            .text_color(Color32::WHITE)
-            .frame(Frame::NONE)
-            .margin(vec2(8.0, 4.0))
-            .min_size(search.size())
-            .desired_width(search.width())
-            .align(Align2::LEFT_CENTER);
-        ui.put(search, edit);
-
-        skin::well(ui.painter(), sort, Color32::BLACK);
-        shadow_text(
-            ui.painter(),
-            pos2(sort.min.x + 10.0, sort.center().y),
-            Align2::LEFT_CENTER,
-            "Most popular",
-            theme::label(13.5),
-            theme::GOLD,
-        );
-        let arrow = pos2(sort.max.x - 14.0, sort.center().y);
-        ui.painter().add(egui::Shape::convex_polygon(
-            vec![
-                arrow + vec2(-5.0, -3.0),
-                arrow + vec2(5.0, -3.0),
-                arrow + vec2(0.0, 4.0),
-            ],
-            theme::GOLD_DIM,
-            Stroke::NONE,
-        ));
-
-        widgets::button_at(
-            ui,
-            update,
-            "update-all",
-            "Update all (3)",
-            ButtonKind::Main,
-            true,
-        );
+    /// The row the selection sits on. A recommended addon is listed under its category too,
+    /// so this prefers the row that was actually clicked or arrowed to.
+    pub fn selected_row(&self) -> Option<usize> {
+        let selection = self.selection()?;
+        let bundle = self.bundle.as_deref();
+        if let Some(hint) = self.row_hint
+            && let Some(row) = self.rows.get(hint)
+            && model::row_selection(row, bundle, &self.groups).as_ref() == Some(selection)
+        {
+            return Some(hint);
+        }
+        model::row_of(&self.rows, selection, bundle, &self.groups)
     }
 
-    fn quest_log(&mut self, ui: &mut Ui, rect: Rect) {
-        skin::well(ui.painter(), rect, theme::WELL);
-        let inner = rect.shrink(3.0);
-        let mut toggled = None;
-        let mut clicked = None;
-        let rows = &self.rows;
-        let catalog = &self.catalog;
-        let selected = self.selected;
-        ui.scope_builder(UiBuilder::new().max_rect(inner), |ui| {
-            ScrollArea::vertical()
-                .id_salt("quest-log")
-                .auto_shrink(false)
-                .show_rows(ui, ROW_HEIGHT, rows.len(), |ui, range| {
-                    ui.spacing_mut().item_spacing.y = 0.0;
-                    for row in &rows[range] {
-                        let width = ui.available_width();
-                        let (r, resp) =
-                            ui.allocate_exact_size(vec2(width, ROW_HEIGHT), Sense::click());
-                        let p = ui.painter_at(r);
-                        match row {
-                            Row::Header {
-                                id,
-                                name,
-                                count,
-                                open,
-                            } => {
-                                if resp.hovered() {
-                                    p.rect_filled(r, 0.0, Color32::from_white_alpha(8));
-                                }
-                                let b = Rect::from_center_size(
-                                    pos2(r.min.x + 13.0, r.center().y),
-                                    vec2(13.0, 13.0),
-                                );
-                                p.rect_filled(b, 1.0, Color32::from_rgb(40, 30, 16));
-                                p.rect_stroke(
-                                    b,
-                                    1.0,
-                                    Stroke::new(1.0, theme::GOLD_DIM),
-                                    StrokeKind::Inside,
-                                );
-                                let s = Stroke::new(1.5, theme::GOLD);
-                                p.line_segment(
-                                    [b.center() - vec2(3.5, 0.0), b.center() + vec2(3.5, 0.0)],
-                                    s,
-                                );
-                                if !open {
-                                    p.line_segment(
-                                        [b.center() - vec2(0.0, 3.5), b.center() + vec2(0.0, 3.5)],
-                                        s,
-                                    );
-                                }
-                                shadow_text(
-                                    &p,
-                                    pos2(r.min.x + 26.0, r.center().y),
-                                    Align2::LEFT_CENTER,
-                                    name,
-                                    theme::label(14.5),
-                                    theme::GOLD,
-                                );
-                                shadow_text(
-                                    &p,
-                                    pos2(r.max.x - 8.0, r.center().y),
-                                    Align2::RIGHT_CENTER,
-                                    &count.to_string(),
-                                    theme::body(13.0),
-                                    theme::GOLD_DIM,
-                                );
-                                if resp.clicked() {
-                                    toggled = Some(*id);
-                                }
-                            }
-                            Row::Addon(i) => {
-                                let addon = &catalog.addons[*i];
-                                let is_selected = selected == Some(*i);
-                                if is_selected {
-                                    skin::v_gradient(
-                                        &p,
-                                        r,
-                                        Color32::from_rgb(92, 70, 22),
-                                        Color32::from_rgb(58, 44, 14),
-                                    );
-                                    p.rect_stroke(
-                                        r,
-                                        0.0,
-                                        Stroke::new(1.0, theme::GOLD_DIM),
-                                        StrokeKind::Inside,
-                                    );
-                                } else if resp.hovered() {
-                                    p.rect_filled(r, 0.0, Color32::from_white_alpha(14));
-                                }
-                                shadow_text(
-                                    &p,
-                                    pos2(r.min.x + 26.0, r.center().y),
-                                    Align2::LEFT_CENTER,
-                                    &addon.name,
-                                    theme::body(15.0),
-                                    theme::tier_color(addon.tier),
-                                );
-                                let version =
-                                    addon.stable.as_ref().map_or("", |s| s.version.as_str());
-                                let (text, color) = if addon.tier == 0 {
-                                    ("out of date", theme::ERROR_RED)
-                                } else {
-                                    (version, theme::TEXT_DIM)
-                                };
-                                shadow_text(
-                                    &p,
-                                    pos2(r.max.x - 8.0, r.center().y),
-                                    Align2::RIGHT_CENTER,
-                                    text,
-                                    theme::body(13.0),
-                                    color,
-                                );
-                                let resp = resp.on_hover_ui(|ui| addon_tooltip(ui, addon));
-                                if resp.clicked() {
-                                    clicked = Some(*i);
-                                }
-                            }
-                        }
+    /// True when there are no headers to sit under.
+    pub fn rows_are_flat(&self) -> bool {
+        !matches!(self.rows.first(), Some(Row::Header { .. }))
+    }
+
+    pub fn casting(&self) -> Option<Casting> {
+        self.demo_casting.clone().or_else(|| self.queue.casting())
+    }
+
+    pub fn now_unix(&self) -> i64 {
+        if self.demo {
+            demo::NOW
+        } else {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs() as i64)
+        }
+    }
+
+    pub fn status_text(&self) -> String {
+        let bundle = self.bundle.as_deref();
+        model::status_line(
+            &self.game_state,
+            bundle.map_or(0, |b| b.catalog.addons.len()),
+            bundle.map_or(0, |b| b.catalog.generated),
+            self.catalog_status,
+            self.now_unix(),
+        )
+    }
+
+    pub fn empty_list_note(&self) -> &'static str {
+        if !model::effective_query(&self.query).is_empty() {
+            return "Nothing matches that.";
+        }
+        match self.tab {
+            Tab::Browse => match self.catalog_status {
+                CatalogStatus::Loading => "Fetching the list of addons...",
+                _ => "No addons to show.",
+            },
+            Tab::MyAddons => match self.game_state {
+                GameState::Searching => "Looking for WoW Forever...",
+                GameState::NotFound => "Choose your game folder to see your addons.",
+                GameState::Found { .. } if !self.scanned => "Reading your AddOns folder...",
+                GameState::Found { .. } => "Nothing here yet.",
+            },
+            Tab::Settings => "",
+        }
+    }
+
+    pub fn page_kind(&self) -> PageKind {
+        let selected = |selection: &Option<Selection>| match selection {
+            Some(Selection::Addon(id)) => PageKind::Addon(id.clone()),
+            Some(Selection::Other(primary)) => PageKind::Other(primary.clone()),
+            Some(Selection::Kit(i)) => PageKind::Kit(*i),
+            Some(Selection::Gap(i)) => PageKind::Gap(*i),
+            None => PageKind::Nothing,
+        };
+        match self.tab {
+            Tab::MyAddons => match self.game_state {
+                GameState::NotFound => PageKind::NoGame,
+                GameState::Searching => PageKind::Loading,
+                GameState::Found { .. } if !self.scanned => PageKind::Loading,
+                GameState::Found { .. } => {
+                    let nothing_installed =
+                        self.managed_map().is_none_or(BTreeMap::is_empty) && self.groups.is_empty();
+                    if self.scanned && nothing_installed && self.query.trim().is_empty() {
+                        PageKind::Empty
+                    } else {
+                        selected(&self.sel_my)
                     }
-                });
-        });
-        if let Some(id) = toggled {
-            if !self.collapsed.remove(id) {
-                self.collapsed.insert(id);
+                }
+            },
+            Tab::Browse => {
+                if self.bundle.is_none() {
+                    match self.catalog_status {
+                        CatalogStatus::Loading => PageKind::Loading,
+                        _ => PageKind::NoCatalog,
+                    }
+                } else {
+                    selected(&self.sel_browse)
+                }
             }
-            self.rebuild_rows();
-        }
-        if clicked.is_some() {
-            self.selected = clicked;
+            Tab::Settings => PageKind::Nothing,
         }
     }
 
-    fn page(&mut self, ui: &mut Ui, rect: Rect) {
-        let painter = ui.painter();
-        self.skin.parchment(painter, rect);
-        painter.rect_stroke(
-            rect,
-            1.0,
-            Stroke::new(1.0, Color32::from_black_alpha(220)),
-            StrokeKind::Outside,
+    pub fn main_action_for(&self, id: &str, main: model::MainButton) -> Action {
+        match main {
+            model::MainButton::Manage => Action::Adopt(id.to_owned()),
+            _ => Action::Install(vec![id.to_owned()]),
+        }
+    }
+
+    /// What Enter does: the page's main button, when it's enabled.
+    fn enter_action(&self) -> Option<Action> {
+        let busy_all = self.queue.busy_exclusive();
+        match self.page_kind() {
+            PageKind::Addon(id) => {
+                let bundle = self.bundle.as_deref()?;
+                let addon = bundle.addon(&id)?;
+                let record = self.managed(&id);
+                let main = model::main_button(addon, record, self.adoption_for(&id).is_some());
+                let channel = model::channel_for(
+                    record,
+                    self.channel_choice.get(&id).copied(),
+                    self.state.settings.default_channel,
+                );
+                let installable =
+                    addon.release(channel).is_some() || main == model::MainButton::Manage;
+                let blocked = busy_all
+                    || self.queue.busy_with(&id)
+                    || main == model::MainButton::Pinned
+                    || !installable;
+                (!blocked).then(|| self.main_action_for(&id, main))
+            }
+            PageKind::Other(primary) => {
+                let adoption = self.adoption_for_folder(&primary)?;
+                (!busy_all).then(|| Action::Adopt(adoption.addon_id.clone()))
+            }
+            PageKind::Kit(i) => {
+                let bundle = self.bundle.as_deref()?;
+                let kit = bundle.catalog.kits.get(i)?;
+                let missing = model::kit_missing(kit, bundle, self.managed_map());
+                (!missing.is_empty() && !busy_all).then_some(Action::Install(missing))
+            }
+            PageKind::Gap(i) => {
+                let bundle = self.bundle.as_deref()?;
+                let url = bundle.catalog.gaps.get(i)?.website.as_deref()?;
+                model::safe_url(url).map(|url| Action::OpenLink(url.to_owned()))
+            }
+            PageKind::NoGame => Some(Action::ChooseFolder),
+            PageKind::Empty => Some(Action::SetTab(Tab::Browse)),
+            PageKind::NoCatalog => Some(Action::RetryCatalog),
+            PageKind::Loading | PageKind::Nothing => None,
+        }
+    }
+
+    // --- Changing state ----------------------------------------------------------------
+
+    pub fn yellow(&mut self, text: impl Into<String>) {
+        self.messages.push(Kind::System, text, Instant::now());
+    }
+
+    pub fn red(&mut self, text: impl Into<String>) {
+        self.messages.push(Kind::Error, text, Instant::now());
+    }
+
+    pub fn pwnage_message(&mut self, now: Instant) {
+        self.messages.push_link(
+            Kind::System,
+            "PWNAGE!",
+            "Watch the video",
+            easter::VIDEO_URL,
+            now,
         );
-        painter.rect_stroke(
-            rect,
-            1.0,
-            Stroke::new(1.0, theme::GOLD_LINE),
-            StrokeKind::Inside,
-        );
-        let Some(addon) = self.selected.and_then(|i| self.catalog.addons.get(i)) else {
+    }
+
+    pub fn save_state(&self) {
+        self.worker.save_state(self.state.clone());
+    }
+
+    /// The list needs another look, without touching what's derived from the disk.
+    pub fn mark_rows_dirty(&mut self) {
+        self.rows_dirty = true;
+    }
+
+    /// Something the lists are derived from has changed.
+    pub fn mark_local_dirty(&mut self) {
+        self.local_dirty = true;
+    }
+
+    pub fn toggle_header(&mut self, id: HeaderId) {
+        if !self.toggled.remove(&id) {
+            self.toggled.insert(id);
+        }
+        self.rows_dirty = true;
+    }
+
+    pub fn set_tab(&mut self, tab: Tab) {
+        if self.tab != tab {
+            self.tab = tab;
+            self.rows_dirty = true;
+            self.list_offset = 0.0;
+            self.selection_changed();
+        }
+        self.tab_chosen = true;
+    }
+
+    pub fn set_selection(&mut self, selection: Option<Selection>) {
+        let slot = match self.tab {
+            Tab::MyAddons => &mut self.sel_my,
+            Tab::Browse => &mut self.sel_browse,
+            Tab::Settings => return,
+        };
+        if *slot == selection {
+            return;
+        }
+        *slot = selection;
+        self.selection_changed();
+    }
+
+    /// The page shows something else now, so its scroll, its changelog and its pending
+    /// fetch all start over.
+    pub fn selection_changed(&mut self) {
+        self.page_to_top = true;
+        self.changelog_open = false;
+        let now = Instant::now();
+        let id = match self.selection() {
+            Some(Selection::Addon(id)) => Some(id.clone()),
+            _ => None,
+        };
+        let in_catalog = id.as_deref().is_some_and(|id| {
+            self.bundle
+                .as_deref()
+                .is_some_and(|b| b.addon(id).is_some())
+        });
+        match id {
+            Some(id) if in_catalog => {
+                if let Some(urls) = self.details.select(&id, now) {
+                    self.worker.fetch_images(id, urls);
+                }
+            }
+            _ => self.details.clear_pending(),
+        }
+    }
+
+    pub fn open_folder_browser(&mut self) {
+        let start = self
+            .game
+            .as_ref()
+            .map(|game| game.install.root.clone())
+            .unwrap_or_else(default_browse_folder);
+        let browser = Popup::Folder(Box::new(FolderBrowser {
+            typed: start.display().to_string(),
+            listing: None,
+            waiting_for: Some(start.clone()),
+        }));
+        // Something else on screen waits behind it. The folder is what's blocking the player.
+        if let Some(showing) = self.popup.replace(browser) {
+            self.popup_queue.push_front(showing);
+        }
+        self.worker.list_dir(start);
+    }
+
+    pub fn ask_remove(&mut self, selection: &Selection) {
+        let plan = match selection {
+            Selection::Addon(id) => self.managed(id).map(|record| {
+                let folders = self
+                    .managed_map()
+                    .map(|m| ops::own_folders(id, m))
+                    .unwrap_or_default();
+                RemovePlan {
+                    addon_id: Some(id.clone()),
+                    name: record.name.clone(),
+                    dependents: feeling_core::deps::dependents(
+                        &folders,
+                        &self.state,
+                        &self.folders,
+                    ),
+                    folders,
+                }
+            }),
+            Selection::Other(primary) => self.group(primary).map(|group| RemovePlan {
+                addon_id: None,
+                name: model::clean_line(&group.title, 80),
+                folders: group.folders.clone(),
+                dependents: feeling_core::deps::dependents(
+                    &group.folders,
+                    &self.state,
+                    &self.folders,
+                ),
+            }),
+            _ => None,
+        };
+        if let Some(plan) = plan {
+            self.show_popup(Popup::Remove(plan));
+        }
+    }
+
+    /// One popup at a time: the rest wait their turn.
+    pub fn show_popup(&mut self, popup: Popup) {
+        if self.popup.is_none() {
+            self.popup = Some(popup);
+        } else {
+            self.popup_queue.push_back(popup);
+        }
+    }
+
+    pub fn next_popup(&mut self) -> Option<Popup> {
+        self.popup_queue.pop_front()
+    }
+
+    pub fn op_env(&self) -> OpEnv {
+        OpEnv {
+            install: self.game.as_ref().map(|game| game.install.clone()),
+            keep_previous: self.state.settings.keep_previous_version,
+        }
+    }
+
+    pub fn pump_queue(&mut self) {
+        let started = self.queue.start_ready();
+        if started.is_empty() {
+            return;
+        }
+        let env = self.op_env();
+        for (op, cancel) in started {
+            self.worker.run_op(op, env.clone(), cancel);
+        }
+    }
+
+    pub fn rescan(&mut self) {
+        if self.demo {
+            self.folders = self.demo_disk.clone();
+            self.index_folders();
+            self.scanned = true;
+            self.local_dirty = true;
+            return;
+        }
+        let Some(game) = &self.game else {
             return;
         };
-
-        let button_row = Rect::from_min_max(
-            pos2(rect.min.x + 18.0, rect.max.y - 42.0),
-            pos2(rect.max.x - 18.0, rect.max.y - 12.0),
-        );
-        let text_area = Rect::from_min_max(
-            rect.min + vec2(18.0, 16.0),
-            pos2(rect.max.x - 10.0, button_row.min.y - 8.0),
-        );
-
-        ui.scope_builder(UiBuilder::new().max_rect(text_area), |ui| {
-            ScrollArea::vertical()
-                .id_salt("page")
-                .auto_shrink(false)
-                .show(ui, |ui| {
-                    ui.set_max_width(text_area.width() - 16.0);
-                    ui.label(
-                        RichText::new(&addon.name)
-                            .font(theme::display(27.0))
-                            .color(theme::INK_HEAD),
-                    );
-                    ui.label(
-                        RichText::new(format!("by {}", addon.author))
-                            .font(theme::label(14.0))
-                            .color(theme::INK_SOFT),
-                    );
-                    ui.add_space(6.0);
-                    page_rule(ui);
-                    ui.add_space(8.0);
-                    section(ui, "Description");
-                    ui.label(
-                        RichText::new(&addon.summary)
-                            .font(theme::label(15.5))
-                            .color(theme::INK),
-                    );
-                    ui.add_space(12.0);
-                    section(ui, "Details");
-                    let release = addon.stable.as_ref();
-                    let fact = |ui: &mut Ui, k: &str, v: String| {
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                RichText::new(k)
-                                    .font(theme::label(14.5))
-                                    .color(theme::INK_SOFT),
-                            );
-                            ui.label(RichText::new(v).font(theme::strong(15.0)).color(theme::INK));
-                        });
-                    };
-                    if let Some(r) = release {
-                        fact(ui, "Version:", r.version.clone());
-                        fact(ui, "Size:", megabytes(r.size));
-                    }
-                    fact(ui, "Folders:", addon.folders.join(", "));
-                    fact(ui, "Requires:", "Interface 16001".to_owned());
-                });
-        });
-
-        ui.scope_builder(UiBuilder::new().max_rect(button_row), |ui| {
-            ui.horizontal(|ui| {
-                widgets::button(ui, "Install", ButtonKind::Main, true);
-                widgets::button(ui, "Share", ButtonKind::Quiet, true);
-            });
-        });
-    }
-
-    fn bottom(&mut self, ui: &mut Ui, full: Rect) {
-        let strip_y = full.max.y - 40.0;
-        let bar = Rect::from_center_size(pos2(full.center().x, strip_y - 19.0), vec2(360.0, 22.0));
-        self.skin
-            .casting_bar(ui.painter(), bar, 0.64, "Installing Questie");
-
-        let tabs = [
-            (Tab::MyAddons, "My Addons"),
-            (Tab::Browse, "Browse"),
-            (Tab::Settings, "Settings"),
-        ];
-        let mut x = full.min.x + 20.0;
-        for (tab, text) in tabs {
-            let r = Rect::from_min_size(pos2(x, strip_y), vec2(112.0, 28.0));
-            if widgets::tab(ui, r, text, self.tab == tab).clicked() {
-                self.tab = tab;
-            }
-            x += 116.0;
+        if self.scan_running {
+            self.scan_again = true;
+            return;
         }
-        shadow_text(
-            ui.painter(),
-            pos2(full.max.x - 20.0, strip_y + 14.0),
-            Align2::RIGHT_CENTER,
-            "Forever 1.60.1  |  18 addons  |  updated 2 hours ago",
-            theme::body(13.0),
-            theme::TEXT_DIM,
-        );
+        self.scan_running = true;
+        let install = game.install.clone();
+        self.worker.scan(install, self.kept_zip_paths());
     }
 
-    /// `--screenshot`: render a few frames so everything has settled, save a PNG, quit.
-    fn take_screenshot_if_asked(&mut self, ui: &Ui) {
+    fn kept_zip_paths(&self) -> Vec<(String, PathBuf)> {
+        self.managed_map()
+            .map(|managed| {
+                managed
+                    .values()
+                    .filter_map(|m| Some((m.id.clone(), m.previous_zip.clone()?)))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn index_folders(&mut self) {
+        self.folder_lookup = self
+            .folders
+            .iter()
+            .enumerate()
+            .map(|(i, f)| (f.name.to_lowercase(), i))
+            .collect();
+    }
+
+    pub fn use_game(&mut self, game: FoundGame) {
+        self.state.current_install = Some(game.key.clone());
+        self.state.installs.entry(game.key.clone()).or_default();
+        self.game_state = GameState::Found {
+            version: game.install.version.clone(),
+        };
+        self.write_problem = None;
+        self.scanned = false;
+        if self.demo {
+            self.rescan();
+        } else {
+            self.scan_running = true;
+            self.worker
+                .open_game(game.install.clone(), self.kept_zip_paths());
+        }
+        self.game = Some(game);
+        self.local_dirty = true;
+        self.save_state();
+        for action in std::mem::take(&mut self.after_folder) {
+            self.actions.push(action);
+        }
+    }
+
+    pub fn fetch_catalog(&mut self) {
+        self.catalog_fetching = true;
+        self.worker.load_catalog(self.state.catalog_etag.clone());
+    }
+
+    /// Nothing is on its way from a worker anymore.
+    pub fn is_quiet(&self) -> bool {
+        let looked = !matches!(self.game_state, GameState::Searching);
+        let scanned = self.game.is_none() || (self.scanned && !self.scan_running);
+        looked && scanned && !self.catalog_fetching && self.queue.is_idle()
+    }
+
+    /// Quiet, and with no popup waiting on an answer.
+    pub fn is_settled(&self) -> bool {
+        self.is_quiet() && self.popup.is_none()
+    }
+
+    pub fn next_op_id(&mut self) -> u64 {
+        self.queue.next_id()
+    }
+
+    pub fn run_slash(&mut self, line: &str) {
+        let now = Instant::now();
+        let managed = self.managed_map().map_or(0, BTreeMap::len);
+        let stats = &self.state.stats;
+        let facts = Facts {
+            seconds_open: stats.seconds_open + self.started.elapsed().as_secs(),
+            launches: stats.launches,
+            addons_installed: stats.addons_installed,
+            updates_applied: stats.updates_applied,
+            managed,
+        };
+        match easter::parse_slash(line, facts) {
+            Some(easter::Slash::Say(text)) => self.yellow(text),
+            Some(easter::Slash::Reload) => {
+                self.rescan();
+                self.yellow("Reloading your addons.");
+            }
+            Some(easter::Slash::Dance) => self.fun.dance(now),
+            Some(easter::Slash::Ding) => {
+                self.fun.ding(now);
+                self.yellow("Ding!");
+            }
+            Some(easter::Slash::Pwnage) => {
+                self.fun.pwnage(now);
+                self.pwnage_message(now);
+            }
+            Some(easter::Slash::OpenAbout) => {
+                self.set_tab(Tab::Settings);
+                self.section = Section::About;
+            }
+            None => {}
+        }
+    }
+
+    // --- Derived data ------------------------------------------------------------------
+
+    /// Rebuild only what its inputs have invalidated. On a quiet frame this does nothing.
+    pub fn refresh(&mut self) {
+        if std::mem::take(&mut self.local_dirty) {
+            let bundle = self.bundle.clone();
+            let empty = BTreeMap::new();
+            let managed = self.managed_map().unwrap_or(&empty);
+            let owned: Vec<&str> = managed
+                .values()
+                .flat_map(|m| m.folders.iter().map(String::as_str))
+                .collect();
+            let groups = scan::group_unmanaged(&self.folders, owned.iter().copied());
+            let adoptions = bundle
+                .as_deref()
+                .map(|b| scan::match_to_catalog(&self.folders, &b.catalog, owned.iter().copied()))
+                .unwrap_or_default();
+            let updates = model::updates_available(managed, bundle.as_deref());
+            self.groups = groups;
+            self.adoptions = adoptions;
+            self.updates = updates;
+            self.rows_dirty = true;
+        }
+        if std::mem::take(&mut self.rows_dirty) {
+            let empty = BTreeMap::new();
+            self.rows = match self.tab {
+                Tab::Browse => self.bundle.as_deref().map_or_else(Vec::new, |bundle| {
+                    model::browse_rows(bundle, &self.query, self.sort, &self.toggled)
+                }),
+                Tab::MyAddons => {
+                    let managed = self.managed_map().unwrap_or(&empty);
+                    model::my_rows(
+                        managed,
+                        &self.updates,
+                        &self.groups,
+                        &self.query,
+                        &self.toggled,
+                    )
+                }
+                Tab::Settings => Vec::new(),
+            };
+            self.fix_selection();
+        }
+    }
+
+    /// Keep the selection if it still means something. A hidden row in a closed category
+    /// still does; while searching, the first match is what's wanted.
+    fn fix_selection(&mut self) {
+        if self.tab == Tab::Settings {
+            return;
+        }
+        let bundle = self.bundle.clone();
+        let current = self.selection().cloned();
+        let searching = !model::effective_query(&self.query).is_empty();
+        let keep = current.as_ref().is_some_and(|selection| {
+            model::row_of(&self.rows, selection, bundle.as_deref(), &self.groups).is_some()
+                || (!searching && self.selection_resolves(selection))
+        });
+        if keep {
+            return;
+        }
+        let first = model::first_row(&self.rows)
+            .and_then(|row| model::row_selection(&self.rows[row], bundle.as_deref(), &self.groups));
+        self.set_selection(first);
+    }
+
+    fn selection_resolves(&self, selection: &Selection) -> bool {
+        let bundle = self.bundle.as_deref();
+        match selection {
+            Selection::Addon(id) => {
+                self.managed(id).is_some() || bundle.is_some_and(|b| b.addon(id).is_some())
+            }
+            Selection::Other(primary) => self.group(primary).is_some(),
+            Selection::Kit(i) => bundle.is_some_and(|b| *i < b.catalog.kits.len()),
+            Selection::Gap(i) => bundle.is_some_and(|b| *i < b.catalog.gaps.len()),
+        }
+    }
+
+    // --- One frame ---------------------------------------------------------------------
+
+    pub fn draw(&mut self, ui: &mut Ui) {
+        let ctx = ui.ctx().clone();
+        if self.frames.fetch_add(1, Ordering::Relaxed) == 0 {
+            let began = self.launch.started.unwrap_or(self.started);
+            self.marks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .first_frame_ms = Some(began.elapsed().as_millis());
+        }
+        self.keyboard(&ctx);
+        self.take_drops(&ctx);
+        self.refresh();
+        views::draw(self, ui);
+
+        let had_actions = !self.actions.is_empty();
+        for action in std::mem::take(&mut self.actions) {
+            self.apply(action);
+        }
+        self.refresh();
+        if had_actions {
+            ctx.request_repaint();
+        }
+        self.remember_window(&ctx);
+        self.fit_window(&ctx);
+        self.cursors.apply(&ctx);
+        self.schedule_wake(&ctx);
+        self.take_screenshot_if_asked(&ctx);
+    }
+
+    fn keyboard(&mut self, ctx: &egui::Context) {
+        // A popup or an open menu has the keyboard, including Escape.
+        if self.popup.is_some() || egui::Popup::is_any_open(ctx) {
+            return;
+        }
+        let search_id = toolbar::search_id();
+        let focused = ctx.memory(|m| m.focused());
+        let search_focused = focused == Some(search_id);
+        // Typing `/` or Ctrl+F jumps to the search box from anywhere that isn't text.
+        let typing_elsewhere =
+            focused.is_some() && !search_focused && ctx.egui_wants_keyboard_input();
+        if typing_elsewhere {
+            return;
+        }
+        let (down, up, enter, escape, find, slash) = ctx.input_mut(|i| {
+            let slash = !search_focused
+                && i.events
+                    .iter()
+                    .any(|e| matches!(e, egui::Event::Text(t) if t == "/"));
+            (
+                i.consume_key(Modifiers::NONE, Key::ArrowDown),
+                i.consume_key(Modifiers::NONE, Key::ArrowUp),
+                i.key_pressed(Key::Enter),
+                i.consume_key(Modifiers::NONE, Key::Escape),
+                i.consume_key(Modifiers::COMMAND, Key::F),
+                slash,
+            )
+        });
+        if slash || find {
+            ctx.memory_mut(|m| m.request_focus(search_id));
+        }
+        if escape {
+            if self.query.is_empty() {
+                ctx.memory_mut(|m| m.surrender_focus(search_id));
+            } else {
+                self.query.clear();
+                self.rows_dirty = true;
+                self.list_to_top = true;
+            }
+        }
+        if enter {
+            if search_focused {
+                self.enter_in_search(ctx);
+            } else if focused.is_none()
+                && let Some(action) = self.enter_action()
+            {
+                self.actions.push(action);
+            }
+        }
+        if down || up {
+            if self.tab == Tab::Settings {
+                self.actions
+                    .push(Action::SetSection(model::next_section(self.section, down)));
+            } else {
+                self.move_selection(down);
+            }
+        }
+    }
+
+    /// Enter in the search box runs a command if that's what it holds. Otherwise it just
+    /// hands the keyboard to the list, so an install is always a separate, deliberate press.
+    fn enter_in_search(&mut self, ctx: &egui::Context) {
+        ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter));
+        let line = self.query.trim().to_owned();
+        if line.starts_with('/') {
+            self.query.clear();
+            self.rows_dirty = true;
+            self.run_slash(&line);
+        } else {
+            ctx.memory_mut(|m| m.surrender_focus(toolbar::search_id()));
+        }
+    }
+
+    fn move_selection(&mut self, down: bool) {
+        let bundle = self.bundle.clone();
+        let from = self.selected_row();
+        let Some(next) = model::step_selection(&self.rows, from, down) else {
+            return;
+        };
+        let selection = model::row_selection(&self.rows[next], bundle.as_deref(), &self.groups);
+        self.set_selection(selection);
+        self.row_hint = Some(next);
+        self.pending_scroll = Some(next);
+    }
+
+    fn take_drops(&mut self, ctx: &egui::Context) {
+        let dropped: Vec<PathBuf> = ctx.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .map(|file| file.path().to_path_buf())
+                .collect()
+        });
+        for path in dropped {
+            self.actions.push(Action::ZipDropped(path));
+        }
+    }
+
+    fn remember_window(&mut self, ctx: &egui::Context) {
+        let zoom = ctx.zoom_factor();
+        let rect = ctx.input(|i| {
+            let viewport = i.viewport();
+            if viewport.minimized == Some(true) || viewport.maximized == Some(true) {
+                return None;
+            }
+            Some((viewport.outer_rect?.min, viewport.inner_rect?.size()))
+        });
+        if let Some((pos, size)) = rect {
+            // Stored without the UI scale, because that's how the window gets created.
+            self.window_rect = Some(((pos.to_vec2() * zoom).to_pos2(), size * zoom));
+        }
+    }
+
+    /// Everything's laid out for at least 820x560 points, so a bigger UI scale needs a
+    /// bigger window, when the screen has room for one.
+    fn fit_window(&mut self, ctx: &egui::Context) {
+        if self.fit_window_in == 0 {
+            return;
+        }
+        self.fit_window_in -= 1;
+        if self.fit_window_in > 0 {
+            ctx.request_repaint();
+            return;
+        }
+        let (monitor, inner) = ctx.input(|i| {
+            (
+                i.viewport().monitor_size,
+                i.viewport().inner_rect.map(|r| r.size()),
+            )
+        });
+        let room = monitor.map_or(MIN_POINTS, |m| m - vec2(16.0, 64.0));
+        let least = MIN_POINTS.min(room).max(vec2(320.0, 240.0));
+        ctx.send_viewport_cmd(ViewportCommand::MinInnerSize(least));
+        if let Some(inner) = inner
+            && (inner.x < least.x - 0.5 || inner.y < least.y - 0.5)
+        {
+            ctx.send_viewport_cmd(ViewportCommand::InnerSize(inner.max(least)));
+        }
+    }
+
+    pub fn set_scale(&mut self, scale: f32) {
+        let scale = scale.clamp(0.8, 2.0);
+        self.scale_draft = scale;
+        self.ctx.set_zoom_factor(scale);
+        self.state.settings.ui_scale = scale;
+        self.fit_window_in = 2;
+        self.save_state();
+    }
+
+    /// Sleep until the next thing on a timer. No timers, no frames.
+    fn schedule_wake(&self, ctx: &egui::Context) {
+        let now = Instant::now();
+        let mut wake = self.messages.next_wake(now);
+        let mut sooner = |d: Option<Duration>| {
+            if let Some(d) = d {
+                wake = Some(wake.map_or(d, |w: Duration| w.min(d)));
+            }
+        };
+        sooner(self.fun.next_wake(now));
+        sooner(self.details.next_wake(now));
+        sooner(
+            self.loot
+                .as_ref()
+                .map(|(_, until)| until.saturating_duration_since(now)),
+        );
+        match wake {
+            Some(Duration::ZERO) => ctx.request_repaint(),
+            Some(delay) => ctx.request_repaint_after(delay),
+            None => {}
+        }
+    }
+
+    /// `--screenshot`: let everything settle, save a PNG, quit.
+    fn take_screenshot_if_asked(&mut self, ctx: &egui::Context) {
         let Some(path) = self.launch.screenshot.clone() else {
             return;
         };
-        let ctx = ui.ctx();
-        self.frames += 1;
+        if self.shot_taken {
+            return;
+        }
+        self.shot_frames += 1;
         ctx.request_repaint();
-        if self.frames == 5 {
-            let closer = ctx.clone();
-            ctx.request_screenshot(move |image| {
-                let bytes: Vec<u8> = image
-                    .pixels
-                    .iter()
-                    .flat_map(|c| c.to_srgba_unmultiplied())
-                    .collect();
-                let saved = image::save_buffer(
-                    &path,
-                    &bytes,
-                    image.size[0] as u32,
-                    image.size[1] as u32,
-                    image::ColorType::Rgba8,
-                );
-                if let Err(e) = saved {
-                    eprintln!("could not save screenshot: {e}");
-                }
-                closer.send_viewport_cmd(ViewportCommand::Close);
-            });
+        let waited = self.started.elapsed();
+        let hover_ready = !self.hover_wait || waited > Duration::from_millis(700);
+        let settled = self.demo || self.is_quiet() || waited > Duration::from_secs(20);
+        if self.shot_frames >= 8 && hover_ready && settled {
+            self.shot_taken = true;
+            crate::save_screenshot(ctx, path, true);
+        }
+    }
+
+    pub fn script_tick(&mut self, now: Instant) {
+        if let Some(mut script) = self.script.take() {
+            script.tick(self, now);
+            self.script = Some(script);
+            self.ctx.request_repaint_after(Duration::from_millis(16));
+        }
+    }
+
+    /// Add the time this session has been open.
+    pub fn record_session(&mut self) {
+        self.state.stats.seconds_open += self.started.elapsed().as_secs();
+        self.started = Instant::now();
+    }
+
+    /// The window is closing. Stop what can stop, let what can't finish, and save.
+    pub fn shut_down(&mut self) {
+        let nothing_to_save = self.demo || self.read_only || self.relaunching;
+        if std::mem::replace(&mut self.shut_down, true) || nothing_to_save {
+            return;
+        }
+        self.queue.cancel_all();
+        let deadline = Instant::now() + SHUTDOWN_WAIT;
+        while self.queue.running_count() > 0 {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                log::warn!("Closing with an operation still running. It'll recover next time.");
+                break;
+            }
+            match self.rx.recv_timeout(left) {
+                Ok(event) => self.handle(event, Instant::now()),
+                Err(_) => break,
+            }
+        }
+        self.record_session();
+        if let Some((pos, size)) = self.window_rect {
+            self.state.settings.window_pos = Some([pos.x, pos.y]);
+            self.state.settings.window_size = Some([size.x, size.y]);
+        }
+        self.worker.finish_saves();
+        if let Err(e) = self.state.save_to(&self.worker.dirs().state_file) {
+            log::error!("Couldn't save settings: {e}");
+        }
+    }
+
+    /// For the test harness: keep the pointer over one spot.
+    pub fn input_hook(&mut self, raw: &mut egui::RawInput) {
+        // Once is enough. A pointer that keeps "moving" never gets a tooltip.
+        if let Some([x, y]) = self.launch.hover.take() {
+            raw.events.push(egui::Event::PointerMoved(egui::pos2(x, y)));
+            self.hover_wait = true;
         }
     }
 }
@@ -538,92 +1155,95 @@ impl eframe::App for App {
         [0.05, 0.04, 0.03, 1.0]
     }
 
+    /// Runs even while minimized, so a finished job gets recorded either way.
+    fn logic(&mut self, _ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        App::logic(self);
+    }
+
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
-        let full = ui.max_rect();
-        self.window_chrome(ui, full);
-        self.toolbar(ui, full);
+        self.draw(ui);
+    }
 
-        let top = full.min.y + 94.0;
-        let bottom = full.max.y - 74.0;
-        let split = full.min.x + (full.width() * 0.42).clamp(320.0, 460.0);
-        let log = Rect::from_min_max(pos2(full.min.x + 20.0, top), pos2(split - 4.0, bottom));
-        let page = Rect::from_min_max(pos2(split + 4.0, top), pos2(full.max.x - 20.0, bottom));
-        self.quest_log(ui, log);
-        self.page(ui, page);
-        self.bottom(ui, full);
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        self.input_hook(raw_input);
+    }
 
-        self.skin.gold_frame(ui.painter(), full);
-        self.skin.portrait(
-            ui.painter(),
-            pos2(full.min.x + 50.0, full.min.y + 50.0),
-            44.0,
-            false,
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.shut_down();
+    }
+}
+
+pub fn same_main(folder: &str, id: &str) -> bool {
+    id.strip_prefix("local:")
+        .is_some_and(|main| main.eq_ignore_ascii_case(folder))
+}
+
+/// `kit:0`, `gap:0`, `other:Folder`, or an addon id.
+pub fn parse_selection(text: &str) -> Selection {
+    if let Some(i) = text.strip_prefix("kit:").and_then(|i| i.parse().ok()) {
+        Selection::Kit(i)
+    } else if let Some(i) = text.strip_prefix("gap:").and_then(|i| i.parse().ok()) {
+        Selection::Gap(i)
+    } else if let Some(primary) = text.strip_prefix("other:") {
+        Selection::Other(primary.to_owned())
+    } else {
+        Selection::Addon(text.to_owned())
+    }
+}
+
+/// Where to fetch the catalog. Only a test rig can point somewhere else, because a shortcut
+/// with a stranger's catalog in it would be a way to install a stranger's files.
+fn catalog_url_for(launch: &Launch) -> String {
+    launch
+        .catalog_url
+        .clone()
+        .filter(|_| launch.test_rig)
+        .unwrap_or_else(|| CATALOG_URL.to_owned())
+}
+
+fn default_browse_folder() -> PathBuf {
+    if cfg!(windows) {
+        return PathBuf::from(r"C:\Program Files (x86)");
+    }
+    std::env::var_os("HOME").map_or_else(|| PathBuf::from("/"), PathBuf::from)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn selections_parse_from_the_command_line() {
+        assert_eq!(parse_selection("kit:2"), Selection::Kit(2));
+        assert_eq!(parse_selection("gap:1"), Selection::Gap(1));
+        assert_eq!(
+            parse_selection("other:Foo"),
+            Selection::Other("Foo".to_owned())
         );
-        self.resize_grips(ui, full);
-        self.take_screenshot_if_asked(ui);
+        assert_eq!(
+            parse_selection("gh:a/b"),
+            Selection::Addon("gh:a/b".to_owned())
+        );
     }
-}
 
-/// A hand-ruled line across the parchment, with a small diamond at its center.
-fn page_rule(ui: &mut Ui) {
-    let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 7.0), Sense::hover());
-    let p = ui.painter_at(r);
-    let c = r.center();
-    let line = Color32::from_rgba_unmultiplied(92, 60, 20, 170);
-    let clear = Color32::from_rgba_unmultiplied(92, 60, 20, 0);
-    let left = Rect::from_min_max(pos2(r.min.x, c.y), pos2(c.x - 8.0, c.y + 1.0));
-    let right = Rect::from_min_max(pos2(c.x + 8.0, c.y), pos2(r.max.x, c.y + 1.0));
-    skin::h_gradient(&p, left, clear, line);
-    skin::h_gradient(&p, right, line, clear);
-    p.add(egui::Shape::convex_polygon(
-        vec![
-            c - vec2(4.0, 0.0),
-            c - vec2(0.0, 3.0),
-            c + vec2(4.0, 0.0),
-            c + vec2(0.0, 3.0),
-        ],
-        line,
-        Stroke::NONE,
-    ));
-}
-
-fn section(ui: &mut Ui, title: &str) {
-    ui.label(
-        RichText::new(title)
-            .font(theme::display(17.0))
-            .color(theme::INK_HEAD),
-    );
-    ui.add_space(1.0);
-}
-
-fn megabytes(bytes: u64) -> String {
-    if bytes >= 1_000_000 {
-        format!("{:.1} MB", bytes as f64 / 1_000_000.0)
-    } else {
-        format!("{} KB", (bytes / 1000).max(1))
+    #[test]
+    fn only_a_test_rig_can_change_where_the_catalog_comes_from() {
+        let mut launch = Launch {
+            catalog_url: Some("https://stranger.example/catalog.json".to_owned()),
+            ..Launch::default()
+        };
+        assert_eq!(catalog_url_for(&launch), CATALOG_URL);
+        launch.test_rig = true;
+        assert_eq!(
+            catalog_url_for(&launch),
+            "https://stranger.example/catalog.json"
+        );
     }
-}
 
-/// Addon sizes, priced the way a vendor would.
-fn coins(bytes: u64) -> String {
-    let mb = bytes as f64 / 1_000_000.0;
-    let gold = mb.floor() as u64;
-    let silver = ((mb - mb.floor()) * 100.0).round() as u64;
-    if gold == 0 {
-        format!("{silver} silver")
-    } else {
-        format!("{gold} gold {silver} silver")
-    }
-}
-
-fn addon_tooltip(ui: &mut Ui, addon: &feeling_core::catalog::Addon) {
-    ui.set_max_width(270.0);
-    widgets::tooltip_title(ui, &addon.name, theme::tier_color(addon.tier));
-    widgets::tooltip_line(ui, "Binds when installed");
-    if let Some(r) = &addon.stable {
-        widgets::tooltip_line(ui, &format!("Size: {}", coins(r.size)));
-    }
-    if !addon.summary.is_empty() {
-        widgets::tooltip_colored(ui, &format!("Use: {}", addon.summary), theme::USE_GREEN);
+    #[test]
+    fn a_dropped_zips_main_folder_sorts_first() {
+        assert!(same_main("Foo", "local:foo"));
+        assert!(!same_main("Bar", "local:foo"));
+        assert!(!same_main("Foo", "gh:a/foo"));
     }
 }

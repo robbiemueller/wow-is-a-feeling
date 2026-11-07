@@ -5,24 +5,39 @@ use std::path::{Path, PathBuf};
 
 const APP_DIR: &str = "wow-is-a-feeling";
 
+/// When set, all four folders live under this one, so a test run can't touch a player's
+/// real settings.
+const HOME_ENV: &str = "WIAF_HOME";
+
 /// Settings and managed-addon records. Roams with the Windows profile.
 pub fn config_dir() -> PathBuf {
-    app_dir(dirs::config_dir(), "config")
+    resolve(dirs::config_dir(), "config")
 }
 
 /// Things that are safe to lose, such as the downloaded catalog.
 pub fn cache_dir() -> PathBuf {
-    app_dir(dirs::cache_dir(), "cache")
+    resolve(dirs::cache_dir(), "cache")
 }
 
 /// Larger files we want to keep, such as previous addon zips. Machine-local on
 /// Windows, so they never get copied around with a roaming profile.
 pub fn data_dir() -> PathBuf {
-    app_dir(dirs::data_local_dir(), "data")
+    resolve(dirs::data_local_dir(), "data")
 }
 
 pub fn log_dir() -> PathBuf {
-    app_dir(dirs::data_local_dir(), "logs")
+    resolve(dirs::data_local_dir(), "logs")
+}
+
+fn resolve(base: Option<PathBuf>, kind: &str) -> PathBuf {
+    under_home(std::env::var_os(HOME_ENV), base, kind)
+}
+
+fn under_home(home: Option<std::ffi::OsString>, base: Option<PathBuf>, kind: &str) -> PathBuf {
+    match home.filter(|home| !home.is_empty()) {
+        Some(home) => PathBuf::from(home).join(kind),
+        None => app_dir(base, kind),
+    }
 }
 
 /// Each kind gets its own subfolder because the OS bases can coincide (on Windows the
@@ -60,6 +75,23 @@ mod tests {
         }
         for (i, dir) in dirs.iter().enumerate() {
             assert!(!dirs[i + 1..].contains(dir), "{} is shared", dir.display());
+        }
+    }
+
+    #[test]
+    fn a_home_override_holds_every_kind_and_an_empty_one_is_ignored() {
+        let base = || Some(PathBuf::from("base"));
+        let kinds = ["config", "cache", "data", "logs"];
+        for kind in kinds {
+            assert_eq!(
+                under_home(Some("test-home".into()), base(), kind),
+                Path::new("test-home").join(kind)
+            );
+            assert_eq!(
+                under_home(Some("".into()), base(), kind),
+                app_dir(base(), kind)
+            );
+            assert_eq!(under_home(None, base(), kind), app_dir(base(), kind));
         }
     }
 
