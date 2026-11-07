@@ -1,0 +1,12 @@
+[package]
+name = "feeling-catalog"
+description = "CI tool that builds the addon catalog for WoW is a Feeling."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+feeling-core.workspace = true

@@ -1,0 +1,17 @@
+# Logo B, 16x16, hand-tuned. Every pixel counts here.
+...bbbbbbbbb....
+.bbpbbbbpbbbbb.b
+.bbbbbpbbbbbbbb.
+kccccccccccccck.
+kcsssssssssssck.
+kcswwshshswwsck.
+kcsswshhhswssck.
+kcsswwshswwssck.
+kcssswwwwwsssck.
+kcssswwswwsssck.
+kcssssssssssLck.
+.kkkkkkkkkkkkk..
+.....ddddd......
+...ccccccccc....
+...kkkkkkkkk....
+................

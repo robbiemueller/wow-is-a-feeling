@@ -1,0 +1,36 @@
+[workspace]
+resolver = "3"
+members = ["crates/core", "crates/app", "crates/catalog-builder", "crates/xtask"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/robbiemueller/wow-is-a-feeling"
+homepage = "https://robbiemueller.github.io/wow-is-a-feeling/"
+authors = ["Robbie Mueller"]
+
+[workspace.dependencies]
+feeling-core = { path = "crates/core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+log = "0.4"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+zip = { version = "9.4", default-features = false, features = ["deflate-flate2"] }
+ureq = { version = "3.5", default-features = false, features = ["rustls", "platform-verifier", "gzip"] }
+sha2 = "0.10"
+md-5 = "0.10"
+
+# Size and speed both matter here: fat LTO strips far more than it costs.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+opt-level = 3
+
+# Dev builds of the UI are painfully slow without this.
+[profile.dev.package."*"]
+opt-level = 2

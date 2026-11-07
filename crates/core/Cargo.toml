@@ -1,0 +1,31 @@
+[package]
+name = "feeling-core"
+description = "UI-free core of WoW is a Feeling: TOC parsing, catalog, install, update."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+log.workspace = true
+ureq.workspace = true
+zip.workspace = true
+flate2.workspace = true
+sha2.workspace = true
+md-5.workspace = true
+dirs = "7"
+nucleo-matcher = "0.3"
+minisign-verify = "0.3"
+self-replace = "1.5"
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.55"
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Diagnostics_ToolHelp"] }
+
+[dev-dependencies]
+tempfile = "3"

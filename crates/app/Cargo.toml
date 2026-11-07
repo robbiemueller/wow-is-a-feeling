@@ -1,0 +1,23 @@
+[package]
+name = "wow-is-a-feeling"
+description = "A lightweight, free addon manager for World of Warcraft: Forever, with a vanilla feel."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "wow-is-a-feeling"
+path = "src/main.rs"
+
+[dependencies]
+feeling-core.workspace = true
+eframe = { version = "=0.37.0", default-features = false, features = ["glow", "accesskit", "wayland", "x11"] }
+egui = "=0.37.0"
+log.workspace = true
+
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"

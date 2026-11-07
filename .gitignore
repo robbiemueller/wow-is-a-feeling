@@ -1,0 +1,18 @@
+# Rust build output
+/target/
+**/*.rs.bk
+
+# Local-only files
+.env
+*.minisign.key
+*.pem
+/out/
+/dist/
+
+# OS and editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+.claude/
+__pycache__/
