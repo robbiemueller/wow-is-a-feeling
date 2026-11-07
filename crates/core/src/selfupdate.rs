@@ -703,7 +703,7 @@ mod tests {
         let keys = generate_keys();
         let json = manifest_json("0.2.0");
         let server = release_server(json.clone(), keys.sign(&json));
-        let http = Http::new();
+        let http = Http::allowing_loopback();
         let key = Some("windows-x64");
 
         let info = check_at(&http, &server.base, &keys.public, "0.1.0", key)
@@ -728,7 +728,7 @@ mod tests {
         let signature = keys.sign(&manifest_json("0.2.0"));
         let server = release_server(manifest_json("9.9.9"), signature);
         let result = check_at(
-            &Http::new(),
+            &Http::allowing_loopback(),
             &server.base,
             &keys.public,
             "0.1.0",
@@ -748,7 +748,7 @@ mod tests {
             }
         });
         let result = check_at(
-            &Http::new(),
+            &Http::allowing_loopback(),
             &server.base,
             &keys.public,
             "0.1.0",
@@ -765,7 +765,7 @@ mod tests {
             .unwrap()
             .port();
         let result = check_at(
-            &Http::new(),
+            &Http::allowing_loopback(),
             &format!("http://127.0.0.1:{port}"),
             &keys.public,
             "0.1.0",
@@ -780,7 +780,7 @@ mod tests {
         let huge = vec![b' '; MAX_MANIFEST_BYTES as usize + 1];
         let server = release_server(huge.clone(), keys.sign(&huge));
         let result = check_at(
-            &Http::new(),
+            &Http::allowing_loopback(),
             &server.base,
             &keys.public,
             "0.1.0",
@@ -847,7 +847,7 @@ mod tests {
         let asset = asset_for(server.base.clone() + "/a.exe", &body, AssetKind::Exe);
         let mut last = None;
         let applied = apply_to(
-            &Http::new(),
+            &Http::allowing_loopback(),
             &asset,
             &app.target,
             &replace_fake(&app.target),
@@ -887,7 +887,7 @@ mod tests {
             let mut asset = asset_for(server.base.clone() + "/a", &body, kind);
             asset.sha256 = sha_hex(b"what was signed");
             let result = apply_to(
-                &Http::new(),
+                &Http::allowing_loopback(),
                 &asset,
                 &app.target,
                 &never_replace,
@@ -911,7 +911,7 @@ mod tests {
         let mut asset = asset_for(server.base.clone() + "/a", &body, AssetKind::Exe);
         asset.sha256 = String::new();
         let result = apply_to(
-            &Http::new(),
+            &Http::allowing_loopback(),
             &asset,
             &app.target,
             &never_replace,
@@ -931,7 +931,7 @@ mod tests {
             let mut asset = asset_for(server.base.clone() + "/a", &body, AssetKind::Exe);
             asset.size = size;
             let result = apply_to(
-                &Http::new(),
+                &Http::allowing_loopback(),
                 &asset,
                 &app.target,
                 &never_replace,
@@ -955,7 +955,7 @@ mod tests {
         let asset = asset_for(server.base.clone() + "/a", &body, AssetKind::Exe);
         let refuse = |_: &Path| -> io::Result<()> { Err(io::Error::other("locked")) };
         let result = apply_to(
-            &Http::new(),
+            &Http::allowing_loopback(),
             &asset,
             &app.target,
             &refuse,
@@ -975,7 +975,7 @@ mod tests {
         let asset = asset_for(server.base.clone() + "/a", &body, AssetKind::Exe);
         let cancel = AtomicBool::new(false);
         let result = apply_to(
-            &Http::new(),
+            &Http::allowing_loopback(),
             &asset,
             &app.target,
             &never_replace,
@@ -1001,7 +1001,7 @@ mod tests {
             fs::copy(new, &app.target).map(drop)
         };
         apply_to(
-            &Http::new(),
+            &Http::allowing_loopback(),
             &asset,
             &app.target,
             &replace,
@@ -1021,7 +1021,7 @@ mod tests {
         let server = file_server(body.clone());
         let asset = asset_for(server.base.clone() + "/a.gz", &body, AssetKind::BinGz);
         let result = apply_to(
-            &Http::new(),
+            &Http::allowing_loopback(),
             &asset,
             &app.target,
             &never_replace,
@@ -1044,7 +1044,7 @@ mod tests {
             AssetKind::AppImage,
         );
         let applied = apply_to(
-            &Http::new(),
+            &Http::allowing_loopback(),
             &asset,
             &app.target,
             &never_replace,
@@ -1088,7 +1088,7 @@ mod tests {
         let server = file_server(zip.clone());
         let asset = asset_for(server.base.clone() + "/a.zip", &zip, AssetKind::AppZip);
         let applied = apply_to(
-            &Http::new(),
+            &Http::allowing_loopback(),
             &asset,
             &app,
             &never_replace,
@@ -1131,7 +1131,7 @@ mod tests {
         let server = file_server(zip.clone());
         let asset = asset_for(server.base.clone() + "/a.zip", &zip, AssetKind::AppZip);
         let result = apply_to(
-            &Http::new(),
+            &Http::allowing_loopback(),
             &asset,
             &app,
             &never_replace,
@@ -1156,7 +1156,7 @@ mod tests {
             let server = file_server(zip.clone());
             let asset = asset_for(server.base.clone() + "/a.zip", &zip, AssetKind::AppZip);
             let result = apply_to(
-                &Http::new(),
+                &Http::allowing_loopback(),
                 &asset,
                 &app,
                 &never_replace,

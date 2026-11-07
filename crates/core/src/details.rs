@@ -5,13 +5,11 @@
 //! text just has to read well, and nothing a README contains may ever reach an HTML
 //! renderer or a shell, because there isn't one.
 
-use std::net::IpAddr;
-
 use serde::Deserialize;
 
 use crate::catalog::{Addon, Source};
 use crate::error::{Error, Result};
-use crate::net::Http;
+use crate::net::{self, Http};
 
 const MAX_DOWNLOAD_BYTES: u64 = 512 * 1024;
 const MAX_TEXT_CHARS: usize = 6000;
@@ -68,6 +66,7 @@ pub struct Details {
     pub about: String,
     pub changelog: Option<String>,
     /// Up to three screenshots, as https URLs the app can fetch through [`Http`].
+    /// Written by a stranger, so fetch these with [`Http::get_untrusted`] only.
     pub images: Vec<String>,
 }
 
@@ -209,6 +208,7 @@ fn fetch_wowi(http: &Http, id: u64, endpoints: &Endpoints<'_>) -> Result<Details
             .unwrap_or_default()
             .iter()
             .filter_map(|url| absolute_https(url))
+            .filter(|url| net::is_public_url(url))
             .take(MAX_IMAGES)
             .collect(),
     })
@@ -840,7 +840,7 @@ pub fn image_urls_from_markdown(markdown: &str, raw_base: &str) -> Vec<String> {
         let Some(url) = candidate.filter(|url| !is_badge(url)) else {
             continue;
         };
-        let Some(url) = resolve_image(url, raw_base).filter(|url| !is_local_address(url)) else {
+        let Some(url) = resolve_image(url, raw_base).filter(|url| net::is_public_url(url)) else {
             continue;
         };
         if !images.contains(&url) {
@@ -857,23 +857,6 @@ fn image_snippet(text: &str, at: usize) -> &str {
         end -= 1;
     }
     &text[at..end]
-}
-
-/// A README is written by a stranger. It doesn't get to make the app probe the player's
-/// own network, and no real screenshot lives there anyway.
-fn is_local_address(url: &str) -> bool {
-    let rest = url.strip_prefix("https://").unwrap_or(url);
-    let authority = rest.split('/').next().unwrap_or(rest);
-    let authority = authority
-        .rsplit('@')
-        .next()
-        .unwrap_or(authority)
-        .to_ascii_lowercase();
-    let host = match authority.strip_prefix('[') {
-        Some(bracketed) => bracketed.split(']').next().unwrap_or(bracketed),
-        None => authority.split(':').next().unwrap_or(&authority),
-    };
-    host == "localhost" || host.ends_with(".local") || host.parse::<IpAddr>().is_ok()
 }
 
 /// From `![alt](url "title")`, the url.
@@ -997,19 +980,17 @@ mod tests {
                 stream,
                 "200 OK",
                 &[],
-                b"# Title\n\n[![Build](https://img.shields.io/x.svg)](https://ci)\n\nHello **world**.\n\n![shot](docs/shot.png)\n",
+                b"# Title\n\n[![Build](https://img.shields.io/x.svg)](https://ci)\n\nHello **world**.\n\n![shot](https://cdn.example/shot.png)\n",
             ),
             "/owner/repo/HEAD/CHANGELOG.md" => respond(stream, "200 OK", &[], b"## 1.0\n- First\n"),
             other => panic!("unexpected request for {other}"),
         }
         });
-        let details = fetch_from(&Http::new(), &github(), &endpoints(&server)).unwrap();
+        let details =
+            fetch_from(&Http::allowing_loopback(), &github(), &endpoints(&server)).unwrap();
         assert_eq!(details.about, "Title\n\nHello world.");
         assert_eq!(details.changelog.as_deref(), Some("1.0\n\n• First"));
-        assert_eq!(
-            details.images,
-            [format!("{}/owner/repo/HEAD/docs/shot.png", server.base)]
-        );
+        assert_eq!(details.images, ["https://cdn.example/shot.png"]);
     }
 
     #[test]
@@ -1026,7 +1007,8 @@ mod tests {
             }
             _ => respond(stream, "404 Not Found", &[], b""),
         });
-        let details = fetch_from(&Http::new(), &github(), &endpoints(&server)).unwrap();
+        let details =
+            fetch_from(&Http::allowing_loopback(), &github(), &endpoints(&server)).unwrap();
         assert_eq!(details.about, "Plain readme.");
         assert_eq!(details.changelog.as_deref(), Some("Fixed things."));
     }
@@ -1040,7 +1022,8 @@ mod tests {
             }
             _ => respond(stream, "404 Not Found", &[], b""),
         });
-        let details = fetch_from(&Http::new(), &github(), &endpoints(&server)).unwrap();
+        let details =
+            fetch_from(&Http::allowing_loopback(), &github(), &endpoints(&server)).unwrap();
         assert_eq!(details.about, "About.");
         assert_eq!(details.changelog, None);
     }
@@ -1053,7 +1036,8 @@ mod tests {
             "/owner/repo/HEAD/CHANGELOG.md" => respond(stream, "500 Oops", &[], b""),
             _ => respond(stream, "404 Not Found", &[], b""),
         });
-        let details = fetch_from(&Http::new(), &github(), &endpoints(&server)).unwrap();
+        let details =
+            fetch_from(&Http::allowing_loopback(), &github(), &endpoints(&server)).unwrap();
         assert_eq!(details.about, "About.");
         assert_eq!(details.changelog, None);
     }
@@ -1061,7 +1045,8 @@ mod tests {
     #[test]
     fn no_readme_falls_back_to_the_catalog_summary() {
         let server = serve(|_, stream| respond(stream, "404 Not Found", &[], b""));
-        let details = fetch_from(&Http::new(), &github(), &endpoints(&server)).unwrap();
+        let details =
+            fetch_from(&Http::allowing_loopback(), &github(), &endpoints(&server)).unwrap();
         assert_eq!(details.about, "The catalog's summary.");
         assert!(details.images.is_empty());
         assert_eq!(details.changelog, None);
@@ -1070,7 +1055,7 @@ mod tests {
     #[test]
     fn a_server_error_on_the_readme_is_reported() {
         let server = serve(|_, stream| respond(stream, "500 Oops", &[], b""));
-        let result = fetch_from(&Http::new(), &github(), &endpoints(&server));
+        let result = fetch_from(&Http::allowing_loopback(), &github(), &endpoints(&server));
         assert!(matches!(result, Err(Error::HttpStatus { status: 500, .. })));
     }
 
@@ -1085,7 +1070,8 @@ mod tests {
                 respond(stream, "404 Not Found", &[], b"");
             }
         });
-        let details = fetch_from(&Http::new(), &github(), &endpoints(&server)).unwrap();
+        let details =
+            fetch_from(&Http::allowing_loopback(), &github(), &endpoints(&server)).unwrap();
         assert!(details.about.chars().count() <= MAX_TEXT_CHARS + 1);
         assert!(details.about.ends_with('…'));
     }
@@ -1104,7 +1090,8 @@ mod tests {
             "a/..",
         ] {
             let odd = addon(Source::Github { repo: repo.into() });
-            let details = fetch_from(&Http::new(), &odd, &endpoints(&server)).unwrap();
+            let details =
+                fetch_from(&Http::allowing_loopback(), &odd, &endpoints(&server)).unwrap();
             assert_eq!(details.about, "The catalog's summary.", "{repo}");
         }
         assert_eq!(server.hits.load(std::sync::atomic::Ordering::SeqCst), 0);
@@ -1116,7 +1103,7 @@ mod tests {
         let direct = addon(Source::Direct {
             url: "https://example.test/a.zip".into(),
         });
-        let details = fetch_from(&Http::new(), &direct, &endpoints(&server)).unwrap();
+        let details = fetch_from(&Http::allowing_loopback(), &direct, &endpoints(&server)).unwrap();
         assert_eq!(details.about, "The catalog's summary.");
     }
 
@@ -1134,7 +1121,7 @@ mod tests {
             );
         });
         let details = fetch_from(
-            &Http::new(),
+            &Http::allowing_loopback(),
             &addon(Source::Wowi { id: 5086 }),
             &endpoints(&server),
         )
@@ -1162,7 +1149,7 @@ mod tests {
             )
         });
         let details = fetch_from(
-            &Http::new(),
+            &Http::allowing_loopback(),
             &addon(Source::Wowi { id: 1 }),
             &endpoints(&server),
         )
@@ -1176,7 +1163,7 @@ mod tests {
     fn wowinterface_nonsense_is_a_parse_error() {
         let server = serve(|_, stream| respond(stream, "200 OK", &[], b"<html>maintenance</html>"));
         let result = fetch_from(
-            &Http::new(),
+            &Http::allowing_loopback(),
             &addon(Source::Wowi { id: 1 }),
             &endpoints(&server),
         );
@@ -1333,7 +1320,7 @@ mod tests {
         ] {
             let _ = markdown_to_text(nasty);
             let _ = bbcode_to_text(nasty);
-            let _ = image_urls_from_markdown(nasty, "https://r");
+            let _ = image_urls_from_markdown(nasty, "https://raw.example");
         }
     }
 
@@ -1455,7 +1442,7 @@ mod tests {
             let markdown = started.elapsed();
             let _ = bbcode_to_text(case);
             let bbcode = started.elapsed() - markdown;
-            let _ = image_urls_from_markdown(case, "https://r");
+            let _ = image_urls_from_markdown(case, "https://raw.example");
             let images = started.elapsed() - markdown - bbcode;
             let limit = std::time::Duration::from_secs(10);
             let shown: String = case.chars().take(12).collect();
@@ -1578,14 +1565,38 @@ mod tests {
             "https://[::1]/x.png",
             "https://printer.local/x.png",
             "https://me@10.0.0.1:444/x.png",
+            "https://router/x.png",
+            "https://2130706433/x.png",
         ] {
             assert!(
-                image_urls_from_markdown(&format!("![x]({url})"), "https://r").is_empty(),
+                image_urls_from_markdown(&format!("![x]({url})"), "https://raw.example").is_empty(),
                 "{url}"
             );
         }
-        let fine = image_urls_from_markdown("![x](https://cdn.example/a.png)", "https://r");
+        let fine =
+            image_urls_from_markdown("![x](https://cdn.example/a.png)", "https://raw.example");
         assert_eq!(fine, ["https://cdn.example/a.png"]);
+    }
+
+    #[test]
+    fn a_wowi_page_cannot_point_the_app_at_the_players_own_network() {
+        let server = serve(|_, stream| {
+            respond(
+                stream,
+                "200 OK",
+                &[],
+                br#"[{"UID":"1","UIDescription":"x","UIIMGs":["https://127.0.0.1/a.png",
+                    "http://192.168.1.1/b.png","//localhost/c.png","https://router/d.png",
+                    "https://cdn.example/fine.png"]}]"#,
+            );
+        });
+        let details = fetch_from(
+            &Http::allowing_loopback(),
+            &addon(Source::Wowi { id: 1 }),
+            &endpoints(&server),
+        )
+        .unwrap();
+        assert_eq!(details.images, ["https://cdn.example/fine.png"]);
     }
 
     #[test]
@@ -1600,7 +1611,7 @@ mod tests {
     #[test]
     fn repeated_images_count_once() {
         let md = "![a](x.png) ![b](x.png) ![c](y.png)";
-        assert_eq!(image_urls_from_markdown(md, "https://r").len(), 2);
+        assert_eq!(image_urls_from_markdown(md, "https://raw.example").len(), 2);
     }
 
     #[test]
