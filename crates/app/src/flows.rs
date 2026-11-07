@@ -1744,8 +1744,9 @@ fn update_all_backs_up_settings_first_and_counts_on_the_bar() {
 
     let mut h = rig.launch_settled();
     let ids: Vec<String> = names.iter().map(|n| format!("direct:{n}")).collect();
-    app_mut(&mut h).actions.push(Action::Install(ids));
-    h.step();
+    // Applied here and looked at before another frame, so no worker can have answered yet,
+    // however fast the machine is. Answers only land when a frame reads them.
+    app_mut(&mut h).apply(Action::Install(ids.clone()));
     assert_eq!(app(&h).casting().unwrap().text, "Installing 1 of 4");
     finish_ops(&mut h);
     let backups = rig.dirs.backups();
@@ -1762,12 +1763,20 @@ fn update_all_backs_up_settings_first_and_counts_on_the_bar() {
     rig.site.publish(&catalog_of(v2));
     let mut h = rig.launch_settled();
     assert!(has_label(&h, "Update all (4)"));
-    click(&mut h, "Update all (4)");
-    let cast = app(&h).casting().unwrap();
+    // What the button does, checked the same way: the backup is the one running, alone, and
+    // all four updates wait behind it, which the queue holds to until the backup is done.
+    app_mut(&mut h).apply(Action::UpdateAll);
+    let queue = &app(&h).queue;
     assert_eq!(
-        cast.text, "Backing up your settings",
+        queue.casting().unwrap().text,
+        "Backing up your settings",
         "the bar shows the backup first"
     );
+    assert_eq!(queue.running_count(), 1, "nothing runs beside it");
+    assert!(queue.busy_exclusive());
+    for id in &ids {
+        assert!(queue.busy_with(id), "{id} waits its turn");
+    }
     finish_ops(&mut h);
     for name in names {
         assert_eq!(rig.version_on_disk(name).as_deref(), Some("2.0"));

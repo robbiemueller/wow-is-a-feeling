@@ -739,6 +739,25 @@ mod tests {
     }
 
     #[test]
+    fn a_backup_ahead_of_a_batch_shows_first_and_is_not_counted_in_it() {
+        let mut q = Queue::default();
+        let mut backup = op(&mut q, "backup", &[]);
+        backup.verb = Verb::Backup;
+        backup.exclusive = true;
+        let backup_id = backup.id;
+        q.push(backup);
+        for name in ["a", "b", "c", "d"] {
+            let o = op(&mut q, name, &[name]);
+            q.push(o);
+        }
+        assert_eq!(names(&q.start_ready()), vec!["backup"]);
+        assert_eq!(q.casting().unwrap().text, "Backing up your settings");
+        q.finish(backup_id);
+        assert_eq!(names(&q.start_ready()), vec!["a", "b", "c"]);
+        assert_eq!(q.casting().unwrap().text, "Updating 1 of 4");
+    }
+
+    #[test]
     fn the_bar_names_a_single_op_and_only_moves_forward() {
         let mut q = Queue::default();
         let o = op(&mut q, "Questie", &["Questie"]);
