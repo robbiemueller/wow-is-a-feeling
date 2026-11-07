@@ -15,8 +15,9 @@ const GAME_ADDON_PREFIX: &str = "blizzard_";
 /// The biggest pack, in bytes, that installs as another addon's dependency without the player
 /// seeing its size first. A pack is an addon a reviewed entry lists under its `packs`, such as
 /// a voice pack: those run to gigabytes, and any addon's TOC can require one of their folders.
-/// Other dependencies aren't held to this, because the addon that requires one won't load
-/// without it.
+/// A pack up to this size comes along whether or not it's reviewed, because the reviewed entry
+/// that lists it vouches for it. Other dependencies aren't held to this, because the addon that
+/// requires one won't load without it.
 pub const BIGGEST_UNASKED_DOWNLOAD: u64 = 100_000_000;
 
 /// Which catalog addons provide each folder.
@@ -57,8 +58,9 @@ pub struct Resolution {
     /// Required folders that nothing installed provides and no trusted catalog entry does
     /// either. The player has to look for these themselves.
     pub missing: Vec<String>,
-    /// Required folders whose pick is trusted but was never reviewed by a person, so it
-    /// isn't installed by itself. The player can open it from the Requires line and decide.
+    /// Required folders whose pick is trusted but was never reviewed by a person, and isn't a
+    /// pack of a known size up to [`BIGGEST_UNASKED_DOWNLOAD`], so it isn't installed by itself.
+    /// The player can open it from the Requires line and decide.
     pub unreviewed: Vec<Unreviewed>,
     /// Required folders whose pick is a pack with a download over [`BIGGEST_UNASKED_DOWNLOAD`],
     /// reviewed or not, so it isn't installed by itself either. The player hears its size and
@@ -102,8 +104,10 @@ pub struct TooBig {
 /// pack, which a reviewed entry lists under its `packs`, never joins when its download is over
 /// [`BIGGEST_UNASKED_DOWNLOAD`], reviewed or not, because a voice pack can run to gigabytes:
 /// those are listed in `too_big`, with their size. That's decided before `reviewed`, since the
-/// catalog publishes big packs unreviewed. Any other pick joins whatever its size, because the
-/// addon that requires it won't load without it.
+/// catalog publishes big packs unreviewed. A pack whose download is known and up to that size
+/// joins even when it's published unreviewed, as one is when only its other channel's build is
+/// big: the reviewed entry's hand-written group vouches for it. Any other pick joins whatever its
+/// size, because the addon that requires it won't load without it.
 pub fn resolve<I, S>(
     addon_id: &str,
     catalog: &Catalog,
@@ -156,8 +160,11 @@ where
         };
         let pick = &catalog.addons[provider];
         let size = download_size(pick, channel(&pick.id));
-        let too_big = size > BIGGEST_UNASKED_DOWNLOAD && is_pack(&pick.id, catalog);
-        if !too_big && pick.reviewed {
+        let pack = is_pack(&pick.id, catalog);
+        let too_big = pack && size > BIGGEST_UNASKED_DOWNLOAD;
+        // A pack's group on a reviewed entry vouches for it, when its size is known.
+        let vouched_pack = pack && size > 0;
+        if !too_big && (pick.reviewed || vouched_pack) {
             plan_folders(pick, &mut planned);
             stack.push((provider, 0));
         } else if seen_left.insert((current, folder)) {
@@ -208,7 +215,8 @@ fn is_pack(id: &str, catalog: &Catalog) -> bool {
 /// then the most downloaded trusted one. Ties keep catalog order. An untrusted entry is never
 /// picked, even when nothing else provides the folder, because its folder list is only a
 /// claim and its downloads can be inflated. [`resolve`] installs the pick by itself only when
-/// it's reviewed too and isn't a big pack, and the Requires line links to it either way.
+/// it's reviewed too, or a pack small enough, and never when it's a big pack. The Requires line
+/// links to it either way.
 pub fn best_provider(folder: &str, catalog: &Catalog, index: &FolderIndex) -> Option<usize> {
     let folder = folder.to_lowercase();
     index
@@ -830,10 +838,12 @@ mod tests {
 
     #[test]
     fn the_size_that_counts_is_the_build_its_channel_would_install() {
-        let mut pack = sized(addon("pack", &["Pack"], &[]), 50_000_000);
+        // A small stable build and a big beta, so the catalog publishes the pack unreviewed.
+        // The owner's group vouches for it, so it comes along while it's small.
+        let mut pack = sized(unreviewed("pack", &["Pack"], &[]), 50_000_000);
         pack.beta = Some(Release {
             version: "2.0-beta".to_string(),
-            size: 1_600_000_000,
+            size: 157_070_901,
             date: 1,
             ..Default::default()
         });
@@ -845,6 +855,7 @@ mod tests {
         let index = FolderIndex::build(&catalog);
         let stable = resolve("top", &catalog, &index, NOTHING, |_| Channel::Stable);
         assert_eq!(stable.to_install, ["pack", "top"]);
+        assert!(stable.unreviewed.is_empty() && stable.too_big.is_empty());
         let beta = resolve("top", &catalog, &index, NOTHING, |id: &str| {
             if id == "pack" {
                 Channel::Beta
@@ -853,10 +864,30 @@ mod tests {
             }
         });
         assert_eq!(beta.to_install, ["top"]);
+        assert_eq!(beta.too_big, [too_big("top", "Pack", "pack", 157_070_901)]);
+        assert!(beta.unreviewed.is_empty());
+    }
+
+    #[test]
+    fn a_pack_nobody_reviewed_comes_along_only_when_its_download_is_known_and_small() {
+        let catalog = catalog(vec![
+            addon("top", &["Top"], &["Small", "Unknown", "Library"]),
+            sized(unreviewed("small", &["Small"], &[]), 5_000_000),
+            unreviewed("unknown", &["Unknown"], &[]),
+            sized(unreviewed("library", &["Library"], &[]), 5_000_000),
+            with_packs("owner", "Owner", &["small", "unknown"]),
+        ]);
+        let result = resolve_in(&catalog, "top", &[]);
+        assert_eq!(result.to_install, ["small", "top"]);
         assert_eq!(
-            beta.too_big,
-            [too_big("top", "Pack", "pack", 1_600_000_000)]
+            result.unreviewed,
+            [
+                left_out("top", "Unknown", "unknown"),
+                left_out("top", "Library", "library"),
+            ],
+            "a pack of no known size, and anything that's no pack"
         );
+        assert!(result.too_big.is_empty());
     }
 
     #[test]

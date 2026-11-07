@@ -4505,6 +4505,77 @@ fn the_same_big_addon_is_no_pack_when_nothing_lists_it_so_it_is_left_out_as_unre
     assert!(managed(&h, FOO).is_some() && managed(&h, QUEST_VOICES).is_none());
 }
 
+const BOSS_VOICES: &str = "gh:rusty-key/spoken-wow/bosses-audio";
+
+/// A stranger's new addon whose TOC requires the boss voices: a pack with a small stable build
+/// and a beta over 100 MB, which the catalog publishes trusted but not reviewed for its beta.
+fn a_stranger_requiring_a_pack_with_a_big_beta(rig: &Rig) -> Catalog {
+    let mut bosses = named(
+        publish_addon(&rig.site, BOSS_VOICES, "SpokenBossesAudio", "v1.0.0"),
+        "Spoken Audio: Bosses (English)",
+    );
+    bosses.reviewed = false;
+    let mut beta = bosses.stable.clone().unwrap();
+    beta.version = "v1.1.0-beta".to_owned();
+    beta.date += 1;
+    // Never downloaded here, so it can be as big as a whole voice pack.
+    beta.size = 157_070_901;
+    bosses.beta = Some(beta);
+    let mut spoken = spoken(&rig.site, "v3.8.3");
+    spoken.packs.push(PackGroup {
+        name: "Boss voices".to_owned(),
+        needed: false,
+        ids: vec![BOSS_VOICES.to_owned()],
+        met_by: Vec::new(),
+    });
+    let mut stranger = publish_addon(&rig.site, FOO, "Foo", "1.0");
+    stranger.trusted = false;
+    stranger.reviewed = false;
+    stranger.deps = vec!["SpokenBossesAudio".to_owned()];
+    catalog_of(vec![stranger, spoken, bosses])
+}
+
+#[test]
+fn a_small_pack_published_unreviewed_for_its_big_beta_comes_along_on_stable_only() {
+    // On stable it's a small download, and Spoken's group vouches for it.
+    let rig = Rig::new();
+    rig.site
+        .publish(&a_stranger_requiring_a_pack_with_a_big_beta(&rig));
+    let mut h = rig.launch_settled();
+    click(&mut h, "Foo Addon, 1.0");
+    assert!(has_label(&h, "Spoken Audio: Bosses (English)"));
+    assert!(!has_label(&h, crate::views::page::INSTALL_IT_YOURSELF));
+    click(&mut h, "Install");
+    assert!(said(
+        &h,
+        "Foo Addon requires Spoken Audio: Bosses (English), so that installs first."
+    ));
+    assert!(!said(&h, "nobody has reviewed it") && !said(&h, "won't load without"));
+    finish_ops(&mut h);
+    assert!(managed(&h, FOO).is_some() && managed(&h, BOSS_VOICES).is_some());
+    assert!(rig.addons().join("SpokenBossesAudio").exists());
+
+    // On beta it would be the big build, so it's left out with that size.
+    let rig = Rig::new();
+    rig.site
+        .publish(&a_stranger_requiring_a_pack_with_a_big_beta(&rig));
+    let mut h = rig.launch_settled();
+    app_mut(&mut h).state.settings.default_channel = Channel::Beta;
+    click(&mut h, "Foo Addon, 1.0");
+    assert!(has_label(&h, crate::views::page::INSTALL_IT_YOURSELF));
+    click(&mut h, "Install");
+    assert!(said(
+        &h,
+        "Foo Addon won't load without Spoken Audio: Bosses (English), a 157.1 MB download. \
+         Install it from its page."
+    ));
+    assert!(!said(&h, "nobody has reviewed it"));
+    assert!(!app(&h).queue.busy_with(BOSS_VOICES));
+    finish_ops(&mut h);
+    assert!(managed(&h, FOO).is_some() && managed(&h, BOSS_VOICES).is_none());
+    assert!(!rig.addons().join("SpokenBossesAudio").exists());
+}
+
 #[test]
 fn a_big_requirement_nobody_reviewed_that_is_no_pack_says_nobody_reviewed_it() {
     const MAPS: &str = "gh:nutiler/dandymapdata";

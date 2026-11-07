@@ -27,6 +27,60 @@ pub fn fold_folder(text: &str) -> String {
     text.chars().map(plain_form).flat_map(fold_letter).collect()
 }
 
+/// Whether two folder names pass for the same folder: they fold alike, or they're the same
+/// ignoring case, which is all the catalog check and the app compare. Folding reads a few
+/// capitals from other alphabets apart from their small letters, such as a Greek capital Eta as
+/// H and its small letter as n, so neither one covers the other.
+pub fn same_folder(a: &str, b: &str) -> bool {
+    fold_folder(a) == fold_folder(b) || a.to_lowercase() == b.to_lowercase()
+}
+
+/// One of the two ways a folder name is filed in [`FolderMap`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum FolderKey {
+    Folded(String),
+    Lowered(String),
+}
+
+fn folder_keys(folder: &str) -> [FolderKey; 2] {
+    [
+        FolderKey::Folded(fold_folder(folder)),
+        FolderKey::Lowered(folder.to_lowercase()),
+    ]
+}
+
+/// Folder names filed so that names that pass for the same folder, as [`same_folder`] has it,
+/// find each other, each with what it belongs to.
+#[derive(Debug)]
+pub struct FolderMap<T> {
+    filed: std::collections::HashMap<FolderKey, Vec<T>>,
+}
+
+impl<T> Default for FolderMap<T> {
+    fn default() -> Self {
+        Self {
+            filed: std::collections::HashMap::new(),
+        }
+    }
+}
+
+impl<T: Clone> FolderMap<T> {
+    pub fn add(&mut self, folder: &str, value: T) {
+        for key in folder_keys(folder) {
+            self.filed.entry(key).or_default().push(value.clone());
+        }
+    }
+
+    /// Everything filed under a folder name that passes for this one. Something filed under one
+    /// that matches both ways comes twice.
+    pub fn alike(&self, folder: &str) -> impl Iterator<Item = &T> {
+        folder_keys(folder)
+            .into_iter()
+            .filter_map(|key| self.filed.get(&key))
+            .flatten()
+    }
+}
+
 /// A letter or digit drawn in a style, as the plain one: the mathematical bold, italic,
 /// script, fraktur, double-struck, sans-serif and monospace alphabets, the letterlike
 /// symbols that stand in for a few of their letters, circled, parenthesized and squared
@@ -631,6 +685,37 @@ mod tests {
         assert_eq!(fold_folder("Qu\u{0435}stie"), "questie");
         assert_ne!(fold_folder("Foo_Bar"), fold_folder("FooBar"));
         assert_ne!(fold_folder("!BugGrabber"), fold_folder("BugGrabber"));
+    }
+
+    #[test]
+    fn a_folder_passes_for_another_folded_or_ignoring_case() {
+        // A Cyrillic o, which only folding sees through.
+        assert!(same_folder("TomT\u{043E}m", "tomtom"));
+        assert!(same_folder("TOMTOM", "TomTom"));
+        // Folding reads a Greek capital Eta as H and its small letter as n, so these fold apart,
+        // and they're still one folder to the catalog check and the app, which ignore case.
+        assert_ne!(
+            fold_folder("\u{0397}ogHeals"),
+            fold_folder("\u{03B7}ogHeals")
+        );
+        assert!(same_folder("\u{0397}ogHeals", "\u{03B7}ogHeals"));
+        // So is a final sigma, which only lowering a whole name gives.
+        assert!(same_folder("Hog\u{03A3}", "hog\u{03C2}"));
+        assert!(!same_folder("Foo_Bar", "FooBar"));
+
+        let mut map = FolderMap::default();
+        map.add("TomT\u{043E}m", 1);
+        map.add("\u{0397}ogHeals", 2);
+        map.add("Hog\u{03A3}", 3);
+        let found = |folder: &str| -> Vec<i32> {
+            let mut found: Vec<i32> = map.alike(folder).copied().collect();
+            found.dedup();
+            found
+        };
+        assert_eq!(found("TOMTOM"), [1]);
+        assert_eq!(found("\u{03B7}ogheals"), [2]);
+        assert_eq!(found("hog\u{03C2}"), [3]);
+        assert!(found("TomTomForever").is_empty());
     }
 
     #[test]

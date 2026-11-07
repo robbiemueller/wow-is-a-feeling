@@ -1209,7 +1209,8 @@ pub struct Settled {
 
 /// Everything between the scans and the gate: who merges with whom, who owns which name
 /// and folder, and what the app may pick by itself. No network and no clock of its own.
-/// `remembered` is what the scan cache remembers of entries `previous` left out.
+/// `remembered` is what the scan cache remembers of entries `previous` left out, and `now` is
+/// the build's time.
 pub fn settle(
     scanned: Scanned,
     curated: &Curated,
@@ -1244,6 +1245,7 @@ pub fn settle(
         previous,
         remembered,
         curated,
+        now,
     };
     let (mut candidates, held) = merge::hold_collisions(candidates, &rules);
     merge::settle_trust(&mut candidates, picks, &curated.merges, now);
@@ -2299,6 +2301,8 @@ mod tests {
         previous: Catalog,
         /// What the scan cache remembers of each entry's last published catalog.
         remembered: Remembered,
+        /// When the next build runs.
+        now: i64,
     }
 
     const BUILT_AT: i64 = 1_800_000_000;
@@ -2374,6 +2378,7 @@ mod tests {
             wowi,
             previous,
             remembered: Remembered::default(),
+            now: BUILT_AT,
         }
     }
 
@@ -2394,7 +2399,7 @@ mod tests {
                 &picks,
                 Some(&self.previous),
                 &self.remembered,
-                BUILT_AT,
+                self.now,
             )
         }
 
@@ -2402,6 +2407,11 @@ mod tests {
         fn build(&self, extra: Vec<Candidate>) -> (Published, tempfile::TempDir) {
             let picks = HandPicked::new(&self.seeds, &self.curated);
             let settled = self.settle(extra);
+            // The settle step leaves the gate no vouch to drop.
+            let settled_addons: Vec<Addon> =
+                settled.candidates.iter().map(|c| c.addon.clone()).collect();
+            let unsettled = crate::gate::formerly_shipped_elsewhere(&settled_addons);
+            assert!(unsettled.is_empty(), "{unsettled:?}");
             let dir = tempfile::tempdir().unwrap();
             let published = publish(
                 settled.candidates,
@@ -2422,10 +2432,13 @@ mod tests {
             (published, dir)
         }
 
-        /// The next build reads this one's catalog as the last, and the scan cache remembers it.
+        /// The next build reads this one's catalog as the last, made at this build's time, and the
+        /// scan cache remembers it.
         fn after(&mut self, published: &Published) {
-            self.previous = published.catalog.clone();
-            self.remembered.note(&published.catalog);
+            let mut catalog = published.catalog.clone();
+            catalog.generated = self.now;
+            self.remembered.note(&catalog);
+            self.previous = catalog;
         }
     }
 
@@ -5748,8 +5761,69 @@ mod tests {
     }
 
     #[test]
-    fn a_vouched_folder_goes_to_a_hand_picked_entry_or_one_listed_with_it_already() {
-        // A repository listed beside TomTom from before ages were kept, shipping a TomTom folder.
+    fn a_strangers_new_repository_shipping_the_old_folder_while_the_addon_is_away_is_held() {
+        let mut w = tomtom_renamed();
+        let (renamed, _d0) = w.build(vec![]);
+        assert_eq!(addon_of(&renamed, "wowi:7032").formerly, ["TomTom"]);
+        w.after(&renamed);
+
+        // The listing is missing from the next build, and a stranger's new repository ships
+        // TomTom. The listing's claim is still there.
+        let tomtom = w.wowi.remove(0);
+        let stranger = || claim_of("zebra/Waypoints", "Zebra Waypoints", &["TomTom"], 1);
+        w.now += DAY_SECS;
+        let (gap, _d1) = w.build(vec![stranger()]);
+        assert!(!gap.catalog.addons.iter().any(|a| a.id == "wowi:7032"));
+        assert_eq!(
+            held_reason(&gap, "gh:zebra/Waypoints"),
+            "its folder TomTom was wowi:7032's main folder"
+        );
+        w.after(&gap);
+
+        // Over 30 days after it was last published, the claim is gone, and so the stranger is
+        // listed.
+        w.now += 30 * DAY_SECS;
+        let (later, _d2) = w.build(vec![stranger()]);
+        assert!(!is_held(&later, "gh:zebra/Waypoints"));
+        w.after(&later);
+
+        // Back again, the listing ranks ahead of the stranger, which is held, and the vouch is
+        // back.
+        w.wowi.insert(0, tomtom);
+        w.now += DAY_SECS;
+        let (back, _d3) = w.build(vec![stranger()]);
+        assert_eq!(
+            held_reason(&back, "gh:zebra/Waypoints"),
+            "its folder TomTom was wowi:7032's main folder"
+        );
+        assert_eq!(addon_of(&back, "wowi:7032").formerly, ["TomTom"]);
+    }
+
+    #[test]
+    fn an_established_repository_only_now_shipping_the_old_folder_is_held_however_old() {
+        // Helpers is from before ages were kept, as TomTom's listing is, and adds a TomTom
+        // folder after the rename. Its claim to that folder is from today.
+        let mut w = tomtom_renamed();
+        let (renamed, _d0) = w.build(vec![]);
+        w.after(&renamed);
+        let at = w
+            .repos
+            .iter()
+            .position(|c| c.addon.id == "gh:zebra/Helpers")
+            .unwrap();
+        w.repos[at].addon.folders = vec!["Helpers".into(), "TomTom".into()];
+        let (grown, _d1) = w.build(vec![]);
+        assert_eq!(
+            held_reason(&grown, "gh:zebra/Helpers"),
+            "its folder TomTom was wowi:7032's main folder"
+        );
+        assert_eq!(addon_of(&grown, "wowi:7032").formerly, ["TomTom"]);
+    }
+
+    #[test]
+    fn a_vouched_folder_goes_to_a_hand_picked_entry_or_a_listed_one_that_ranks_level() {
+        // A repository listed beside TomTom from before ages were kept, shipping a TomTom
+        // folder. The two are level, so it keeps the folder and the vouch goes.
         let mut w = tomtom_renamed();
         let pins = real_entry("zebra/Pins", "Map Pins", &["MapPins", "TomTom"], 1);
         w.repos.push(pins.clone());
@@ -5775,7 +5849,19 @@ mod tests {
             settled.unvouched,
             ["wowi:7032 no longer vouches for TomTom, which gh:zebra/Waypoints ships"]
         );
-        let (published, _d2) = w.build(vec![seeded()]);
+
+        // While the listing is away it's listed, and when the listing is back, the vouch goes.
+        let tomtom = w.wowi.remove(0);
+        let (gap, _d2) = w.build(vec![seeded()]);
+        assert!(!is_held(&gap, "gh:zebra/Waypoints"));
+        w.after(&gap);
+        w.wowi.insert(0, tomtom);
+        let settled = w.settle(vec![seeded()]);
+        assert_eq!(
+            settled.unvouched,
+            ["wowi:7032 no longer vouches for TomTom, which gh:zebra/Waypoints ships"]
+        );
+        let (published, _d3) = w.build(vec![seeded()]);
         assert!(!is_held(&published, "gh:zebra/Waypoints"));
         assert!(addon_of(&published, "wowi:7032").formerly.is_empty());
 

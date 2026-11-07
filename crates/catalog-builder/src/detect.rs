@@ -20,9 +20,9 @@ const MAX_NEGATIVE_READS: u32 = 4;
 /// Zips opened per release when nothing in the names helps. A real release can have
 /// several zips with the game in their name, such as a game client beside the addon.
 const MAX_ZIPS_PER_RELEASE: usize = 5;
-/// Zips opened per release in all while every one read is another addon's. A release of
-/// several addons can put the pinned one's own zip behind bigger ones, so reading goes on past
-/// the usual few, but a release of a hundred zips can't cost a hundred reads.
+/// Zips opened per release in all once one read is another addon's. A release of several
+/// addons can put the pinned one's own zip behind bigger ones, so reading goes on past the
+/// usual few, but a release of a hundred zips can't cost a hundred reads.
 const MAX_ZIPS_PASSED_OVER: usize = 20;
 /// A newer release this far past the Forever one means support really was dropped,
 /// rather than the author publishing per-flavor releases in close succession.
@@ -306,9 +306,10 @@ pub fn assets_signature(assets: &[GhAsset]) -> String {
 /// Decide whether one release has a Forever build, and read its TOCs if so. With a `pin`,
 /// only a build that still ships that main folder counts: one release can hold several
 /// addons' zips, and another addon's is passed over, never counted against the release.
-/// While every zip read is another addon's, reading goes on past the usual few, up to
-/// [`MAX_ZIPS_PASSED_OVER`]. A release with no build of the pinned addon in what was read is
-/// settled as another addon's, with a count of the zips left unread, so it isn't read every run.
+/// Once a zip read is another addon's, reading goes on past the usual few until the pinned
+/// addon's build turns up, up to [`MAX_ZIPS_PASSED_OVER`], whatever the other zips read were.
+/// A release with no build of the pinned addon in what was read is settled as another addon's,
+/// with a count of the zips left unread, so it isn't read every run.
 /// `Err` means something failed along the way, and nothing should be cached.
 pub fn classify_release(
     release: &GhRelease,
@@ -377,7 +378,7 @@ pub fn classify_release(
         unlabeled.sort_by_key(best_first);
     }
     // After a few releases with no Forever build at all, a zip's name has to say Forever before
-    // it's read, unless every zip read so far is another addon's.
+    // it's read, unless a zip read so far is another addon's.
     let unlabeled_first = if allow_toc_reads {
         MAX_ZIPS_PER_RELEASE
     } else {
@@ -396,10 +397,10 @@ pub fn classify_release(
         if seen.contains(&asset.name.as_str()) {
             continue;
         }
-        // Past the usual few, only while every zip read was another addon's: the pinned addon's
-        // own can be behind them, but a release of junk shouldn't cost more reads.
-        let all_passed_over = passed_over && !read_something;
-        if at >= first && (!all_passed_over || seen.len() >= MAX_ZIPS_PASSED_OVER) {
+        // Past the usual few, only once a zip read was another addon's, so this is a release of
+        // several addons and the pinned one's own can be behind the others, among zips for
+        // other flavors or none. A release of nothing but junk doesn't cost more reads.
+        if at >= first && (!passed_over || seen.len() >= MAX_ZIPS_PASSED_OVER) {
             break;
         }
         seen.push(&asset.name);
@@ -1230,20 +1231,62 @@ mod tests {
     }
 
     #[test]
-    fn reading_on_stops_once_a_zip_read_isnt_another_addons_build() {
-        // A zip with nothing for Forever among the first few: the release isn't all other
-        // addons' zips, so the usual few is all it gets, and the rest are counted as unread.
+    fn a_zip_for_another_flavor_among_the_first_few_doesnt_stop_reading_on() {
+        // Among the first five, one has nothing for Forever and the rest are other addons'. The
+        // pinned addon's own zip is the smallest of eight, and named like none of it.
+        let mut fake = Fake::default();
+        let mut releases = [other_addons_parts(&mut fake, MAX_ZIPS_PER_RELEASE + 2)];
+        fake.zips
+            .insert("Part1.zip".into(), Ok(other_scan("Retail")));
+        fake.zips
+            .insert("Extras.zip".into(), Ok(forever_scan("Main")));
+        releases[0].assets.push(asset("Extras.zip"));
+        let mut cache = BTreeMap::new();
+        let chosen = pinned(&mut fake, &releases, &mut cache, "Main");
+        assert_eq!(chosen.stable.unwrap().asset.name, "Extras.zip");
+        assert_eq!(fake.zip_reads.len(), MAX_ZIPS_PER_RELEASE + 3);
+
+        // Without it, every zip is read, and the release is settled as another addon's.
         let mut fake = Fake::default();
         let releases = [other_addons_parts(&mut fake, MAX_ZIPS_PER_RELEASE + 2)];
         fake.zips
             .insert("Part1.zip".into(), Ok(other_scan("Retail")));
         let mut cache = BTreeMap::new();
         let chosen = pinned(&mut fake, &releases, &mut cache, "Main");
-        assert_eq!(fake.zip_reads.len(), MAX_ZIPS_PER_RELEASE);
+        assert_eq!(fake.zip_reads.len(), MAX_ZIPS_PER_RELEASE + 2);
         assert_eq!(cache["v1"].skipped_for.as_deref(), Some("Main"));
-        assert_eq!(cache["v1"].unread, 2);
-        assert_eq!(chosen.left_unread, [("v1".to_string(), 2)]);
+        assert_eq!(cache["v1"].unread, 0);
+        assert!(chosen.left_unread.is_empty());
         assert!(chosen.errors.is_empty(), "settled, so not read every run");
+
+        // Past twenty, what's left is counted as unread, the same as for other addons' zips alone.
+        let mut fake = Fake::default();
+        let releases = [other_addons_parts(&mut fake, MAX_ZIPS_PASSED_OVER + 3)];
+        fake.zips
+            .insert("Part0.zip".into(), Ok(other_scan("Retail")));
+        let mut cache = BTreeMap::new();
+        let chosen = pinned(&mut fake, &releases, &mut cache, "Main");
+        assert_eq!(fake.zip_reads.len(), MAX_ZIPS_PASSED_OVER);
+        assert_eq!(cache["v1"].skipped_for.as_deref(), Some("Main"));
+        assert_eq!(chosen.left_unread, [("v1".to_string(), 3)]);
+    }
+
+    #[test]
+    fn reading_on_needs_a_zip_that_is_another_addons_build() {
+        // The first five have nothing for Forever, so the usual few is all the release gets,
+        // and it counts as one without a Forever build.
+        let mut fake = Fake::default();
+        let releases = [other_addons_parts(&mut fake, MAX_ZIPS_PER_RELEASE + 2)];
+        for at in 0..MAX_ZIPS_PER_RELEASE {
+            fake.zips
+                .insert(format!("Part{at}.zip"), Ok(other_scan("Retail")));
+        }
+        let mut cache = BTreeMap::new();
+        let chosen = pinned(&mut fake, &releases, &mut cache, "Main");
+        assert_eq!(fake.zip_reads.len(), MAX_ZIPS_PER_RELEASE);
+        assert!(chosen.stable.is_none() && chosen.left_unread.is_empty());
+        assert_eq!(cache["v1"].skipped_for, None);
+        assert!(cache["v1"].confirmed_negative);
     }
 
     #[test]

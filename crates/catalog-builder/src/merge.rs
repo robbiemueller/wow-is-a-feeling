@@ -15,7 +15,7 @@ use crate::gate::is_safe_folder;
 use crate::github::RepoInfo;
 use crate::model::{Candidate, Held, MAX_FORMERLY};
 use crate::state::Remembered;
-use crate::text::{fold_folder, fold_name, normalize, tokens};
+use crate::text::{FolderMap, fold_folder, fold_name, normalize, same_folder, tokens};
 use crate::tier::popularity;
 
 /// The age of everything that was already listed when ages started being kept. Older
@@ -23,6 +23,9 @@ use crate::tier::popularity;
 pub const BASELINE_CREATED: i64 = FOREVER_EPOCH;
 /// How long an entry must keep its name and main folder before the app may pick it by itself.
 const TRUST_AFTER_SECS: i64 = 14 * 24 * 60 * 60;
+/// How long an entry gone from the catalog keeps its former main folders as claims, counted from
+/// the last catalog it was published in. Long enough for a held or left-out entry to come back.
+const AWAY_CLAIM_SECS: i64 = 30 * 24 * 60 * 60;
 /// Entries an owner can have without being hand-picked. The most any real owner has today
 /// is 21 listed out of 38 known. This is what makes a flood of repositories cost something.
 pub const MAX_ENTRIES_PER_OWNER: usize = 40;
@@ -305,6 +308,8 @@ pub struct ClaimRules<'a> {
     pub remembered: &'a Remembered,
     /// For `[pins]` and the names `[overrides]` gives.
     pub curated: &'a Curated,
+    /// The build's time, which says how long an entry has been away.
+    pub now: i64,
 }
 
 fn is_baseline(candidate: &Candidate) -> bool {
@@ -566,11 +571,46 @@ impl<'a> Vouches<'a> {
     /// The former main folders vouched for `addon` in this build, before dropping any that an
     /// entry with a better claim ships.
     fn of(&self, addon: &Addon) -> Vec<String> {
-        let was = self
-            .curated
-            .pin_of(&addon.id)
-            .map_or(&[][..], |pin| &pin.was[..]);
-        former_mains(self.last(&addon.id), was, addon)
+        former_mains(self.last(&addon.id), self.was(&addon.id), addon)
+    }
+
+    /// The folders `[pins]` says this entry was.
+    fn was(&self, id: &str) -> &'a [String] {
+        self.curated.pin_of(id).map_or(&[][..], |pin| &pin.was[..])
+    }
+
+    /// Entries this build doesn't have, whose former main folders are still their claims: each
+    /// one the last catalog listed, and each one the scan cache remembers being published in the
+    /// last 30 days. Each comes with the folders it would be vouched for if it came back as it
+    /// was, and its age. `present` holds this build's ids, lowercased.
+    fn away(&self, present: &HashSet<String>, now: i64) -> Vec<Away> {
+        let mut away = Vec::new();
+        for (id, addon) in &self.listed {
+            if present.contains(id) {
+                continue;
+            }
+            let main = addon.folders.first().map_or("", String::as_str);
+            away.push(Away {
+                id: addon.id.clone(),
+                created: addon.created,
+                folders: vouched_list(main, None, self.was(id), &addon.formerly),
+            });
+        }
+        // In id order, so a folder two of them are vouched for names the same one every run.
+        away.sort_by(|a, b| a.id.cmp(&b.id));
+        for (id, last) in self.remembered.entries() {
+            // Noted before the time was kept, it counts as recent.
+            let recent = last.at == 0 || now - last.at <= AWAY_CLAIM_SECS;
+            if present.contains(id) || self.listed.contains_key(id) || !recent {
+                continue;
+            }
+            away.push(Away {
+                id: id.to_string(),
+                created: last.created,
+                folders: vouched_list(&last.main, None, self.was(id), &last.formerly),
+            });
+        }
+        away
     }
 
     /// A summary line for a GitHub entry whose main folder moved since it was last published,
@@ -614,6 +654,17 @@ fn former_mains(last: Option<(&str, &[String])>, was: &[String], addon: &Addon) 
     let moved_from =
         (holds_one_addon(addon) && !last_main.is_empty() && !last_main.eq_ignore_ascii_case(main))
             .then_some(last_main);
+    vouched_list(main, moved_from, was, carried)
+}
+
+/// The former main folders of an entry whose main folder is `main`: the ones `carried` over,
+/// with a folder it just moved away from and the ones `[pins]` says it `was` in front.
+fn vouched_list(
+    main: &str,
+    moved_from: Option<&str>,
+    was: &[String],
+    carried: &[String],
+) -> Vec<String> {
     // Already vouched for stays where it is, so the list doesn't churn from build to build.
     let new = moved_from
         .into_iter()
@@ -626,6 +677,80 @@ fn former_mains(last: Option<(&str, &[String])>, was: &[String], addon: &Addon) 
         .take(MAX_FORMERLY)
         .map(str::to_string)
         .collect()
+}
+
+/// An entry this build doesn't have, with the former main folders it's still vouched for.
+struct Away {
+    id: String,
+    /// Its age in the catalog it was last published in.
+    created: i64,
+    folders: Vec<String>,
+}
+
+/// Where an entry stands in a claim to a folder, the way the collision pass ranks entries:
+/// hand-picked first, then oldest. Two entries listed before ages were kept are level, and so
+/// are two a person chose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Rank {
+    picked: bool,
+    created: i64,
+}
+
+impl Rank {
+    fn new(id: &str, created: i64, picks: &HandPicked) -> Self {
+        Self {
+            picked: picks.contains(id),
+            // A catalog from before ages were kept says 0, which a build reads as the baseline.
+            created: if created == 0 {
+                BASELINE_CREATED
+            } else {
+                created
+            },
+        }
+    }
+
+    fn of(candidate: &Candidate, picks: &HandPicked) -> Self {
+        Self::new(&candidate.addon.id, candidate.addon.created, picks)
+    }
+
+    fn level_with(self, other: Self) -> bool {
+        (self.created == BASELINE_CREATED && other.created == BASELINE_CREATED)
+            || (self.picked && other.picked)
+    }
+
+    fn ahead_of(self, other: Self) -> bool {
+        !self.level_with(other)
+            && match (self.picked, other.picked) {
+                (true, false) => true,
+                (false, true) => false,
+                _ => self.created < other.created,
+            }
+    }
+}
+
+/// A former main folder vouched for an entry, which makes it that entry's claim.
+#[derive(Debug, Clone)]
+struct Claim {
+    id: String,
+    rank: Rank,
+}
+
+/// Whether an entry shipping a folder that's vouched for another has the better claim to it, so
+/// it keeps the folder and the vouch goes. It must rank ahead of the entry vouched for, or level
+/// with it, and unless it's hand-picked, the last catalog must already have listed it with that
+/// folder: a folder an entry has only now added is a claim from today, however old the entry is,
+/// as in the collision pass. While the entry vouched for had the folder as its main one, anything
+/// that ranked behind it and shipped the folder was held, so one listed with it since got it
+/// while that entry was away from a build, or after its rename.
+fn keeps_vouched_folder(
+    shipper: &Candidate,
+    rank: Rank,
+    folder: &str,
+    vouched: Rank,
+    last: &LastCatalog<'_>,
+) -> bool {
+    (rank.picked || last.listed_with(&shipper.addon.id, folder))
+        && (rank.ahead_of(vouched) || rank.level_with(vouched))
 }
 
 /// What stamping `formerly` found, one summary line each.
@@ -671,47 +796,46 @@ pub fn stamp_formerly(
 }
 
 /// A former main folder vouches that an installed copy with it is this addon, and the collision
-/// pass held every newcomer that ships one. What still ships one has a better claim to it:
-/// something hand-picked, or an entry the last catalog already listed with that folder. The
-/// folder is that entry's, so the vouch goes, and the line says which entry ships it.
+/// pass held everything else that ships one unless it has the better claim (see
+/// [`keeps_vouched_folder`]). What still ships one has it, so the folder is that entry's: the
+/// vouch goes, and the line says which entry ships it. Folders compare as [`same_folder`] does.
 fn drop_formerly_others_ship(
     candidates: &mut [Candidate],
     picks: &HandPicked,
     last: &LastCatalog<'_>,
 ) -> Vec<String> {
-    let ids: Vec<String> = candidates.iter().map(|c| c.addon.id.clone()).collect();
-    let mut shipped_by: HashMap<String, Vec<usize>> = HashMap::new();
+    // Each folder with the entry that ships it and where it is in that entry's list.
+    let mut shipped_by: FolderMap<(usize, usize)> = FolderMap::default();
     for (at, candidate) in candidates.iter().enumerate() {
-        for folder in &candidate.addon.folders {
-            shipped_by
-                .entry(folder.to_lowercase())
-                .or_default()
-                .push(at);
+        for (place, folder) in candidate.addon.folders.iter().enumerate() {
+            shipped_by.add(folder, (at, place));
         }
     }
-    let mut dropped = Vec::new();
-    for (at, candidate) in candidates.iter_mut().enumerate() {
-        candidate.addon.formerly.retain(|folder| {
-            let better = shipped_by
-                .get(&folder.to_lowercase())
-                .into_iter()
-                .flatten()
-                .find(|&&owner| {
-                    owner != at
-                        && (picks.contains(&ids[owner])
-                            || last.had_folder(&ids[owner], &fold_folder(folder)))
-                });
-            match better {
-                Some(&owner) => {
-                    dropped.push(format!(
-                        "{} no longer vouches for {folder}, which {} ships",
-                        ids[at], ids[owner]
-                    ));
-                    false
-                }
-                None => true,
+    let ranks: Vec<Rank> = candidates.iter().map(|c| Rank::of(c, picks)).collect();
+    // Decided before anything changes, so the order of the list can't matter.
+    let mut goes: Vec<(usize, String, usize)> = Vec::new();
+    for (at, candidate) in candidates.iter().enumerate() {
+        let id = &candidate.addon.id;
+        for folder in &candidate.addon.formerly {
+            // Judged by the shipper's own folder, as the collision pass judged it.
+            let better = shipped_by.alike(folder).copied().find(|&(owner, place)| {
+                let shipper = &candidates[owner];
+                let shipped = &shipper.addon.folders[place];
+                !shipper.addon.id.eq_ignore_ascii_case(id)
+                    && keeps_vouched_folder(shipper, ranks[owner], shipped, ranks[at], last)
+            });
+            if let Some((owner, _)) = better {
+                goes.push((at, folder.clone(), owner));
             }
-        });
+        }
+    }
+    let mut dropped = Vec::with_capacity(goes.len());
+    for (at, folder, owner) in goes {
+        dropped.push(format!(
+            "{} no longer vouches for {folder}, which {} ships",
+            candidates[at].addon.id, candidates[owner].addon.id
+        ));
+        candidates[at].addon.formerly.retain(|kept| *kept != folder);
     }
     dropped
 }
@@ -721,6 +845,8 @@ fn drop_formerly_others_ship(
 struct LastCatalog<'a> {
     folders_of: HashMap<String, HashSet<String>>,
     owners_of: HashMap<String, Vec<&'a str>>,
+    /// Each entry's folders as it was listed, by lowercased id.
+    listed: HashMap<String, &'a [String]>,
     /// Folders its addons require, folded.
     required: HashSet<String>,
 }
@@ -736,8 +862,9 @@ impl<'a> LastCatalog<'a> {
                     .or_default()
                     .push(&addon.id);
             }
-            last.folders_of
-                .insert(addon.id.to_ascii_lowercase(), folders);
+            let id = addon.id.to_ascii_lowercase();
+            last.listed.insert(id.clone(), addon.folders.as_slice());
+            last.folders_of.insert(id, folders);
             last.required
                 .extend(addon.deps.iter().map(|dep| fold_folder(dep)));
         }
@@ -749,6 +876,14 @@ impl<'a> LastCatalog<'a> {
         self.folders_of
             .get(&id.to_ascii_lowercase())
             .is_some_and(|folders| folders.contains(folded))
+    }
+
+    /// Whether the last catalog listed this entry with a folder that passes for this one, as
+    /// [`same_folder`] has it.
+    fn listed_with(&self, id: &str, folder: &str) -> bool {
+        self.listed
+            .get(&id.to_ascii_lowercase())
+            .is_some_and(|folders| folders.iter().any(|f| same_folder(f, folder)))
     }
 
     /// Folders the last catalog's addons require that nothing still provides: no entry
@@ -813,42 +948,60 @@ fn squats_a_dependency(candidate: &Candidate, open: &HashSet<String>) -> Option<
     })
 }
 
-/// The former main folders each present entry is vouched for, folded, with the entries that
-/// are. Worked out before the pass, so its order can't decide it.
-fn vouched_folders(
+/// The former main folders vouched for each entry, as its claims: every entry in this build, and
+/// every one away from it that still has them (see [`Vouches::away`]), so an entry that's held or
+/// left out for a while doesn't lose them. Worked out before the pass, so its order can't decide
+/// it.
+fn vouched_claims(
     candidates: &[Candidate],
     vouches: &Vouches<'_>,
-) -> HashMap<String, Vec<String>> {
-    let mut claims: HashMap<String, Vec<String>> = HashMap::new();
+    picks: &HandPicked,
+    now: i64,
+) -> FolderMap<Claim> {
+    let mut claims = FolderMap::default();
+    let mut present = HashSet::new();
     for candidate in candidates {
+        present.insert(candidate.addon.id.to_ascii_lowercase());
+        let claim = Claim {
+            id: candidate.addon.id.clone(),
+            rank: Rank::of(candidate, picks),
+        };
         for folder in vouches.of(&candidate.addon) {
-            claims
-                .entry(fold_folder(&folder))
-                .or_default()
-                .push(candidate.addon.id.clone());
+            claims.add(&folder, claim.clone());
+        }
+    }
+    for away in vouches.away(&present, now) {
+        let claim = Claim {
+            rank: Rank::new(&away.id, away.created, picks),
+            id: away.id,
+        };
+        for folder in &away.folders {
+            claims.add(folder, claim.clone());
         }
     }
     claims
 }
 
 /// A former main folder says an installed copy with it is that entry's addon, so it's that
-/// entry's claim. Anything new shipping it is held, so it can't take the copies the vouch is
-/// for, or strip the vouch. An entry the last catalog already listed with the folder has had it
-/// all along.
+/// entry's claim. Anything else shipping it is held unless it has the better claim (see
+/// [`keeps_vouched_folder`]), so it can't take the copies the vouch is for, or strip the vouch.
 fn ships_a_vouched_folder(
     candidate: &Candidate,
-    vouched: &HashMap<String, Vec<String>>,
+    claims: &FolderMap<Claim>,
+    picks: &HandPicked,
     last: &LastCatalog<'_>,
 ) -> Option<String> {
     let id = &candidate.addon.id;
+    let rank = Rank::of(candidate, picks);
     candidate.addon.folders.iter().find_map(|folder| {
-        let folded = fold_folder(folder);
-        let owner = vouched
-            .get(&folded)?
-            .iter()
-            .find(|owner| !owner.eq_ignore_ascii_case(id))?;
-        (!last.had_folder(id, &folded))
-            .then(|| format!("its folder {folder} was {owner}'s main folder"))
+        let owner = claims.alike(folder).find(|claim| {
+            !claim.id.eq_ignore_ascii_case(id)
+                && !keeps_vouched_folder(candidate, rank, folder, claim.rank, last)
+        })?;
+        Some(format!(
+            "its folder {folder} was {}'s main folder",
+            owner.id
+        ))
     })
 }
 
@@ -908,7 +1061,7 @@ pub fn hold_collisions(
     let last = LastCatalog::new(rules.previous);
     let open = last.open_dependencies(&ordered);
     let vouches = Vouches::new(rules.previous, rules.remembered, rules.curated);
-    let vouched = vouched_folders(&ordered, &vouches);
+    let claims = vouched_claims(&ordered, &vouches, picks, rules.now);
     let bare_names = names_without_parentheses(rules.curated, picks);
     let mut ledger = Ledger::default();
     let mut held = Vec::new();
@@ -918,7 +1071,7 @@ pub fn hold_collisions(
                 rules
                     .reserved
                     .problem(&candidate)
-                    .or_else(|| ships_a_vouched_folder(&candidate, &vouched, &last))
+                    .or_else(|| ships_a_vouched_folder(&candidate, &claims, picks, &last))
                     .or_else(|| last.added_a_taken_folder(&candidate, &present))
             })
             .flatten()
@@ -945,8 +1098,9 @@ pub fn hold_collisions(
 /// and only gets installed when a player asks for it, and its ids on other sites are only
 /// claims, so they go. Among what's left, an id belongs to whoever got there first.
 /// Only what a person chose is reviewed, which is what it takes to be installed as another
-/// addon's dependency: any addon can ship a library's folder long before anything needs it.
-/// [`unreview_big_packs`] then takes it back from packs too big for that.
+/// addon's dependency, unless a reviewed entry lists it as a small pack: any addon can ship a
+/// library's folder long before anything needs it. [`unreview_big_packs`] then takes it back
+/// from packs too big for that.
 /// `candidates` must be in the collision pass's order.
 pub fn settle_trust(
     candidates: &mut [Candidate],
@@ -1132,6 +1286,7 @@ mod tests {
             previous,
             remembered: &Remembered::default(),
             curated: &Curated::default(),
+            now: NOW,
         };
         hold_collisions(std::mem::take(list), &rules)
     }
@@ -2134,45 +2289,224 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_vouch_goes_only_for_a_hand_picked_entry_or_one_listed_with_the_folder() {
-        let renamed = wowi(1, "New Name", &["NewName"]);
+    /// Stamps `formerly` for a listing that was Questie and is NewName now, `days` old or from
+    /// before ages were kept, beside `others`, and returns its vouches and the lines about dropped
+    /// ones. `pins_had_questie` says whether the last catalog listed gh:b/Pins with a Questie
+    /// folder.
+    fn stamp_beside(
+        days: Option<i64>,
+        others: Vec<Candidate>,
+        chosen: &HandPicked,
+        pins_had_questie: bool,
+    ) -> (Vec<String>, Vec<String>) {
+        let pins_folders: &[&str] = if pins_had_questie {
+            &["Pins", "Questie"]
+        } else {
+            &["Pins"]
+        };
         let previous = Catalog {
             addons: vec![
                 listed_as("wowi:1", &["Questie"]),
-                listed_as("gh:b/Pins", &["Pins", "Questie"]),
+                listed_as("gh:b/Pins", pins_folders),
             ],
             ..Catalog::default()
         };
-        let stamp = |others: Vec<Candidate>, picks: &HandPicked| {
-            let mut candidates = vec![renamed.clone()];
-            candidates.extend(others);
-            let stamped = stamp_formerly(
-                &mut candidates,
-                Some(&previous),
-                &Remembered::default(),
-                &Curated::default(),
-                picks,
-            );
-            (candidates[0].addon.formerly.clone(), stamped.unvouched)
-        };
-        // Something hand-picked shipping it, or an entry listed with it before, wins it.
-        let (formerly, unvouched) = stamp(
+        let renamed = wowi(1, "New Name", &["NewName"]);
+        let mut candidates = vec![days.map_or(renamed.clone(), |days| aged(renamed, days))];
+        candidates.extend(others);
+        let stamped = stamp_formerly(
+            &mut candidates,
+            Some(&previous),
+            &Remembered::default(),
+            &Curated::default(),
+            chosen,
+        );
+        (candidates[0].addon.formerly.clone(), stamped.unvouched)
+    }
+
+    #[test]
+    fn a_vouch_goes_only_to_an_entry_with_the_better_claim_to_its_folder() {
+        let pins = || gh("b/Pins", &["Pins", "Questie"]);
+        // Something hand-picked shipping it wins it, whenever it arrived.
+        let (formerly, unvouched) = stamp_beside(
+            Some(3),
             vec![gh("questie/questie", &["Questie"])],
             &picks(&["questie/questie"]),
+            true,
         );
         assert!(formerly.is_empty());
         assert_eq!(
             unvouched,
             ["wowi:1 no longer vouches for Questie, which gh:questie/questie ships"]
         );
-        let (formerly, _) = stamp(vec![gh("b/Pins", &["Pins", "Questie"])], &picks(&[]));
-        assert!(formerly.is_empty());
 
-        // Anything else the collision pass held, so it's never there to strip the vouch.
-        let (formerly, unvouched) = stamp(vec![gh("zebra/New", &["Questie"])], &picks(&[]));
+        // So does an entry the last catalog listed with it that's older, or level with it as
+        // two entries from before ages were kept are.
+        let (formerly, _) = stamp_beside(Some(3), vec![aged(pins(), 90)], &picks(&[]), true);
+        assert!(formerly.is_empty());
+        let (formerly, unvouched) = stamp_beside(None, vec![pins()], &picks(&[]), true);
+        assert!(formerly.is_empty());
+        assert_eq!(
+            unvouched,
+            ["wowi:1 no longer vouches for Questie, which gh:b/Pins ships"]
+        );
+
+        // Listed with it but younger, it got the folder while the listing was away or after its
+        // rename, so the listing keeps the vouch, and the collision pass holds the other.
+        let (formerly, unvouched) =
+            stamp_beside(Some(90), vec![aged(pins(), 3)], &picks(&[]), true);
         assert_eq!(formerly, ["Questie"]);
         assert!(unvouched.is_empty());
+        // And older but only now shipping it, its claim is from today.
+        let (formerly, _) = stamp_beside(Some(3), vec![aged(pins(), 90)], &picks(&[]), false);
+        assert_eq!(formerly, ["Questie"]);
+        let (formerly, _) = stamp_beside(None, vec![pins()], &picks(&[]), false);
+        assert_eq!(formerly, ["Questie"]);
+    }
+
+    /// The collision pass with what the scan cache remembers, at the time `now`.
+    fn pass_at(
+        mut list: Vec<Candidate>,
+        chosen: &HandPicked,
+        previous: &Catalog,
+        remembered: &Remembered,
+        now: i64,
+    ) -> (Vec<Candidate>, Vec<Held>) {
+        stamp_ages(&mut list, Some(previous), chosen, now);
+        let rules = ClaimRules {
+            picks: chosen,
+            reserved: &Reserved::default(),
+            previous: Some(previous),
+            remembered,
+            curated: &Curated::default(),
+            now,
+        };
+        hold_collisions(list, &rules)
+    }
+
+    fn vouching(mut candidate: Candidate, formerly: &[&str]) -> Candidate {
+        candidate.addon.formerly = formerly.iter().map(|f| f.to_string()).collect();
+        candidate
+    }
+
+    #[test]
+    fn an_entry_away_from_a_build_keeps_its_vouched_folders_for_a_month() {
+        let tomtom = vouching(wowi(7032, "TomTom", &["TomTomForever"]), &["TomTom"]);
+        let waypoints = || gh("zebra/Waypoints", &["Waypoints", "TomTom"]);
+        let reason = "its folder TomTom was wowi:7032's main folder";
+
+        // The last catalog listed the listing, and this build doesn't have it.
+        let previous = published(&[(&tomtom, NOW - 10 * DAY)]);
+        let nothing = Remembered::default();
+        let (_, held) = pass_at(vec![waypoints()], &picks(&[]), &previous, &nothing, NOW);
+        assert_eq!(held_ids(&held), ["gh:zebra/Waypoints"]);
+        assert_eq!(held[0].reason, reason);
+
+        // Only the scan cache remembers it, from a catalog a few weeks old.
+        let mut remembered = Remembered::default();
+        let mut noted = published(&[(&tomtom, NOW - 60 * DAY)]);
+        noted.generated = NOW - 29 * DAY;
+        remembered.note(&noted);
+        let without = Catalog::default();
+        let (_, held) = pass_at(vec![waypoints()], &picks(&[]), &without, &remembered, NOW);
+        assert_eq!(held[0].reason, reason);
+        // Noted before the time was kept, it counts as recent.
+        let mut undated = Remembered::default();
+        noted.generated = 0;
+        undated.note(&noted);
+        let (_, held) = pass_at(vec![waypoints()], &picks(&[]), &without, &undated, NOW);
+        assert_eq!(held[0].reason, reason);
+        // Gone over a month, its claims go with it.
+        let (kept, held) = pass_at(
+            vec![waypoints()],
+            &picks(&[]),
+            &without,
+            &remembered,
+            NOW + 2 * DAY,
+        );
+        assert!(held.is_empty(), "{:?}", held_ids(&held));
+        assert_eq!(ids(&kept), ["gh:zebra/Waypoints"]);
+
+        // Back again, it ranks ahead of what got the folder while it was gone.
+        let since = published(&[(&waypoints(), NOW - 5 * DAY)]);
+        let (_, held) = pass_at(
+            vec![waypoints(), tomtom.clone()],
+            &picks(&["7032"]),
+            &since,
+            &remembered,
+            NOW,
+        );
+        assert_eq!(held_ids(&held), ["gh:zebra/Waypoints"]);
+    }
+
+    #[test]
+    fn an_old_entry_only_now_shipping_a_vouched_folder_is_held_however_old() {
+        // The listing renamed itself a while ago and is younger for it. The repository is older,
+        // and adds the folder it moved away from.
+        let tomtom = vouching(wowi(7032, "TomTom", &["TomTomForever"]), &["TomTom"]);
+        let helpers = gh("zebra/Helpers", &["Helpers"]);
+        let previous = published(&[(&tomtom, NOW - 20 * DAY), (&helpers, NOW - 400 * DAY)]);
+        let grown = gh("zebra/Helpers", &["Helpers", "TomTom"]);
+        let (kept, held) = pass_at(
+            vec![tomtom.clone(), grown.clone()],
+            &picks(&[]),
+            &previous,
+            &Remembered::default(),
+            NOW,
+        );
+        assert_eq!(held_ids(&held), ["gh:zebra/Helpers"]);
+        assert_eq!(
+            held[0].reason,
+            "its folder TomTom was wowi:7032's main folder"
+        );
+        assert_eq!(ids(&kept), ["wowi:7032"]);
+
+        // The same while the listing is away.
+        let (_, held) = pass_at(
+            vec![grown],
+            &picks(&[]),
+            &previous,
+            &Remembered::default(),
+            NOW,
+        );
+        assert_eq!(held_ids(&held), ["gh:zebra/Helpers"]);
+    }
+
+    #[test]
+    fn a_folder_that_only_looks_like_a_vouched_one_counts_as_it() {
+        let previous = published(&[(
+            &vouching(wowi(7032, "TomTom", &["TomTomForever"]), &["TomTom"]),
+            0,
+        )]);
+        let tomtom = wowi(7032, "TomTom", &["TomTomForever"]);
+        // A Cyrillic o, which folding sees through. The catalog check only ignores case.
+        let look_alike = gh("zebra/Waypoints", &["Waypoints", "TomT\u{043E}m"]);
+        let (_, held) = pass(vec![tomtom, look_alike], &picks(&[]), Some(&previous));
+        assert_eq!(
+            held[0].reason,
+            "its folder TomT\u{043E}m was wowi:7032's main folder"
+        );
+
+        // A hand-picked one takes it, and the vouch goes, so nothing alike is left beside it.
+        let mut list = vec![
+            vouching(
+                aged(wowi(7032, "TomTom", &["TomTomForever"]), 3),
+                &["TomTom"],
+            ),
+            gh("chosen/Waypoints", &["Waypoints", "TomT\u{043E}m"]),
+        ];
+        let stamped = stamp_formerly(
+            &mut list,
+            Some(&previous),
+            &Remembered::default(),
+            &Curated::default(),
+            &picks(&["chosen/Waypoints"]),
+        );
+        assert!(list[0].addon.formerly.is_empty());
+        assert_eq!(
+            stamped.unvouched,
+            ["wowi:7032 no longer vouches for TomTom, which gh:chosen/Waypoints ships"]
+        );
     }
 
     #[test]

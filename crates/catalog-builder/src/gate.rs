@@ -8,7 +8,7 @@ use feeling_core::catalog::{Addon, CATALOG_SCHEMA, CATEGORIES, Catalog, PackGrou
 
 use crate::curated::{Curated, HandPicked, PackSpec};
 use crate::model::{Held, MAX_DEPS, MAX_FORMERLY};
-use crate::text::fold_name;
+use crate::text::{FolderMap, fold_name};
 use crate::zipscan::MAX_FOLDERS;
 
 /// The most the published file may hold: about ten times today's, and room for some
@@ -333,20 +333,54 @@ fn attach_packs(catalog: &mut Catalog, specs: &[PackSpec], warnings: &mut Vec<St
 }
 
 /// A former main folder vouches that an installed copy with that main folder is this addon, so
-/// no other entry may ship it. The settle step makes sure of that: the collision pass holds a
-/// newcomer that ships one, and a vouch goes when an entry with a better claim ships it. Only
-/// settled candidates reach the gate, so this only says when that stops being true.
+/// no other entry may ship it. The settle step sees to that: the collision pass holds whatever
+/// ships one without the better claim to it, and a vouch goes when an entry with the better
+/// claim ships it. This is the last guard. Any vouch for a folder another entry in the catalog
+/// ships goes, with a warning naming both, so no catalog goes out with one. It never refuses the
+/// catalog for it, because then a stranger's repository could stop it for everyone. Folders
+/// compare as [`crate::text::same_folder`] has it, which counts every pair the catalog check
+/// does.
+fn drop_formerly_shipped_elsewhere(addons: &mut [Addon], warnings: &mut Vec<String>) {
+    let mut shipped_by: FolderMap<usize> = FolderMap::default();
+    for (at, addon) in addons.iter().enumerate() {
+        for folder in &addon.folders {
+            shipped_by.add(folder, at);
+        }
+    }
+    let mut goes: Vec<(usize, String, usize)> = Vec::new();
+    for (at, addon) in addons.iter().enumerate() {
+        for folder in &addon.formerly {
+            let other = shipped_by
+                .alike(folder)
+                .copied()
+                .find(|&other| !addons[other].id.eq_ignore_ascii_case(&addon.id));
+            if let Some(other) = other {
+                goes.push((at, folder.clone(), other));
+            }
+        }
+    }
+    for (at, folder, other) in goes {
+        warnings.push(format!(
+            "{} no longer vouches for {folder}, which {} ships",
+            addons[at].id, addons[other].id
+        ));
+        addons[at].formerly.retain(|kept| *kept != folder);
+    }
+}
+
+/// The catalog check's rule for former main folders, as `xtask check-catalog` has it: no entry's
+/// former main folder is a folder another entry ships, compared ignoring case.
+#[cfg(test)]
 pub(crate) fn formerly_shipped_elsewhere(addons: &[Addon]) -> Vec<String> {
     let mut problems = Vec::new();
     for addon in addons {
         for folder in &addon.formerly {
-            let folder_lower = folder.to_lowercase();
             let other = addons.iter().find(|other| {
                 other.id != addon.id
                     && other
                         .folders
                         .iter()
-                        .any(|f| f.to_lowercase() == folder_lower)
+                        .any(|f| f.to_lowercase() == folder.to_lowercase())
             });
             if let Some(other) = other {
                 problems.push(format!(
@@ -386,13 +420,14 @@ pub fn run_gate(mut catalog: Catalog, context: &GateContext<'_>) -> Result<Passe
         true
     });
 
-    warnings.extend(formerly_shipped_elsewhere(&catalog.addons));
     let held = trim_to_size(
         &mut catalog,
         context.picks,
         MAX_CATALOG_BYTES,
         &mut warnings,
     )?;
+    // After trimming, so only an entry that goes out can take a vouch away.
+    drop_formerly_shipped_elsewhere(&mut catalog.addons, &mut warnings);
     if let Some(problem) = shrink_problem(&catalog, context) {
         return Err(problem);
     }
@@ -965,26 +1000,83 @@ mod tests {
     }
 
     #[test]
-    fn the_gate_says_when_a_former_main_folder_is_another_entrys() {
-        // Settling never lets this through, so the gate only says so and changes nothing.
+    fn a_former_main_folder_another_entry_ships_loses_its_vouch_and_the_catalog_still_goes_out() {
         let mut renamed = addon("gh:a/new", "NewName");
-        renamed.formerly = vec!["QUESTIE".into()];
-        let (out, warnings) = pass(catalog(vec![
-            renamed,
-            addon("gh:questie/questie", "Questie"),
-        ]));
-        assert_eq!(out.addons[0].formerly, ["QUESTIE"]);
+        renamed.formerly = vec!["QUESTIE".into(), "Older".into()];
+        let before = catalog(vec![renamed, addon("gh:questie/questie", "Questie")]);
+        assert_eq!(formerly_shipped_elsewhere(&before.addons).len(), 1);
+        let (out, warnings) = pass(before);
+        assert_eq!(out.addons.len(), 2, "nothing is held for it");
+        assert_eq!(out.addons[0].formerly, ["Older"]);
         assert_eq!(
             warnings,
-            ["gh:a/new lists QUESTIE as a former main folder, but gh:questie/questie ships it"]
+            ["gh:a/new no longer vouches for QUESTIE, which gh:questie/questie ships"]
         );
+        assert!(
+            formerly_shipped_elsewhere(&out.addons).is_empty(),
+            "what the catalog check holds every catalog to"
+        );
+
+        // Folders that only look alike count too, and so do ones that are the same ignoring
+        // case but fold apart, as a Greek capital Eta and its small letter do.
+        let mut look_alike = addon("gh:a/new", "NewName");
+        look_alike.formerly = vec!["Questie".into(), "\u{0397}ogHeals".into()];
+        let mut lookalike_quests = addon("gh:zebra/quests", "Zebra");
+        lookalike_quests.folders = vec!["Zebra".into(), "Qu\u{0435}stie".into()];
+        let mut hogs = addon("gh:zebra/hogs", "Hogs");
+        hogs.folders = vec!["\u{03B7}ogHeals".into()];
+        let before = catalog(vec![look_alike, lookalike_quests, hogs]);
+        assert_eq!(formerly_shipped_elsewhere(&before.addons).len(), 1);
+        let (out, warnings) = pass(before);
+        assert!(out.addons[0].formerly.is_empty());
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(formerly_shipped_elsewhere(&out.addons).is_empty());
 
         // A main folder it moved away from but still ships is its own.
         let mut moved = addon("gh:a/hog", "HogTronUI");
         moved.folders = vec!["HogTronUI".into(), "HogHeals".into()];
         moved.formerly = vec!["HogHeals".into()];
-        let (_, warnings) = pass(catalog(vec![moved]));
+        let (out, warnings) = pass(catalog(vec![moved]));
         assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(out.addons[0].formerly, ["HogHeals"]);
+    }
+
+    #[test]
+    fn only_an_entry_that_goes_out_takes_a_vouch_away() {
+        // The entry shipping the folder is the youngest and largest, so the size limit takes it
+        // first, and the vouch stays.
+        let mut c = numbered(0);
+        let count = MAX_CATALOG_BYTES / 26_000 + 20;
+        c.addons = (0..count)
+            .map(|i| sized(&format!("gh:old/{i}"), 100, 250))
+            .collect();
+        let mut young = sized("gh:young/big", 200, 256);
+        for folder in &mut young.folders {
+            *folder = folder.replace("Pack", "Young");
+        }
+        let vouched = young.folders[0].clone();
+        let mut renamed = addon("gh:chosen/new", "NewName");
+        renamed.formerly = vec![vouched.clone()];
+        c.addons.push(young);
+        c.addons.push(renamed);
+
+        let passed =
+            gate_with(c, &Curated::default(), &picked(&["chosen/new"]), None, &[]).unwrap();
+        assert!(passed.held.iter().any(|h| h.id == "gh:young/big"));
+        let kept = passed
+            .catalog
+            .addons
+            .iter()
+            .find(|a| a.id == "gh:chosen/new");
+        assert_eq!(kept.unwrap().formerly, [vouched]);
+        assert!(
+            !passed
+                .warnings
+                .iter()
+                .any(|w| w.contains("no longer vouches")),
+            "{:?}",
+            passed.warnings
+        );
     }
 
     #[test]

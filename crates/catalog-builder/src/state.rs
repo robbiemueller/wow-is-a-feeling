@@ -41,13 +41,20 @@ pub struct State {
     pub remembered: Remembered,
 }
 
-/// The main folder an entry was last published with, and the former ones the catalog vouched
-/// for then.
+/// The main folder an entry was last published with, the former ones the catalog vouched for
+/// then, when that was, and how old the entry was.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LastPublished {
     pub main: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub formerly: Vec<String>,
+    /// Unix seconds when the catalog it was last published in was made. 0 for an entry noted
+    /// before this was kept, which counts as recent.
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    pub at: i64,
+    /// Its `created` in that catalog. 0 for an entry noted before this was kept.
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    pub created: i64,
 }
 
 /// What each entry was last published as, by lowercased id. Nothing is ever taken out: it's a
@@ -57,8 +64,8 @@ pub struct LastPublished {
 pub struct Remembered(BTreeMap<String, LastPublished>);
 
 impl Remembered {
-    /// Notes what each entry of a catalog that went out was published as. Entries it left out
-    /// keep what was noted before.
+    /// Notes what each entry of a catalog that went out was published as, and when. Entries it
+    /// left out keep what was noted before.
     pub fn note(&mut self, catalog: &Catalog) {
         for addon in &catalog.addons {
             let Some(main) = addon.folders.first() else {
@@ -69,6 +76,8 @@ impl Remembered {
                 LastPublished {
                     main: main.clone(),
                     formerly: addon.formerly.clone(),
+                    at: catalog.generated,
+                    created: addon.created,
                 },
             );
         }
@@ -77,6 +86,11 @@ impl Remembered {
     /// What the entry with this id was last published as. Case doesn't matter.
     pub fn get(&self, id: &str) -> Option<&LastPublished> {
         self.0.get(&id.to_ascii_lowercase())
+    }
+
+    /// Every entry noted, by lowercased id.
+    pub fn entries(&self) -> impl Iterator<Item = (&str, &LastPublished)> {
+        self.0.iter().map(|(id, last)| (id.as_str(), last))
     }
 
     /// Each entry's main folder, by lowercased id.
@@ -329,6 +343,7 @@ mod tests {
                     id: (*id).to_string(),
                     folders: folders.iter().map(|f| f.to_string()).collect(),
                     formerly: formerly.iter().map(|f| f.to_string()).collect(),
+                    created: 1_790_000_000,
                     ..feeling_core::catalog::Addon::default()
                 })
                 .collect(),
@@ -339,27 +354,47 @@ mod tests {
     #[test]
     fn what_each_entry_was_published_as_outlasts_a_catalog_that_leaves_it_out() {
         let mut state = State::empty();
-        state.remembered.note(&catalog_of(&[
+        let mut first = catalog_of(&[
             ("wowi:7032", &["TomTomForever"], &["TomTom"]),
             ("gh:A/Addon", &["Addon", "Addon_Options"], &[]),
-        ]));
+        ]);
+        first.generated = 1_800_000_000;
+        state.remembered.note(&first);
         // The next catalog leaves the listing out and moves the repository's main folder.
-        state
-            .remembered
-            .note(&catalog_of(&[("gh:a/addon", &["AddonCore", "Addon"], &[])]));
+        let mut next = catalog_of(&[("gh:a/addon", &["AddonCore", "Addon"], &[])]);
+        next.generated = 1_800_086_400;
+        state.remembered.note(&next);
         let tomtom = state.remembered.get("WOWI:7032").unwrap();
         assert_eq!(tomtom.main, "TomTomForever");
         assert_eq!(tomtom.formerly, ["TomTom"]);
         assert_eq!(
-            state.remembered.get("gh:A/Addon").unwrap().main,
-            "AddonCore"
+            (tomtom.at, tomtom.created),
+            (1_800_000_000, 1_790_000_000),
+            "when it was last published, and how old it was then"
+        );
+        let addon = state.remembered.get("gh:A/Addon").unwrap();
+        assert_eq!(
+            (addon.main.as_str(), addon.at),
+            ("AddonCore", 1_800_086_400)
         );
         assert_eq!(state.remembered.get("gh:a/other"), None);
+        assert_eq!(state.remembered.entries().count(), 2);
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("catalog-state.json");
         state.save(&path).unwrap();
         assert_eq!(State::load(&path).remembered, state.remembered);
+
+        // Memory noted before when and how old were kept still loads, with both 0.
+        fs::write(
+            &path,
+            br#"{"schema":1,"remembered":{"wowi:7032":{"main":"TomTomForever","formerly":["TomTom"]}}}"#,
+        )
+        .unwrap();
+        let noted = State::load(&path);
+        let tomtom = noted.remembered.get("wowi:7032").unwrap();
+        assert_eq!((tomtom.at, tomtom.created), (0, 0));
+        assert_eq!(tomtom.formerly, ["TomTom"]);
 
         // A scan cache from before this was kept still loads, with nothing remembered.
         fs::write(&path, br#"{"schema":1,"repos":{"A/a":{}}}"#).unwrap();
