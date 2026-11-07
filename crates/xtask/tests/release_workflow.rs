@@ -738,6 +738,9 @@ fn the_key_is_in_one_step_of_one_small_job() {
                     .unwrap()
                     .contains("sha256sum --check --strict")
             );
+        } else if step.label() == "Hash the signature" {
+            assert_eq!(keyed_steps, 1, "this hashes what the keyed step made");
+            assert!(step.block("env").is_empty());
         } else {
             assert_eq!(step.script().unwrap(), "chmod +x signer/xtask-sign\n");
         }
@@ -1040,8 +1043,45 @@ fn a_changed_asset_never_reaches_github() {
     .unwrap();
 
     let failure = rig.run_job("publish", &[]).unwrap_err();
-    assert_eq!(failure.step, "Check each asset against the signed hashes");
+    assert_eq!(
+        failure.step,
+        "Check these are exactly the files the manifest job made"
+    );
     assert!(!rig.log().contains("gh release"), "{}", rig.log());
+}
+
+#[test]
+fn a_swapped_tool_or_signature_is_caught_before_it_counts() {
+    for swapped in ["tool", "signature"] {
+        let Some(rig) = Rig::new() else { return };
+        rig.signed_release();
+        let ran = rig.root.join("swapped-tool-ran");
+        if swapped == "tool" {
+            fs::write(
+                rig.store("tool").join("xtask"),
+                format!("#!/bin/sh\ntouch '{}'\n", ran.display()),
+            )
+            .unwrap();
+        } else {
+            fs::write(
+                rig.store("signature").join("latest.json.minisig"),
+                "untrusted comment: not the real one\n",
+            )
+            .unwrap();
+        }
+        let failure = rig.run_job("verify", &[]).unwrap_err();
+        assert_eq!(
+            failure.step, "Check the tool, manifest and signature are the ones their jobs made",
+            "{swapped}"
+        );
+        assert!(!ran.exists(), "{swapped}");
+        let failure = rig.run_job("publish", &[]).unwrap_err();
+        assert_eq!(
+            failure.step, "Check these are exactly the files the manifest job made",
+            "{swapped}"
+        );
+        assert!(!rig.log().contains("gh release create"), "{swapped}");
+    }
 }
 
 #[test]

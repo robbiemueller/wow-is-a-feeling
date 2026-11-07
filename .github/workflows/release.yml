@@ -209,6 +209,7 @@ jobs:
     outputs:
       assets: ${{ steps.hash.outputs.assets }}
       manifest: ${{ steps.hash.outputs.manifest }}
+      tool: ${{ steps.hash.outputs.tool }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -273,8 +274,10 @@ jobs:
         run: |
           assets=$(cd release && sha256sum -- * | LC_ALL=C sort -k2 | sha256sum | cut -c1-64)
           manifest=$(sha256sum manifest/latest.json | cut -c1-64)
+          tool=$(sha256sum target/debug/xtask | cut -c1-64)
           echo "assets=$assets" >> "$GITHUB_OUTPUT"
           echo "manifest=$manifest" >> "$GITHUB_OUTPUT"
+          echo "tool=$tool" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: assets
@@ -298,6 +301,8 @@ jobs:
     needs: [signer, manifest]
     runs-on: ubuntu-22.04
     permissions: {}
+    outputs:
+      signature: ${{ steps.hash.outputs.signature }}
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
@@ -320,6 +325,9 @@ jobs:
         env:
           MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
         run: signer/xtask-sign manifest/latest.json
+      - name: Hash the signature
+        id: hash
+        run: echo "signature=$(sha256sum manifest/latest.json.minisig | cut -c1-64)" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: signature
@@ -329,7 +337,7 @@ jobs:
   # Apart from publish, because the full xtask links far more crates than a job holding the
   # write token should run.
   verify:
-    needs: sign
+    needs: [sign, manifest]
     runs-on: ubuntu-22.04
     permissions: {}
     steps:
@@ -345,13 +353,23 @@ jobs:
         with:
           name: signature
           path: release
+      - name: Check the tool, manifest and signature are the ones their jobs made
+        env:
+          TOOL: ${{ needs.manifest.outputs.tool }}
+          MANIFEST: ${{ needs.manifest.outputs.manifest }}
+          SIGNATURE: ${{ needs.sign.outputs.signature }}
+        run: |
+          test -n "$TOOL" && test -n "$MANIFEST" && test -n "$SIGNATURE"
+          echo "$TOOL  tool/xtask" | sha256sum --check --strict
+          echo "$MANIFEST  release/latest.json" | sha256sum --check --strict
+          echo "$SIGNATURE  release/latest.json.minisig" | sha256sum --check --strict
       - name: Check the signature with the key built into the app
         run: |
           chmod +x tool/xtask
           tool/xtask verify-latest release/latest.json
 
   publish:
-    needs: [verify, manifest]
+    needs: [verify, manifest, sign]
     runs-on: ubuntu-22.04
     permissions:
       contents: write
@@ -374,8 +392,9 @@ jobs:
         env:
           ASSETS: ${{ needs.manifest.outputs.assets }}
           MANIFEST: ${{ needs.manifest.outputs.manifest }}
+          SIGNATURE: ${{ needs.sign.outputs.signature }}
         run: |
-          test -n "$ASSETS" && test -n "$MANIFEST"
+          test -n "$ASSETS" && test -n "$MANIFEST" && test -n "$SIGNATURE"
           expected=$(printf '%s\n' latest.json latest.json.minisig \
             wow-is-a-feeling-linux-x64.AppImage wow-is-a-feeling-linux-x64.gz \
             wow-is-a-feeling-linux-x64.tar.gz wow-is-a-feeling-macos-universal.dmg \
@@ -387,6 +406,7 @@ jobs:
             exit 1
           fi
           echo "$MANIFEST  release/latest.json" | sha256sum --check --strict
+          echo "$SIGNATURE  release/latest.json.minisig" | sha256sum --check --strict
           assets=$(cd release && sha256sum -- wow-is-a-feeling-* | LC_ALL=C sort -k2 | sha256sum | cut -c1-64)
           if [ "$assets" != "$ASSETS" ]; then
             echo "::error::The release files changed after the manifest job hashed them, so nothing was published."

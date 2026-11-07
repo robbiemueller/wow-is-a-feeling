@@ -40,7 +40,7 @@ jobs:
         if: runner.os == 'Linux'
         run: cargo clippy --locked -p xtask --no-default-features --bin xtask-sign -- -D warnings
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --workspace --no-fail-fast
 
   smoke:
     name: Screenshot on ${{ matrix.os }}
