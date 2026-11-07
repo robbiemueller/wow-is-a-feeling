@@ -15,9 +15,10 @@ const GAME_ADDON_PREFIX: &str = "blizzard_";
 /// The biggest pack, in bytes, that installs as another addon's dependency without the player
 /// seeing its size first. A pack is an addon a reviewed entry lists under its `packs`, such as
 /// a voice pack: those run to gigabytes, and any addon's TOC can require one of their folders.
-/// A pack up to this size comes along whether or not it's reviewed, because the reviewed entry
-/// that lists it vouches for it. Other dependencies aren't held to this, because the addon that
-/// requires one won't load without it.
+/// A pack known to be up to this size comes along whether or not it's reviewed, because the
+/// reviewed entry that lists it vouches for it. One whose size the catalog doesn't give could be
+/// any size, so it's left to the player like a bigger one. Other dependencies aren't held to
+/// this, because the addon that requires one won't load without it.
 pub const BIGGEST_UNASKED_DOWNLOAD: u64 = 100_000_000;
 
 /// Which catalog addons provide each folder.
@@ -59,12 +60,12 @@ pub struct Resolution {
     /// either. The player has to look for these themselves.
     pub missing: Vec<String>,
     /// Required folders whose pick is trusted but was never reviewed by a person, and isn't a
-    /// pack of a known size up to [`BIGGEST_UNASKED_DOWNLOAD`], so it isn't installed by itself.
-    /// The player can open it from the Requires line and decide.
+    /// pack, so it isn't installed by itself. The player can open it from the Requires line and
+    /// decide.
     pub unreviewed: Vec<Unreviewed>,
     /// Required folders whose pick is a pack with a download over [`BIGGEST_UNASKED_DOWNLOAD`],
-    /// reviewed or not, so it isn't installed by itself either. The player hears its size and
-    /// decides.
+    /// or one the catalog gives no size for, reviewed or not, so it isn't installed by itself
+    /// either. The player hears its size, or that nobody knows it, and decides.
     pub too_big: Vec<TooBig>,
 }
 
@@ -79,7 +80,8 @@ pub struct Unreviewed {
     pub provider: String,
 }
 
-/// A required pack left for the player to install, because its download is big.
+/// A required pack left for the player to install, because its download is big, or of a size
+/// nobody knows.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TooBig {
     /// The addon whose TOC requires it, which is the page whose Requires line links to it.
@@ -88,7 +90,8 @@ pub struct TooBig {
     pub folder: String,
     /// The entry the app picked for the folder, the same one the Requires line shows.
     pub provider: String,
-    /// Its download, in bytes, from the channel it would install from.
+    /// Its download, in bytes, from the channel it would install from. 0 when the catalog
+    /// doesn't say.
     pub size: u64,
 }
 
@@ -101,12 +104,12 @@ pub struct TooBig {
 /// A dependency joins the plan only when its pick is reviewed as well as trusted: any addon
 /// can ship a library's folder name long before anything needs it, and a trusted entry only
 /// had to be old enough. The rest are left out and listed in `unreviewed`. A pick that's a
-/// pack, which a reviewed entry lists under its `packs`, never joins when its download is over
-/// [`BIGGEST_UNASKED_DOWNLOAD`], reviewed or not, because a voice pack can run to gigabytes:
-/// those are listed in `too_big`, with their size. That's decided before `reviewed`, since the
-/// catalog publishes big packs unreviewed. A pack whose download is known and up to that size
-/// joins even when it's published unreviewed, as one is when only its other channel's build is
-/// big: the reviewed entry's hand-written group vouches for it. Any other pick joins whatever its
+/// pack, which a reviewed entry lists under its `packs`, goes by its size instead, reviewed or
+/// not, because a voice pack can run to gigabytes and the catalog publishes big ones unreviewed.
+/// It joins only when its download is known and up to [`BIGGEST_UNASKED_DOWNLOAD`], even when
+/// it's published unreviewed, as one is when only its other channel's build is big: the reviewed
+/// entry's hand-written group vouches for it. A bigger pack, or one the catalog gives no size
+/// for, is listed in `too_big` with its size, 0 when unknown. Any other pick joins whatever its
 /// size, because the addon that requires it won't load without it.
 pub fn resolve<I, S>(
     addon_id: &str,
@@ -161,10 +164,11 @@ where
         let pick = &catalog.addons[provider];
         let size = download_size(pick, channel(&pick.id));
         let pack = is_pack(&pick.id, catalog);
-        let too_big = pack && size > BIGGEST_UNASKED_DOWNLOAD;
-        // A pack's group on a reviewed entry vouches for it, when its size is known.
-        let vouched_pack = pack && size > 0;
-        if !too_big && (pick.reviewed || vouched_pack) {
+        // A pack nobody knows the size of could be gigabytes. A small one's group on a reviewed
+        // entry vouches for it.
+        let too_big = pack && (size == 0 || size > BIGGEST_UNASKED_DOWNLOAD);
+        let joins = if pack { !too_big } else { pick.reviewed };
+        if joins {
             plan_folders(pick, &mut planned);
             stack.push((provider, 0));
         } else if seen_left.insert((current, folder)) {
@@ -215,8 +219,8 @@ fn is_pack(id: &str, catalog: &Catalog) -> bool {
 /// then the most downloaded trusted one. Ties keep catalog order. An untrusted entry is never
 /// picked, even when nothing else provides the folder, because its folder list is only a
 /// claim and its downloads can be inflated. [`resolve`] installs the pick by itself only when
-/// it's reviewed too, or a pack small enough, and never when it's a big pack. The Requires line
-/// links to it either way.
+/// it's reviewed too, or a pack known to be small enough, and never when it's a big pack or one
+/// of unknown size. The Requires line links to it either way.
 pub fn best_provider(folder: &str, catalog: &Catalog, index: &FolderIndex) -> Option<usize> {
     let folder = folder.to_lowercase();
     index
@@ -881,13 +885,61 @@ mod tests {
         assert_eq!(result.to_install, ["small", "top"]);
         assert_eq!(
             result.unreviewed,
-            [
-                left_out("top", "Unknown", "unknown"),
-                left_out("top", "Library", "library"),
-            ],
-            "a pack of no known size, and anything that's no pack"
+            [left_out("top", "Library", "library")],
+            "anything that's no pack"
         );
-        assert!(result.too_big.is_empty());
+        assert_eq!(
+            result.too_big,
+            [too_big("top", "Unknown", "unknown", 0)],
+            "a pack of no known size goes by its size, which nobody knows"
+        );
+    }
+
+    #[test]
+    fn a_reviewed_pack_whose_size_nobody_knows_never_comes_along_unasked() {
+        // A direct download or a source archive can have no size in the catalog, and a pack
+        // could be gigabytes, so the player decides whether it's reviewed or not.
+        let mut voices = sized(addon("voices", &["Voices"], &[]), 5_000_000);
+        voices.beta = Some(Release {
+            version: "2.0-beta".to_string(),
+            date: 1,
+            ..Default::default()
+        });
+        let catalog = catalog(vec![
+            addon("top", &["Top"], &["Voices"]),
+            sized(addon("unsized", &["Unsized"], &[]), 0),
+            addon("plugin", &["Plugin"], &["Unsized"]),
+            voices,
+            with_packs("owner", "Owner", &["voices", "unsized"]),
+        ]);
+        let unsized_one = resolve_in(&catalog, "plugin", &[]);
+        assert_eq!(unsized_one.to_install, ["plugin"]);
+        assert_eq!(
+            unsized_one.too_big,
+            [too_big("plugin", "Unsized", "unsized", 0)],
+            "with no size to tell"
+        );
+        assert!(unsized_one.unreviewed.is_empty());
+
+        // The build the player's channel would install is the one whose size counts.
+        let index = FolderIndex::build(&catalog);
+        let stable = resolve("top", &catalog, &index, NOTHING, |_| Channel::Stable);
+        assert_eq!(stable.to_install, ["voices", "top"]);
+        let beta = resolve("top", &catalog, &index, NOTHING, |_| Channel::Beta);
+        assert_eq!(beta.to_install, ["top"]);
+        assert_eq!(beta.too_big, [too_big("top", "Voices", "voices", 0)]);
+    }
+
+    #[test]
+    fn a_reviewed_pick_of_unknown_size_that_is_no_pack_still_comes_along() {
+        // Only packs go by size. ForeverDB and Details have no size in the live catalog.
+        let catalog = catalog(vec![
+            addon("plugin", &["Plugin"], &["ForeverDB"]),
+            sized(addon("foreverdb", &["ForeverDB"], &[]), 0),
+        ]);
+        let result = resolve_in(&catalog, "plugin", &[]);
+        assert_eq!(result.to_install, ["foreverdb", "plugin"]);
+        assert!(result.too_big.is_empty() && result.unreviewed.is_empty());
     }
 
     #[test]

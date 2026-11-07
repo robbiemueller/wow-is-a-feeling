@@ -82,11 +82,11 @@ pub struct Addon {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub trusted: bool,
     /// Whether a person chose this entry: seeded, hand-picked or part of an approved pair.
-    /// Only these get installed by themselves as another addon's dependency, because any
-    /// addon can ship a library's folder name long before anything needs it, and so does a
-    /// pack a reviewed entry lists while its download is 100 MB or less. A pack with a build
-    /// over 100 MB is chosen too, but goes out unreviewed, so apps up to 0.1.2 never install it
-    /// by themselves.
+    /// Apart from packs, only these get installed by themselves as another addon's dependency,
+    /// because any addon can ship a library's folder name long before anything needs it. A
+    /// pack a reviewed entry lists goes by its size instead, reviewed or not: it comes along
+    /// only when its download is known to be 100 MB or less. A pack with a build over 100 MB is
+    /// chosen too, but goes out unreviewed, so apps up to 0.1.2 never install it by themselves.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub reviewed: bool,
     /// Screenshots, for a source whose details don't list them (WoWInterface). Written by a
@@ -95,7 +95,8 @@ pub struct Addon {
     pub images: Vec<String>,
     /// Addons that go with this one, such as the voice packs it plays, as groups that a
     /// person wrote down: an addon's own files never say. Only a `reviewed` entry's groups
-    /// count, and the app installs none of them unless the player says so.
+    /// count. The app offers them, and installs one unasked only as another addon's dependency,
+    /// when its download is known to be 100 MB or less.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub packs: Vec<PackGroup>,
     /// Main folders this addon had before, that the catalog vouches for: a rename its author

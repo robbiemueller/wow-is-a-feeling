@@ -1405,6 +1405,18 @@ mod tests {
     }
 
     #[test]
+    fn a_kit_row_that_says_update_is_not_counted_by_install_all() {
+        // Its row says "update" rather than "installed", but it's installed, so it's Update's
+        // to do, not Install all's.
+        let b = bundle();
+        let kit = &b.catalog.kits[0];
+        let list = map(vec![managed("gh:a/questie", "Questie", "1.0")]);
+        assert_eq!(kit_addons(kit, &b, Some(&list))[0].1, Tag::Update);
+        assert_eq!(Tag::Update.words(), "update");
+        assert!(kit_missing(kit, &b, Some(&list)).is_empty());
+    }
+
+    #[test]
     fn row_lookup_finds_every_kind() {
         let b = bundle();
         let groups = vec![AddonGroup {

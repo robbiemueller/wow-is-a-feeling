@@ -11,6 +11,8 @@
 //! remove <id>
 //! adopt <id>
 //! zip <path>
+//! list <path>       # paste the list in this file and press Install these, which shows the list
+//! confirmlist       # Install these, on that list, which logs what the list showed first
 //! updateall
 //! select <id>
 //! tab my|browse|settings
@@ -123,6 +125,23 @@ impl Script {
             }
             "adopt" => app.actions.push(Action::Adopt(rest.to_owned())),
             "zip" => app.actions.push(Action::ZipDropped(PathBuf::from(rest))),
+            "list" => match std::fs::read_to_string(rest) {
+                Ok(text) => {
+                    app.list_text = text;
+                    app.actions.push(Action::PreviewList);
+                }
+                Err(_) => self.log("couldn't read that list"),
+            },
+            "confirmlist" => match app.popup.take() {
+                Some(crate::dialogs::Popup::List(preview)) => {
+                    self.log(&describe_list(&preview));
+                    app.actions.push(Action::ConfirmList(preview.add));
+                }
+                other => {
+                    app.popup = other;
+                    self.log("no list is being shown");
+                }
+            },
             "updateall" => app.actions.push(Action::UpdateAll),
             "checkapp" => app.actions.push(Action::CheckUpdateNow),
             // What the update prompt's main button does, for a rig testing a real update.
@@ -155,6 +174,28 @@ impl Script {
             other => self.log(&format!("unknown command: {other}")),
         }
     }
+}
+
+/// What a list's popup showed, one line for each part of it.
+fn describe_list(preview: &crate::dialogs::ListPreview) -> String {
+    let mut lines: Vec<String> = vec![format!("list: {} to add", preview.count())];
+    lines.extend(
+        preview
+            .add
+            .iter()
+            .map(|addon| format!("  {}", addon.line())),
+    );
+    lines.extend(preview.brings.iter().map(|dep| format!("  {}", dep.line())));
+    lines.extend(
+        preview
+            .left_alone
+            .iter()
+            .map(|name| format!("  {}", crate::dialogs::left_alone_line(name))),
+    );
+    if let Some(total) = preview.total() {
+        lines.push(format!("  {total}"));
+    }
+    lines.join("\n")
 }
 
 /// One line about what the app believes right now, for a test to compare with the disk.

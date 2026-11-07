@@ -460,7 +460,7 @@ fn requires(app: &mut App, ui: &mut Ui, addon: &Addon) {
     }
     let bundle = app.bundle.clone();
     // What an install would leave for the player to add, decided the same way it decides:
-    // nobody reviewed it, or it's a pack with a big download.
+    // nobody reviewed it, or it's a pack with a big download or one of unknown size.
     let yourself: Vec<String> = bundle.as_deref().map_or_else(Vec::new, |b| {
         let installed = app.installed_folders();
         let resolved = deps::resolve(&addon.id, &b.catalog, &b.folders, installed.iter(), |id| {

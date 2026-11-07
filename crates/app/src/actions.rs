@@ -2,7 +2,7 @@
 //! halfway through being drawn.
 
 use crate::app::App;
-use crate::dialogs::{ListAddon, ListPreview, PackPlan, Popup, RemovePlan, ReplacePlan};
+use crate::dialogs::{ListAddon, ListDep, ListPreview, PackPlan, Popup, RemovePlan, ReplacePlan};
 use crate::easter;
 use crate::model::{self, CatalogBundle, HeaderId, Section, Selection, Tab};
 use crate::ops::{self, FolderConflict, Op, OpKind, Verb, folder_set};
@@ -16,7 +16,7 @@ use feeling_core::listfile;
 use feeling_core::search::SortBy;
 use feeling_core::selfupdate::UpdateInfo;
 use feeling_core::state::{ManagedAddon, Origin};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -80,6 +80,30 @@ pub enum Action {
     RetryCatalog,
     PortraitClicked,
     ZipDropped(PathBuf),
+}
+
+/// What installing a batch would queue and say, worked out with nothing changed yet.
+#[derive(Default)]
+struct InstallPlan {
+    /// What joins the queue, in order.
+    steps: Vec<Step>,
+    /// The yellow lines installing says, in order.
+    lines: Vec<String>,
+}
+
+impl InstallPlan {
+    fn queues(&self, id: &str) -> bool {
+        self.steps.iter().any(|step| step.id == id)
+    }
+}
+
+/// One addon an install plan queues.
+struct Step {
+    id: String,
+    /// The asked-for addon it comes with: itself, or one that requires it.
+    with: String,
+    /// It isn't the first of what its addon brings, so it runs after the step before it.
+    chained: bool,
 }
 
 /// One op about to join the queue.
@@ -356,7 +380,7 @@ impl App {
     /// The question to ask before a first install of an addon with a needed pack group that
     /// nothing meets: nothing in AddOns or in a record, nothing this install brings with it,
     /// and nothing already on its way. It offers each such group's first pack. A required pack
-    /// too big to come along by itself doesn't count as brought.
+    /// that's too big to come along by itself, or of unknown size, doesn't count as brought.
     fn pack_plan(&self, id: &str) -> Option<PackPlan> {
         if self.managed(id).is_some() || self.queue.busy_with(id) {
             return None;
@@ -502,96 +526,14 @@ impl App {
         let Some(bundle) = self.bundle.clone() else {
             return;
         };
-        let installed = self.installed_folders();
-        let mut plan: Vec<String> = Vec::new();
-        let mut chained: HashSet<String> = HashSet::new();
-        let mut told: HashSet<String> = HashSet::new();
-        for id in ids {
-            if self.queue.busy_with(id) {
-                continue;
-            }
-            if let Some(line) = self.another_addon_now(id) {
-                self.yellow(line);
-                continue;
-            }
-            let name = bundle.addon(id).map_or(id.as_str(), |a| a.name.as_str());
-            if agreed.is_empty()
-                && let Some(addon) = bundle.addon(id)
-            {
-                let conflicts = self.folder_conflicts(addon);
-                if !conflicts.is_empty() {
-                    let folders: Vec<&str> = conflicts.iter().map(|c| c.folder.as_str()).collect();
-                    let line = ops::sitting_out_line(name, self.managed(id).is_some(), &folders);
-                    self.yellow(line);
-                    continue;
-                }
-            }
-            let resolved = deps::resolve(
-                id,
-                &bundle.catalog,
-                &bundle.folders,
-                installed.iter(),
-                |dep| self.channel_of(dep),
-            );
-            for missing in &resolved.missing {
-                self.yellow(format!(
-                    "{name} requires {}, which this app can't pick for you. Look for it yourself, \
-                     in Browse or on the web. Installing {name} anyway.",
-                    model::clean_line(missing, 60)
-                ));
-            }
-            // Nothing to say about one that's on its way or already here.
-            for left in &resolved.unreviewed {
-                if !self.here_or_coming(&left.provider, ids, coming)
-                    && told.insert(left.provider.clone())
-                {
-                    self.yellow(unreviewed_line(&bundle, left));
-                }
-            }
-            for left in &resolved.too_big {
-                if !self.here_or_coming(&left.provider, ids, coming)
-                    && told.insert(left.provider.clone())
-                {
-                    self.yellow(too_big_line(&bundle, left));
-                }
-            }
-            for (position, step) in resolved.to_install.iter().enumerate() {
-                if plan.contains(step) || self.queue.busy_with(step) {
-                    continue;
-                }
-                if step != id
-                    && let Some(dep) = bundle.addon(step)
-                {
-                    let asked_for = ids.contains(step);
-                    let conflicts = self.folder_conflicts(dep);
-                    if !conflicts.is_empty() {
-                        // One that was asked for says so in its own turn.
-                        if !asked_for {
-                            self.yellow(format!(
-                                "{name} requires {}, which wasn't added because it would replace \
-                                 {}. Install it from its own page to choose.",
-                                dep.name,
-                                conflict_names(&conflicts)
-                            ));
-                        }
-                        continue;
-                    }
-                    if !asked_for {
-                        self.yellow(format!(
-                            "{name} requires {}, so that installs first.",
-                            dep.name
-                        ));
-                    }
-                }
-                plan.push(step.clone());
-                if position > 0 {
-                    chained.insert(step.clone());
-                }
-            }
+        let plan = self.install_plan(&bundle, ids, agreed, coming, |id| self.channel_of(id));
+        for line in plan.lines {
+            self.yellow(line);
         }
-        let mut drafts = Vec::with_capacity(plan.len());
+        let mut drafts = Vec::with_capacity(plan.steps.len());
         let mut earlier: HashSet<String> = HashSet::new();
-        for id in &plan {
+        for step in &plan.steps {
+            let id = &step.id;
             // Two addons in one batch can both bring a folder that's new to the disk. Whichever
             // lands second replaces the first's copy, and they share it from then on.
             let mut allowed = if ids.contains(id) {
@@ -610,11 +552,112 @@ impl App {
                 earlier.extend(folder_set(&addon.folders));
             }
             if let Some(mut draft) = self.install_draft(id, allowed) {
-                draft.chained = chained.contains(id) && !drafts.is_empty();
+                draft.chained = step.chained && !drafts.is_empty();
                 drafts.push(draft);
             }
         }
         self.enqueue(drafts);
+    }
+
+    /// What [`Self::queue_installs_beside`] queues for these, and what it says about them,
+    /// worked out without changing anything, so a pasted list's preview can show the same.
+    /// `channel` is the channel each addon would install from.
+    fn install_plan(
+        &self,
+        bundle: &CatalogBundle,
+        ids: &[String],
+        agreed: &[String],
+        coming: &[String],
+        channel: impl Fn(&str) -> Channel,
+    ) -> InstallPlan {
+        let installed = self.installed_folders();
+        let mut plan = InstallPlan::default();
+        let mut told: HashSet<String> = HashSet::new();
+        for id in ids {
+            if self.queue.busy_with(id) {
+                continue;
+            }
+            if let Some(line) = self.another_addon_now(id) {
+                plan.lines.push(line);
+                continue;
+            }
+            let name = bundle.addon(id).map_or(id.as_str(), |a| a.name.as_str());
+            if agreed.is_empty()
+                && let Some(addon) = bundle.addon(id)
+            {
+                let conflicts = self.folder_conflicts(addon);
+                if !conflicts.is_empty() {
+                    let folders: Vec<&str> = conflicts.iter().map(|c| c.folder.as_str()).collect();
+                    let line = ops::sitting_out_line(name, self.managed(id).is_some(), &folders);
+                    plan.lines.push(line);
+                    continue;
+                }
+            }
+            let resolved = deps::resolve(
+                id,
+                &bundle.catalog,
+                &bundle.folders,
+                installed.iter(),
+                &channel,
+            );
+            for missing in &resolved.missing {
+                plan.lines.push(format!(
+                    "{name} requires {}, which this app can't pick for you. Look for it yourself, \
+                     in Browse or on the web. Installing {name} anyway.",
+                    model::clean_line(missing, 60)
+                ));
+            }
+            // Nothing to say about one that's on its way or already here.
+            for left in &resolved.unreviewed {
+                if !self.here_or_coming(&left.provider, ids, coming)
+                    && told.insert(left.provider.clone())
+                {
+                    plan.lines.push(unreviewed_line(bundle, left));
+                }
+            }
+            for left in &resolved.too_big {
+                if !self.here_or_coming(&left.provider, ids, coming)
+                    && told.insert(left.provider.clone())
+                {
+                    plan.lines.push(too_big_line(bundle, left));
+                }
+            }
+            for (position, step) in resolved.to_install.iter().enumerate() {
+                if plan.queues(step) || self.queue.busy_with(step) {
+                    continue;
+                }
+                if step != id
+                    && let Some(dep) = bundle.addon(step)
+                {
+                    let asked_for = ids.contains(step);
+                    let conflicts = self.folder_conflicts(dep);
+                    if !conflicts.is_empty() {
+                        // One that was asked for says so in its own turn.
+                        if !asked_for {
+                            plan.lines.push(format!(
+                                "{name} requires {}, which wasn't added because it would replace \
+                                 {}. Install it from its own page to choose.",
+                                dep.name,
+                                conflict_names(&conflicts)
+                            ));
+                        }
+                        continue;
+                    }
+                    if !asked_for {
+                        plan.lines.push(format!(
+                            "{name} requires {}, so that installs first.",
+                            dep.name
+                        ));
+                    }
+                }
+                plan.steps.push(Step {
+                    id: step.clone(),
+                    with: id.clone(),
+                    chained: position > 0,
+                });
+            }
+        }
+        plan
     }
 
     /// Everything that counts as already there for a dependency: on disk, or in a record.
@@ -888,10 +931,10 @@ impl App {
         ));
     }
 
-    /// A list is data from a stranger: it can only name addons the catalog already has,
-    /// and the player sees exactly what it would add, and how big each one is, before anything
-    /// happens. An installed addon whose entry has become another addon is listed to add, as
-    /// its row shows that one isn't installed, and installing the list says why it's left alone.
+    /// A list is data from a stranger: it can only name addons the catalog already has, and
+    /// the player sees what installing it would do, and how big each download is, before
+    /// anything happens. That includes what its addons require that it doesn't name. An
+    /// installed addon whose entry has become another addon is left alone, and says so.
     fn preview_list(&mut self) {
         let Some(bundle) = self.bundle.clone() else {
             return;
@@ -904,6 +947,11 @@ impl App {
                 None => preview.unknown.push(model::clean_line(&id, 80)),
                 Some(addon) if record.is_some_and(|record| model::same_addon(record, addon)) => {
                     preview.have.push(addon.name.clone());
+                }
+                // Installing it would only say why it's left alone.
+                Some(_) if self.another_addon_now(&id).is_some() => {
+                    let yours = record.map_or(id.as_str(), |record| record.name.as_str());
+                    preview.left_alone.push(model::clean_line(yours, 60));
                 }
                 Some(addon) => preview.add.push(ListAddon {
                     name: addon.name.clone(),
@@ -919,7 +967,56 @@ impl App {
                 .iter()
                 .map(|line| model::clean_line(line, 80)),
         );
+        preview.brings = self.brought_along(&bundle, &preview.add);
         self.show_popup(Popup::List(preview));
+    }
+
+    /// What installing these listed addons brings with them, from the same plan installing
+    /// follows: each addon they require that the list doesn't name and the player doesn't
+    /// have or have on its way, once, with the listed addon it comes with.
+    fn brought_along(&self, bundle: &CatalogBundle, listed: &[ListAddon]) -> Vec<ListDep> {
+        let ids: Vec<String> = listed.iter().map(|addon| addon.id.clone()).collect();
+        // Install these sets each listed addon's channel before installing. The rest install
+        // from their own.
+        let chosen: HashMap<&str, Channel> = listed
+            .iter()
+            .map(|addon| (addon.id.as_str(), addon.channel))
+            .collect();
+        let channel = |id: &str| {
+            chosen
+                .get(id)
+                .copied()
+                .unwrap_or_else(|| self.channel_of(id))
+        };
+        // One addon on its own asks before it replaces anything, and goes ahead with what it
+        // requires once the player says yes. Several never ask, so one that would replace
+        // something sits out, and so does what it requires.
+        let agreed: Vec<String> = match ids.as_slice() {
+            [id] => self.replace_plan(id).map_or_else(Vec::new, |plan| {
+                plan.conflicts.into_iter().map(|c| c.folder).collect()
+            }),
+            _ => Vec::new(),
+        };
+        let plan = self.install_plan(bundle, &ids, &agreed, &[], channel);
+        plan.steps
+            .iter()
+            .filter(|step| !ids.contains(&step.id) && self.managed(&step.id).is_none())
+            .filter_map(|step| {
+                let addon = bundle.addon(&step.id)?;
+                let channel = channel(&step.id);
+                Some(ListDep {
+                    addon: ListAddon {
+                        id: step.id.clone(),
+                        name: addon.name.clone(),
+                        channel,
+                        size: addon.release(channel).map_or(0, |release| release.size),
+                    },
+                    needed_by: bundle
+                        .addon(&step.with)
+                        .map_or_else(|| step.with.clone(), |with| with.name.clone()),
+                })
+            })
+            .collect()
     }
 
     fn retry_catalog(&mut self) {
@@ -1003,18 +1100,23 @@ fn unreviewed_line(bundle: &CatalogBundle, left: &Unreviewed) -> String {
 }
 
 /// Why a required pack with a big download wasn't added, and how big it is, so getting it is
-/// the player's own choice. The addon that requires it won't load until they do.
+/// the player's own choice. The addon that requires it won't load until they do. A pack the
+/// catalog gives no size for could be any size, and the line says so rather than "1 KB".
 fn too_big_line(bundle: &CatalogBundle, left: &TooBig) -> String {
     let named = |id: &str, fallback: &str| {
         bundle
             .addon(id)
             .map_or_else(|| model::clean_line(fallback, 60), |a| a.name.clone())
     };
+    let download = if left.size > 0 {
+        format!("a {} download", model::size_text(left.size))
+    } else {
+        "a download of unknown size".to_owned()
+    };
     format!(
-        "{} won't load without {}, a {} download. Install it from its page.",
+        "{} won't load without {}, {download}. Install it from its page.",
         named(&left.needed_by, &left.needed_by),
         named(&left.provider, &left.folder),
-        model::size_text(left.size)
     )
 }
 

@@ -137,29 +137,43 @@ fn in_sentence(name: &str) -> String {
         .collect()
 }
 
-/// What a pasted list would do.
+/// What a pasted list would do, as installing it would work it out.
 #[derive(Clone, Debug, Default)]
 pub struct ListPreview {
+    /// The listed addons it installs, which is what Install these passes on.
     pub add: Vec<ListAddon>,
+    /// What those require that the list doesn't name and that isn't here or on its way.
+    /// Installing them brings these along by itself, so they aren't passed on.
+    pub brings: Vec<ListDep>,
     pub have: Vec<String>,
+    /// Installed addons it names whose entries have become other addons, by the names the
+    /// player knows them by. Installing the list leaves these alone.
+    pub left_alone: Vec<String>,
     pub unknown: Vec<String>,
 }
 
 impl ListPreview {
-    /// What the addons it adds download together, for under the list: "1.6 GB to download in
-    /// all." One whose size the catalog doesn't give makes it "At least". `None` when no size
-    /// is known.
+    /// How many addons installing the list adds, with what they bring along.
+    pub fn count(&self) -> usize {
+        self.add.len() + self.brings.len()
+    }
+
+    /// What installing the list downloads, for under the list: "1.6 GB to download in all."
+    /// One whose size the catalog doesn't give makes it "At least". `None` when no size is
+    /// known.
     pub fn total(&self) -> Option<String> {
+        let addons = || {
+            self.add
+                .iter()
+                .chain(self.brings.iter().map(|dep| &dep.addon))
+        };
         // Sizes come from the catalog, so a silly one mustn't overflow the sum.
-        let total = self
-            .add
-            .iter()
-            .fold(0u64, |total, addon| total.saturating_add(addon.size));
+        let total = addons().fold(0u64, |total, addon| total.saturating_add(addon.size));
         if total == 0 {
             return None;
         }
         let total = size_text(total);
-        Some(if self.add.iter().all(|addon| addon.size > 0) {
+        Some(if addons().all(|addon| addon.size > 0) {
             format!("{total} to download in all.")
         } else {
             format!("At least {total} to download in all.")
@@ -167,12 +181,39 @@ impl ListPreview {
     }
 }
 
+/// An addon a pasted list brings along, because one of the addons it adds requires it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ListDep {
+    pub addon: ListAddon,
+    /// The listed addon it comes with, by name.
+    pub needed_by: String,
+}
+
+impl ListDep {
+    /// Its line under the list: "Also installs Musician (101.8 MB), which Musician List
+    /// requires."
+    pub fn line(&self) -> String {
+        format!(
+            "Also installs {}, which {} requires.",
+            self.addon.line(),
+            self.needed_by
+        )
+    }
+}
+
+/// The note for an installed addon a list names whose entry has become another addon:
+/// "Left alone: ShortKings, which the catalog now lists as another addon."
+pub fn left_alone_line(name: &str) -> String {
+    format!("Left alone: {name}, which the catalog now lists as another addon.")
+}
+
 /// One addon a pasted list would add.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ListAddon {
     pub id: String,
     pub name: String,
-    /// The channel the list asks for, which is the one it installs from.
+    /// The channel it installs from: the one the list asks for, or for an addon the list
+    /// brings along, its own.
     pub channel: Channel,
     /// What that channel's build downloads, in bytes. 0 when the catalog doesn't say.
     pub size: u64,
@@ -653,10 +694,9 @@ fn folder_row(ui: &mut Ui, name: &str) -> egui::Response {
 }
 
 fn list(ui: &mut Ui, app: &mut App, preview: &ListPreview, keep: &mut bool) {
-    let count = preview.add.len();
     yellow(
         ui,
-        &match count {
+        &match preview.count() {
             0 => "This list wouldn't add anything.".to_owned(),
             1 => "This list adds 1 addon:".to_owned(),
             n => format!("This list adds {n} addons:"),
@@ -670,12 +710,24 @@ fn list(ui: &mut Ui, app: &mut App, preview: &ListPreview, keep: &mut bool) {
             for addon in &preview.add {
                 plain(ui, &addon.line());
             }
+            if !preview.brings.is_empty() {
+                ui.add_space(6.0);
+                for dep in &preview.brings {
+                    plain(ui, &dep.line());
+                }
+            }
             if !preview.have.is_empty() {
                 ui.add_space(6.0);
                 plain(
                     ui,
                     &format!("Already installed: {}.", preview.have.join(", ")),
                 );
+            }
+            if !preview.left_alone.is_empty() {
+                ui.add_space(6.0);
+                for name in &preview.left_alone {
+                    plain(ui, &left_alone_line(name));
+                }
             }
             if !preview.unknown.is_empty() {
                 ui.add_space(6.0);
@@ -691,7 +743,9 @@ fn list(ui: &mut Ui, app: &mut App, preview: &ListPreview, keep: &mut bool) {
         plain(ui, &total);
     }
     button_row(ui, |ui| {
-        if widgets::button(ui, "Install these", ButtonKind::Main, count > 0).clicked() {
+        let any = !preview.add.is_empty();
+        if widgets::button(ui, "Install these", ButtonKind::Main, any).clicked() {
+            // What the listed addons require comes along by itself, as for any install.
             app.actions.push(Action::ConfirmList(preview.add.clone()));
             *keep = false;
         }
@@ -840,6 +894,63 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(unknown.total(), None, "nothing to add up");
+    }
+
+    fn brought(name: &str, size: u64, needed_by: &str) -> ListDep {
+        ListDep {
+            addon: listed(name, Channel::Stable, size),
+            needed_by: needed_by.to_owned(),
+        }
+    }
+
+    #[test]
+    fn what_a_list_brings_along_gets_its_own_line_and_counts_in_the_total() {
+        // The live catalog's sizes: Musician List requires Musician.
+        let mut preview = ListPreview {
+            add: vec![listed("Musician List", Channel::Stable, 87_310)],
+            brings: vec![brought("Musician", 101_799_121, "Musician List")],
+            ..Default::default()
+        };
+        assert_eq!(
+            preview.brings[0].line(),
+            "Also installs Musician (101.8 MB), which Musician List requires."
+        );
+        assert_eq!(preview.count(), 2);
+        assert_eq!(
+            preview.total().as_deref(),
+            Some("101.9 MB to download in all.")
+        );
+        preview
+            .brings
+            .push(brought("Somebody's Library", 0, "Musician List"));
+        assert_eq!(
+            preview.brings[1].line(),
+            "Also installs Somebody's Library, which Musician List requires."
+        );
+        assert_eq!(
+            preview.total().as_deref(),
+            Some("At least 101.9 MB to download in all."),
+            "a size the catalog doesn't give counts here too"
+        );
+        preview.brings[1].addon.channel = Channel::Beta;
+        assert_eq!(
+            preview.brings[1].line(),
+            "Also installs Somebody's Library (beta), which Musician List requires."
+        );
+    }
+
+    #[test]
+    fn an_entry_a_list_leaves_alone_says_why_in_its_own_note() {
+        assert_eq!(
+            left_alone_line("ShortKings"),
+            "Left alone: ShortKings, which the catalog now lists as another addon."
+        );
+        let preview = ListPreview {
+            left_alone: vec!["ShortKings".to_owned()],
+            ..Default::default()
+        };
+        assert_eq!(preview.count(), 0);
+        assert_eq!(preview.total(), None);
     }
 
     #[test]
