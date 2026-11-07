@@ -199,14 +199,7 @@ fn byline(ui: &mut Ui, author: &str) {
     if author.is_empty() {
         return;
     }
-    ui.add(
-        egui::Label::new(
-            RichText::new(format!("by {author}"))
-                .font(theme::label(14.0))
-                .color(theme::INK_SOFT),
-        )
-        .wrap(),
-    );
+    widgets::mixed_label(ui, &format!("by {author}"), 14.0, theme::INK_SOFT);
 }
 
 fn rule(ui: &mut Ui) {
@@ -337,14 +330,7 @@ fn addon_body(
 ) {
     if !addon.summary.is_empty() {
         widgets::section(ui, "Description");
-        ui.add(
-            egui::Label::new(
-                RichText::new(&addon.summary)
-                    .font(theme::label(15.5))
-                    .color(theme::INK),
-            )
-            .wrap(),
-        );
+        widgets::mixed_label(ui, &addon.summary, 15.5, theme::INK);
         ui.add_space(10.0);
     }
     details_sections(app, ui, addon);

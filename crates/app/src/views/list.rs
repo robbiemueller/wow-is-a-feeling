@@ -207,7 +207,10 @@ fn row_view(app: &App, row: &Row) -> RowView {
         }
         Row::Kit(i) => {
             let kit = bundle.and_then(|b| b.catalog.kits.get(*i as usize));
-            let count = kit.map_or(0, |k| k.addons.len());
+            let count = match (bundle, kit) {
+                (Some(bundle), Some(kit)) => model::kit_addons(kit, bundle, None).len(),
+                _ => 0,
+            };
             RowView {
                 name: kit.map_or(String::new(), |k| k.name.clone()),
                 color: theme::GOLD_DIM,
@@ -237,8 +240,8 @@ fn paint_row(ui: &Ui, r: Rect, resp: &Response, view: &RowView, selected: bool, 
         skin::v_gradient(
             &p,
             r,
-            Color32::from_rgb(92, 70, 22),
-            Color32::from_rgb(58, 44, 14),
+            Color32::from_rgb(76, 58, 18),
+            Color32::from_rgb(46, 35, 11),
         );
         p.rect_stroke(
             r,
@@ -264,7 +267,12 @@ fn paint_row(ui: &Ui, r: Rect, resp: &Response, view: &RowView, selected: bool, 
         Align2::RIGHT_CENTER,
         &view.tag,
         theme::strong(13.0),
-        view.tag_color,
+        // The dim version would disappear into the selection's gold.
+        if selected && view.tag_color == theme::TEXT_DIM {
+            theme::TEXT
+        } else {
+            view.tag_color
+        },
         r.width() * 0.45,
     );
     let name_room = tag_rect.min.x - r.min.x - indent - 8.0;

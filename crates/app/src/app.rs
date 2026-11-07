@@ -94,6 +94,8 @@ pub struct App {
 
     pub bundle: Option<Arc<CatalogBundle>>,
     pub catalog_status: CatalogStatus,
+    /// A fetch is on its way, even if a cached copy is already showing.
+    pub catalog_fetching: bool,
 
     pub folders: Vec<LocalFolder>,
     folder_lookup: HashMap<String, usize>,
@@ -109,6 +111,7 @@ pub struct App {
 
     pub tab: Tab,
     tab_chosen: bool,
+    default_tab_set: bool,
     pub section: Section,
     pub query: String,
     pub sort: SortBy,
@@ -155,6 +158,9 @@ pub struct App {
     script: Option<Script>,
     shot_frames: u32,
     shot_taken: bool,
+    hover_wait: bool,
+    /// Show the sort menu open on the next frame, for a screenshot.
+    pub open_sort: bool,
 }
 
 impl App {
@@ -209,6 +215,7 @@ impl App {
             write_problem: None,
             bundle: None,
             catalog_status: CatalogStatus::Loading,
+            catalog_fetching: false,
             folders: Vec::new(),
             folder_lookup: HashMap::new(),
             scanned: false,
@@ -220,6 +227,7 @@ impl App {
             updates: Vec::new(),
             tab: Tab::Browse,
             tab_chosen: false,
+            default_tab_set: false,
             section: Section::Game,
             query: String::new(),
             sort: SortBy::Popular,
@@ -261,6 +269,8 @@ impl App {
             script,
             shot_frames: 0,
             shot_taken: false,
+            hover_wait: false,
+            open_sort: false,
             launch,
         };
         if already_running {
@@ -284,7 +294,7 @@ impl App {
     fn start_real(&mut self) {
         let saved = self.state.current_install.clone();
         self.worker.find_game(self.launch.game.clone(), saved);
-        self.worker.load_catalog(self.state.catalog_etag.clone());
+        self.fetch_catalog();
         if self.state.settings.check_app_updates {
             self.worker.check_for_update(VERSION, false);
         }
@@ -423,6 +433,7 @@ impl App {
 
     fn apply_popup_flag(&mut self, name: &str) {
         match name {
+            "sort" => self.open_sort = true,
             "running" => self.popup = Some(Popup::AlreadyRunning),
             "update" => self.popup = Some(Popup::AppUpdate(Box::new(demo::update_info()))),
             "restore" => {
@@ -952,14 +963,15 @@ impl App {
         }
     }
 
+    pub fn fetch_catalog(&mut self) {
+        self.catalog_fetching = true;
+        self.worker.load_catalog(self.state.catalog_etag.clone());
+    }
+
     pub fn is_settled(&self) -> bool {
         let looked = !matches!(self.game_state, GameState::Searching);
         let scanned = self.game.is_none() || (self.scanned && !self.scan_running);
-        looked
-            && scanned
-            && self.catalog_status != CatalogStatus::Loading
-            && self.queue.is_idle()
-            && self.popup.is_none()
+        looked && scanned && !self.catalog_fetching && self.queue.is_idle() && self.popup.is_none()
     }
 
     /// Enqueue an op from outside `actions.rs`: a dropped zip or a batch's backup.
@@ -1069,6 +1081,7 @@ impl App {
                 match source {
                     CatalogSource::Cache => self.catalog_status = CatalogStatus::Cached,
                     CatalogSource::Network => {
+                        self.catalog_fetching = false;
                         self.catalog_status = CatalogStatus::Fresh;
                         self.state.catalog_etag = etag;
                         self.save_state();
@@ -1076,12 +1089,16 @@ impl App {
                 }
                 self.selection_changed();
             }
-            Event::CatalogUnchanged => self.catalog_status = CatalogStatus::Fresh,
+            Event::CatalogUnchanged => {
+                self.catalog_fetching = false;
+                self.catalog_status = CatalogStatus::Fresh;
+            }
             Event::CatalogFailed {
                 offline,
                 unpublished,
                 text,
             } => {
+                self.catalog_fetching = false;
                 if unpublished {
                     log::info!("No catalog is published yet: {text}");
                 } else {
@@ -1177,7 +1194,9 @@ impl App {
             }
         }
         self.local_dirty = true;
-        if !self.tab_chosen {
+        // The default tab is settled once, by the first look at the disk. Installing
+        // something later shouldn't pull the player away from Browse.
+        if !std::mem::replace(&mut self.default_tab_set, true) && !self.tab_chosen {
             let anything =
                 self.managed_map().is_some_and(|m| !m.is_empty()) || !self.folders.is_empty();
             let tab = if anything { Tab::MyAddons } else { Tab::Browse };
@@ -1309,6 +1328,14 @@ impl App {
             return;
         };
         let prev = record.managed.get(&id).cloned();
+        // The demo keeps no zips, so it pretends the previous version's is there.
+        let pretend_kept;
+        let kept = if self.demo {
+            pretend_kept = demo::kept_zips(&version, prev.as_ref());
+            pretend_kept.as_slice()
+        } else {
+            kept
+        };
         let new_record = ops::record_after_install(
             prev.as_ref(),
             ops::Installed {
@@ -1740,7 +1767,7 @@ impl App {
         self.shot_frames += 1;
         ctx.request_repaint();
         let waited = self.started.elapsed();
-        let hover_ready = self.launch.hover.is_none() || waited > Duration::from_millis(700);
+        let hover_ready = !self.hover_wait || waited > Duration::from_millis(700);
         let settled = self.demo || self.is_settled() || waited > Duration::from_secs(20);
         if self.shot_frames >= 8 && hover_ready && settled {
             self.shot_taken = true;
@@ -1792,13 +1819,14 @@ impl App {
     }
 
     /// For the test harness: keep the pointer over one spot.
-    pub fn input_hook(&self, raw: &mut egui::RawInput) {
-        if let Some([x, y]) = self.launch.hover {
+    pub fn input_hook(&mut self, raw: &mut egui::RawInput) {
+        // Once is enough. A pointer that keeps "moving" never gets a tooltip.
+        if let Some([x, y]) = self.launch.hover.take() {
             raw.events
                 .push(egui::Event::PointerMoved(egui::pos2(x, y)));
+            self.hover_wait = true;
         }
     }
-
 }
 
 impl eframe::App for App {

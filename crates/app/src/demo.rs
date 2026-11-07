@@ -284,6 +284,14 @@ pub fn update_info() -> UpdateInfo {
     }
 }
 
+/// The zips a real install would have kept, so rollback can be tried in the demo.
+pub fn kept_zips(version: &str, prev: Option<&ManagedAddon>) -> Vec<PathBuf> {
+    let zip = |v: &str| PathBuf::from(format!(r"C:\demo\zips\{v}.zip"));
+    let mut kept = vec![zip(version)];
+    kept.extend(prev.map(|p| zip(&p.version)));
+    kept
+}
+
 /// The last lines of a log that doesn't exist.
 pub fn log_lines() -> Vec<String> {
     vec!["2026-11-06 12:00:00Z [INFO] This is a demo, so nothing was logged.".to_owned()]

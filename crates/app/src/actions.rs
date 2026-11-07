@@ -565,7 +565,7 @@ impl App {
         if self.bundle.is_none() {
             self.catalog_status = model::CatalogStatus::Loading;
         }
-        self.worker.load_catalog(self.state.catalog_etag.clone());
+        self.fetch_catalog();
     }
 
     fn zip_dropped(&mut self, path: PathBuf) {

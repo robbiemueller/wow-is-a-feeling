@@ -214,29 +214,37 @@ fn paint_pwnage(painter: &egui::Painter, full: Rect) {
     let cell = (full.width() * 0.8 / columns).floor().clamp(4.0, 24.0);
     let word = vec2(columns * cell, 7.0 * cell);
     let top_left = pos2(full.center().x - word.x / 2.0, full.center().y - word.y / 2.0);
-    painter.rect_filled(
-        Rect::from_min_size(top_left, word).expand(cell * 1.5),
+    let plate = Rect::from_min_size(top_left, word).expand(cell * 1.5);
+    painter.rect_filled(plate, 4.0, Color32::from_black_alpha(225));
+    painter.rect_stroke(
+        plate,
         4.0,
-        Color32::from_black_alpha(190),
+        egui::Stroke::new(2.0, theme::GOLD_DIM),
+        egui::StrokeKind::Inside,
     );
-    for (index, letter) in LETTERS.iter().enumerate() {
-        let x = top_left.x + index as f32 * 6.0 * cell;
-        for (row, line) in letter.iter().enumerate() {
-            for (col, block) in line.bytes().enumerate() {
-                if block != b'#' {
-                    continue;
-                }
-                let at = pos2(x + col as f32 * cell, top_left.y + row as f32 * cell);
-                let rect = Rect::from_min_size(at, vec2(cell, cell));
-                painter.rect_filled(rect.translate(vec2(2.0, 2.0)), 0.0, Color32::BLACK);
-                painter.rect_filled(rect, 0.0, theme::GOLD);
-                painter.rect_filled(
-                    Rect::from_min_size(at, vec2(cell, (cell * 0.25).max(1.0))),
-                    0.0,
-                    Color32::from_rgb(255, 240, 150),
-                );
-            }
-        }
+    let blocks = || {
+        LETTERS.iter().enumerate().flat_map(move |(index, letter)| {
+            letter.iter().enumerate().flat_map(move |(row, line)| {
+                line.bytes().enumerate().filter_map(move |(col, block)| {
+                    (block == b'#').then(|| {
+                        let x = (index * 6 + col) as f32 * cell;
+                        Rect::from_min_size(top_left + vec2(x, row as f32 * cell), vec2(cell, cell))
+                    })
+                })
+            })
+        })
+    };
+    // Shadows first, so neighboring blocks melt into one solid letter.
+    let drop = (cell * 0.25).max(2.0);
+    for rect in blocks() {
+        painter.rect_filled(
+            rect.translate(vec2(drop, drop)),
+            0.0,
+            Color32::from_rgb(120, 60, 0),
+        );
+    }
+    for rect in blocks() {
+        painter.rect_filled(rect, 0.0, theme::GOLD);
     }
 }
 

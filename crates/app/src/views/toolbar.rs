@@ -119,6 +119,9 @@ fn sort_dropdown(app: &mut App, ui: &mut Ui, rect: Rect) {
         Stroke::NONE,
     ));
 
+    if std::mem::take(&mut app.open_sort) {
+        Popup::open_id(ui.ctx(), Popup::default_response_id(&response));
+    }
     Popup::menu(&response)
         .width(rect.width())
         .gap(2.0)

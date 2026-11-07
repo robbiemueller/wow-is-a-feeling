@@ -714,23 +714,14 @@ impl Worker {
                 op.folders.iter().cloned().collect()
             }
         };
-        let version = match &op.kind {
-            OpKind::Download { release, .. } => release.version.as_str(),
-            OpKind::Rollback { version, .. } => version.as_str(),
-            _ => "1.0",
-        };
         let outcome = InstallOutcome {
             folders,
             ..InstallOutcome::default()
         };
-        let kept = vec![
-            PathBuf::from(format!(r"C:\demo\zips\{version}.zip")),
-            PathBuf::from(r"C:\demo\zips\previous.zip"),
-        ];
         Ok(OpOutcome::Installed {
             local: None,
             outcome,
-            kept,
+            kept: Vec::new(),
         })
     }
 

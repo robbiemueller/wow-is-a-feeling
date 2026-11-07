@@ -3,7 +3,9 @@
 use crate::skin::{self, shadow_text};
 use crate::theme;
 use eframe::egui::{
-    self, Align2, Color32, CursorIcon, Rect, Response, Sense, Stroke, StrokeKind, Ui, Vec2, pos2,
+    self, Align2, Color32, CursorIcon, Rect, Response, Sense, Stroke, StrokeKind, TextFormat, Ui,
+    Vec2, pos2,
+    text::LayoutJob,
     vec2,
 };
 
@@ -14,13 +16,43 @@ pub enum ButtonKind {
     Quiet,
 }
 
+/// Text in the label face, with any numbers in the heavier one, because the label face's
+/// numerals read badly: its `0` looks like an `O`.
+pub fn mixed_job(text: &str, size: f32, color: Color32) -> LayoutJob {
+    let mut job = LayoutJob::default();
+    let mut append = |part: &str, number: bool| {
+        if part.is_empty() {
+            return;
+        }
+        let font = if number {
+            theme::strong(size)
+        } else {
+            theme::label(size)
+        };
+        job.append(part, 0.0, TextFormat::simple(font, color));
+    };
+    let mut start = 0;
+    let mut in_number = false;
+    for (at, c) in text.char_indices() {
+        let number = c.is_ascii_digit() || (in_number && matches!(c, '.' | ',' | '-' | '+'));
+        if number != in_number {
+            append(&text[start..at], in_number);
+            start = at;
+            in_number = number;
+        }
+    }
+    append(&text[start..], in_number);
+    job
+}
+
+/// Running text in the label face that may hold numbers, wrapped to fit.
+pub fn mixed_label(ui: &mut Ui, text: &str, size: f32, color: Color32) -> Response {
+    ui.add(egui::Label::new(mixed_job(text, size, color)).wrap())
+}
+
 /// The classic red button with gold lettering.
 pub fn button(ui: &mut Ui, text: &str, kind: ButtonKind, enabled: bool) -> Response {
-    let font = theme::label(14.0);
-    let galley = ui
-        .painter()
-        .layout_no_wrap(text.to_owned(), font.clone(), theme::GOLD);
-    let size = vec2((galley.size().x + 28.0).max(82.0), 26.0);
+    let size = vec2(button_width(ui, text), 26.0);
     let sense = if enabled {
         Sense::click()
     } else {
@@ -119,14 +151,14 @@ fn paint_button(
         Color32::from_rgb(130, 120, 104)
     };
     let at = rect.center() + if pressed { vec2(1.0, 1.0) } else { Vec2::ZERO };
-    shadow_text(
-        &painter,
-        at,
-        Align2::CENTER_CENTER,
-        text,
-        theme::label(14.0),
-        color,
+    let galley = painter.layout_job(mixed_job(text, 14.0, color));
+    let top_left = at - galley.size() / 2.0;
+    painter.galley_with_override_text_color(
+        top_left + vec2(1.0, 1.0),
+        galley.clone(),
+        theme::SHADOW,
     );
+    painter.galley(top_left, galley, color);
     if response.has_focus() {
         painter.rect_stroke(
             rect.expand(1.0),
@@ -271,9 +303,7 @@ pub fn tooltip_colored(ui: &mut Ui, text: &str, color: Color32) {
 
 /// How wide [`button`] would make this label.
 pub fn button_width(ui: &Ui, text: &str) -> f32 {
-    let galley = ui
-        .painter()
-        .layout_no_wrap(text.to_owned(), theme::label(14.0), theme::GOLD);
+    let galley = ui.painter().layout_job(mixed_job(text, 14.0, theme::GOLD));
     (galley.size().x + 28.0).max(82.0)
 }
 

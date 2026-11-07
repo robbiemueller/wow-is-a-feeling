@@ -142,16 +142,19 @@ pub fn clean_line(text: &str, max_chars: usize) -> String {
     let mut last_was_space = true;
     let mut kept = 0;
     for c in text.chars() {
-        let space = c.is_whitespace() || c.is_control() || is_format_control(c);
-        if space {
-            if !last_was_space && !is_format_control(c) {
+        if kept == max_chars {
+            break;
+        }
+        if is_format_control(c) {
+            continue;
+        }
+        if c.is_whitespace() || c.is_control() {
+            if !last_was_space {
                 out.push(' ');
+                kept += 1;
                 last_was_space = true;
             }
             continue;
-        }
-        if kept == max_chars {
-            break;
         }
         out.push(c);
         kept += 1;
