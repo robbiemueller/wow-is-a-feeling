@@ -786,7 +786,7 @@ impl Worker {
                 *lock
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                    crate::take_lock(&w.dirs().state_file);
+                    crate::take_lock(&w.dirs().state_file).ok().flatten();
             }
             w.send(Event::Relaunch(result));
         });

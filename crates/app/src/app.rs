@@ -181,11 +181,7 @@ impl App {
 
         let (tx, rx) = mpsc::channel();
         let demo = launch.demo;
-        let catalog_url = launch
-            .catalog_url
-            .clone()
-            .filter(|_| launch.test_rig)
-            .unwrap_or_else(|| CATALOG_URL.to_owned());
+        let catalog_url = catalog_url_for(&launch);
         let sim = Duration::from_millis(launch.sim_ms.unwrap_or(1200));
         let worker = Worker::new(
             ctx.clone(),
@@ -275,8 +271,10 @@ impl App {
             launch,
         };
         if already_running {
+            // The other copy owns everything. All this one does is say so and close.
             app.popup = Some(Popup::AlreadyRunning);
             app.game_state = GameState::NotFound;
+            app.shut_down = true;
             return app;
         }
         if app.managed_map().is_some_and(|m| !m.is_empty()) {
@@ -424,6 +422,7 @@ impl App {
             Tab::MyAddons => match self.game_state {
                 GameState::NotFound => PageKind::NoGame,
                 GameState::Searching => PageKind::Loading,
+                GameState::Found { .. } if !self.scanned => PageKind::Loading,
                 GameState::Found { .. } => {
                     let nothing_installed =
                         self.managed_map().is_none_or(BTreeMap::is_empty) && self.groups.is_empty();
@@ -544,8 +543,8 @@ impl App {
         if self.tab != tab {
             self.tab = tab;
             self.rows_dirty = true;
-            self.page_to_top = true;
             self.list_offset = 0.0;
+            self.selection_changed();
         }
         self.tab_chosen = true;
     }
@@ -594,11 +593,15 @@ impl App {
             .as_ref()
             .map(|game| game.install.root.clone())
             .unwrap_or_else(default_browse_folder);
-        self.popup = Some(Popup::Folder(Box::new(FolderBrowser {
+        let browser = Popup::Folder(Box::new(FolderBrowser {
             typed: start.display().to_string(),
             listing: None,
             waiting_for: Some(start.clone()),
-        })));
+        }));
+        // Something else on screen waits behind it. The folder is what's blocking the player.
+        if let Some(showing) = self.popup.replace(browser) {
+            self.popup_queue.push_front(showing);
+        }
         self.worker.list_dir(start);
     }
 
@@ -1176,6 +1179,16 @@ pub fn parse_selection(text: &str) -> Selection {
     }
 }
 
+/// Where to fetch the catalog. Only a test rig can point somewhere else, because a shortcut
+/// with a stranger's catalog in it would be a way to install a stranger's files.
+fn catalog_url_for(launch: &Launch) -> String {
+    launch
+        .catalog_url
+        .clone()
+        .filter(|_| launch.test_rig)
+        .unwrap_or_else(|| CATALOG_URL.to_owned())
+}
+
 fn default_browse_folder() -> PathBuf {
     if cfg!(windows) {
         return PathBuf::from(r"C:\Program Files (x86)");
@@ -1198,6 +1211,20 @@ mod tests {
         assert_eq!(
             parse_selection("gh:a/b"),
             Selection::Addon("gh:a/b".to_owned())
+        );
+    }
+
+    #[test]
+    fn only_a_test_rig_can_change_where_the_catalog_comes_from() {
+        let mut launch = Launch {
+            catalog_url: Some("https://stranger.example/catalog.json".to_owned()),
+            ..Launch::default()
+        };
+        assert_eq!(catalog_url_for(&launch), CATALOG_URL);
+        launch.test_rig = true;
+        assert_eq!(
+            catalog_url_for(&launch),
+            "https://stranger.example/catalog.json"
         );
     }
 

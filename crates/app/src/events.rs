@@ -55,10 +55,10 @@ impl App {
                 self.local_dirty = true;
                 if !self.tab_chosen {
                     self.tab = Tab::Browse;
-                    self.yellow(
-                        "Couldn't find WoW Forever. Open My Addons to choose your game folder.",
-                    );
                 }
+                self.yellow(
+                    "Couldn't find WoW Forever. Open My Addons to choose your game folder.",
+                );
             }
             Event::Recovered(Ok(lines)) => {
                 for line in lines {

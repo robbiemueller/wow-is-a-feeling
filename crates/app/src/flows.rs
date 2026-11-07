@@ -1878,17 +1878,27 @@ fn messages_fade_and_only_then_stop_asking_for_frames() {
 fn only_one_copy_can_hold_the_lock() {
     let dir = tempfile::tempdir().unwrap();
     let state_file = dir.path().join("config").join("state.json");
-    let first = crate::take_lock(&state_file);
-    assert!(first.is_some());
+    let first = crate::take_lock(&state_file).unwrap();
+    assert!(first.is_some(), "it really is held");
     assert!(
-        crate::take_lock(&state_file).is_none(),
+        crate::take_lock(&state_file).is_err(),
         "the second copy is told"
     );
     drop(first);
     assert!(
-        crate::take_lock(&state_file).is_some(),
+        crate::take_lock(&state_file).is_ok_and(|lock| lock.is_some()),
         "and it's free once the first has gone"
     );
+}
+
+#[test]
+fn a_lock_that_cannot_be_made_stops_nobody() {
+    let dir = tempfile::tempdir().unwrap();
+    // The config "folder" is a file, so the lock file can't be created in it.
+    let blocked = dir.path().join("config");
+    fs::write(&blocked, b"x").unwrap();
+    let lock = crate::take_lock(&blocked.join("state.json"));
+    assert!(lock.is_ok_and(|lock| lock.is_none()));
 }
 
 #[test]
@@ -1932,7 +1942,7 @@ fn a_second_copy_shows_only_the_already_running_popup() {
         matches!(app(&h).popup, Some(Popup::AlreadyRunning)),
         "nothing to go back to"
     );
-    drop(h);
+    close(h);
     let wrote: Vec<_> = fs::read_dir(dir.path()).unwrap().flatten().collect();
     assert!(
         wrote.is_empty(),

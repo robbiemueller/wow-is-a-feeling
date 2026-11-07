@@ -73,10 +73,14 @@ pub fn save_screenshot(ctx: &egui::Context, path: PathBuf, then_close: bool) {
     });
 }
 
-/// Hold the lock that says this is the one running copy. `None` means another copy has it.
-/// A lock that can't even be attempted, such as on a filesystem without locks, is no
-/// reason to stop anyone, so that counts as having it.
-pub fn take_lock(state_file: &Path) -> Option<File> {
+/// Another copy of the app holds the lock.
+#[derive(Debug)]
+pub struct AlreadyRunning;
+
+/// Become the one running copy, by holding this file locked for as long as the app runs.
+/// A lock that can't even be attempted, such as on a read-only disk or a filesystem without
+/// locks, is no reason to stop anyone, so that's `Ok(None)` and the app runs without one.
+pub fn take_lock(state_file: &Path) -> Result<Option<File>, AlreadyRunning> {
     let path = state_file.with_file_name(LOCK_FILE);
     if let Some(dir) = path.parent() {
         paths::ensure_dir(dir);
@@ -91,15 +95,15 @@ pub fn take_lock(state_file: &Path) -> Option<File> {
         Ok(file) => file,
         Err(e) => {
             log::warn!("Couldn't open {}: {e}", path.display());
-            return None;
+            return Ok(None);
         }
     };
     match file.try_lock() {
-        Ok(()) => Some(file),
-        Err(fs::TryLockError::WouldBlock) => None,
+        Ok(()) => Ok(Some(file)),
+        Err(fs::TryLockError::WouldBlock) => Err(AlreadyRunning),
         Err(fs::TryLockError::Error(e)) => {
             log::warn!("Couldn't lock {}: {e}", path.display());
-            Some(file)
+            Ok(None)
         }
     }
 }
@@ -217,8 +221,10 @@ fn main() {
     } else {
         logging::init(log::LevelFilter::Info);
         install_panic_hook();
-        let lock = take_lock(&dirs.state_file);
-        let already_running = lock.is_none();
+        let (lock, already_running) = match take_lock(&dirs.state_file) {
+            Ok(lock) => (lock, false),
+            Err(AlreadyRunning) => (None, true),
+        };
         let mut state = State::load_from(&dirs.state_file);
         if !already_running {
             state.stats.launches += 1;

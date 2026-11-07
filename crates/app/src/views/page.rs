@@ -4,7 +4,7 @@
 use crate::actions::Action;
 use crate::app::{App, PageKind};
 use crate::details_cache::Fetch;
-use crate::model::{self, CatalogStatus, MainButton, Selection, Tag, clean_line};
+use crate::model::{self, CatalogStatus, GameState, MainButton, Selection, Tag, clean_line};
 use crate::theme;
 use crate::widgets::{self, ButtonKind};
 use eframe::egui::{
@@ -762,10 +762,10 @@ fn no_catalog_page(app: &mut App, ui: &mut Ui, rect: Rect) {
 }
 
 fn loading_page(app: &mut App, ui: &mut Ui, rect: Rect) {
-    let message = if app.tab == model::Tab::MyAddons {
-        "Looking for WoW Forever..."
-    } else {
-        "Fetching the list of addons..."
+    let message = match (app.tab, &app.game_state) {
+        (model::Tab::MyAddons, GameState::Searching) => "Looking for WoW Forever...",
+        (model::Tab::MyAddons, _) => "Reading your AddOns folder...",
+        _ => "Fetching the list of addons...",
     };
     note_page(app, ui, rect, message);
 }
