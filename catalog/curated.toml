@@ -1,6 +1,9 @@
 # Hand-picked parts of the catalog. See docs/DESIGN.md.
 # Ids look like gh:owner/repo, wowi:1234 or direct:name. The builder drops any
 # reference that isn't in the catalog and warns about it.
+#
+# Everything named in this file or in seeds.toml counts as hand-picked: it always keeps
+# its name and folders against anything found by search, and the app may pick it by itself.
 
 # Shown first, in this order. Roughly what a new player sets up first.
 featured = [
@@ -24,6 +27,33 @@ featured = [
   "wowi:24165",
   "gh:cjber/shortest-path-forever",
   "wowi:8092",
+]
+
+# Folders of seeded repositories that have no entry yet, so a stranger can't take the
+# name before the real addon arrives. Anything not hand-picked that lists one of these,
+# or is named like one, is held out of the catalog. Gaps have their own lists below.
+# Taken from each repository's own tree. WeakAuras's folders are also what the hand-picked
+# Musca Auras installs into, see seeds.toml.
+reserved = [
+  "ArkInventory",
+  "Cell",
+  "Hekili",
+  "Kui_Media",
+  "Kui_Nameplates",
+  "Kui_Nameplates_Core",
+  "Kui_Nameplates_Core_Config",
+  "MidnightSimpleUnitFrames",
+  "MidnightSimpleUnitFrames_Options",
+  "MountsJournal",
+  "MountsJournalUI",
+  "OmniCC",
+  "OmniCC_Config",
+  "pfQuest",
+  "WeakAuras",
+  "WeakAurasArchive",
+  "WeakAurasModelPaths",
+  "WeakAurasOptions",
+  "WeakAurasTemplates",
 ]
 
 [[kits]]
@@ -53,66 +83,94 @@ addons = [
 name = "Leatrix Plus"
 reason = "It's only published on CurseForge, whose rules don't let a free app like this one offer it."
 website = "https://www.curseforge.com/wow/addons/leatrix-plus"
+folders = ["Leatrix_Plus"]
 alternatives = ["gh:Peterodox/Plumber", "gh:Stanzilla/AdvancedInterfaceOptions"]
 
 [[gaps]]
 name = "Leatrix Maps"
 reason = "It's only published on CurseForge, whose rules don't let a free app like this one offer it."
 website = "https://www.curseforge.com/wow/addons/leatrix-maps"
+folders = ["Leatrix_Maps"]
 alternatives = ["gh:openmap-world/openmap", "gh:Nevcairiel/Mapster"]
 
 [[gaps]]
 name = "Bagnon"
 reason = "Its packaged builds are only on CurseForge, whose rules don't let a free app like this one offer them."
 website = "https://www.curseforge.com/wow/addons/bagnon"
+folders = [
+  "Bagnon",
+  "Bagnon_Bank",
+  "Bagnon_Config",
+  "Bagnon_GuildBank",
+  "Bagnon_VoidStorage",
+  "BagBrother",
+]
 alternatives = ["gh:Cidan/BetterBags", "wowi:6488"]
 
 [[gaps]]
 name = "Baganator"
 reason = "It's only published on CurseForge and Wago, whose rules don't let a free app like this one offer it."
 website = "https://www.curseforge.com/wow/addons/baganator"
+folders = ["Baganator"]
 alternatives = ["gh:Cidan/BetterBags", "wowi:6488"]
 
 [[gaps]]
 name = "Auctionator"
 reason = "It's only published on CurseForge and Wago, whose rules don't let a free app like this one offer it."
 website = "https://www.curseforge.com/wow/addons/auctionator"
+folders = ["Auctionator"]
 alternatives = ["wowi:24165"]
 
 [[gaps]]
 name = "Platynator"
 reason = "It's only published on CurseForge and Wago, whose rules don't let a free app like this one offer it."
 website = "https://www.curseforge.com/wow/addons/platynator"
+folders = ["Platynator"]
 alternatives = ["gh:Tercioo/Plater-Nameplates", "gh:Backupiseasy/ThreatPlates"]
 
 [[gaps]]
 name = "AtlasLoot"
 reason = "Its Forever build is only on CurseForge, whose rules don't let a free app like this one offer it."
 website = "https://www.curseforge.com/wow/addons/atlasloot-forever"
+folders = [
+  "AtlasLoot",
+  "AtlasLootClassic",
+  "AtlasLootClassic_Collections",
+  "AtlasLootClassic_Crafting",
+  "AtlasLootClassic_Data",
+  "AtlasLootClassic_DungeonsAndRaids",
+  "AtlasLootClassic_Factions",
+  "AtlasLootClassic_Options",
+  "AtlasLootClassic_PvP",
+]
 alternatives = ["gh:arithmandar/Atlas", "direct:foreverdb"]
 
 [[gaps]]
 name = "DungeonJournal"
 reason = "It's only published on CurseForge, whose rules don't let a free app like this one offer it."
 website = "https://www.curseforge.com/wow/addons/dungeonjournal"
+folders = ["DungeonJournal", "ForeverDungeonJournal"]
 alternatives = ["gh:arithmandar/Atlas", "direct:foreverdb"]
 
 [[gaps]]
 name = "RareScanner"
 reason = "Its Forever build is only on CurseForge and Wago, whose rules don't let a free app like this one offer it."
 website = "https://www.curseforge.com/wow/addons/rarescanner"
+folders = ["RareScanner"]
 alternatives = ["gh:kemayo/wow-silverdragon"]
 
 [[gaps]]
 name = "BugGrabber"
 reason = "It's only published on CurseForge and Wago, whose rules don't let a free app like this one offer it."
 website = "https://www.curseforge.com/wow/addons/bug-grabber"
+folders = ["!BugGrabber"]
 alternatives = ["gh:funkydude/BugSack"]
 
 [[gaps]]
 name = "ForeverPlus"
 reason = "The original is only published on CurseForge, whose rules don't let a free app like this one offer it."
 website = "https://www.curseforge.com/wow/addons/foreverplus"
+folders = ["ForeverPlus"]
 alternatives = ["gh:xIGBClutchIx/ForeverPlusPlus", "gh:fallenguards/classicuiforever"]
 unrelated = ["gh:7hedubz/ForeverPlus"]
 
@@ -120,6 +178,7 @@ unrelated = ["gh:7hedubz/ForeverPlus"]
 name = "ForeverUI"
 reason = "The original is only published on CurseForge, whose rules don't let a free app like this one offer it."
 website = "https://www.curseforge.com/wow/addons/foreverui"
+folders = ["ForeverUI"]
 alternatives = ["gh:fallenguards/classicuiforever", "gh:EllesmereGaming/EllesmereUI"]
 unrelated = ["gh:morderous/foreverui"]
 
@@ -127,6 +186,7 @@ unrelated = ["gh:morderous/foreverui"]
 name = "ElvUI"
 reason = "Its ready-to-install build is only on Tukui's own site, which needs staff permission, and its GitHub tags are missing libraries."
 website = "https://github.com/tukui-org/ElvUI"
+folders = ["ElvUI", "ElvUI_Libraries", "ElvUI_Options"]
 alternatives = ["gh:EllesmereGaming/EllesmereUI", "gh:fallenguards/classicuiforever"]
 
 # Tags but no packaged zips. The app installs GitHub's source archive using the
@@ -229,3 +289,257 @@ name = "Raider.IO"
 
 [overrides."direct:foreverdb"]
 category = "misc"
+
+# WoWInterface listings that are the same addon as a GitHub repository, as listing id
+# and repository. Their counts add up and the listing stops being its own entry. This
+# table is the only thing that merges them: a repository can write any id or folder
+# name it likes, so neither proves anything. A listing that isn't here stays its own
+# entry, or is held if its name or main folder is already taken. Check catalog-held.json
+# for ones that belong here.
+#
+# First made from the merges in the published catalog in November 2026, with each pair
+# reviewed. 25159 went to brunohanss/Nauctions back then only because that name sorts
+# first. It's MooreaTv's listing, so it's on mooreatv/AuctionDB here.
+[merges]
+3896 = "arithmandar/Atlas"                                 # Atlas
+5086 = "BigWigsMods/BigWigs"                               # BigWigs (Boss Timers & Tools)
+5949 = "funkydude/ErrorMonster"                            # ErrorMonster
+5995 = "funkydude/BugSack"                                 # BugSack
+6096 = "davidmarshall15/Healbot"                           # HealBot Continued
+6308 = "rgd87/NugComboBar"                                 # NugComboBar
+6606 = "kemayo/wow-silverdragon"                           # SilverDragon
+6658 = "Synse/TTell"                                       # TTell
+7296 = "VgerMods/Pawn"                                     # Pawn
+7571 = "b-morgan/Skillet"                                  # Skillet
+7761 = "kemayo/wow-bankstack"                              # BankStack
+8149 = "parnic/ice-hud"                                    # IceHUD
+8306 = "Nevcairiel/Mapster"                                # Mapster
+8736 = "funkydude/BadBoy"                                  # BadBoy: Spam Blocker & Reporter
+8869 = "SFX-WoW/Masque_Caith"                              # Masque: Caith
+8870 = "SFX-WoW/Masque_Apathy"                             # Masque: Apathy
+8873 = "SFX-WoW/Masque_Entropy"                            # Masque: Entropy
+8875 = "SFX-WoW/Masque_Serenity"                           # Masque: Serenity
+8882 = "SFX-WoW/Masque_LiteStep"                           # Masque: LiteStep
+8900 = "SFX-WoW/Masque_Onyx"                               # Masque: Onyx
+8918 = "SFX-WoW/Masque_Gears"                              # Masque: Gears
+9085 = "tullamods/Dominos"                                 # Dominos
+9099 = "rgd87/NugEnergy"                                   # NugEnergy
+9101 = "funkydude/BasicMinimap"                            # BasicMinimap
+9105 = "funkydude/BasicComboPoints"                        # BasicComboPoints
+9381 = "Vladinator/wow-addon-dresser"                      # Dresser
+9577 = "BigWigsMods/LittleWigs"                            # LittleWigs
+9994 = "oUF-wow/oUF"                                       # oUF
+10440 = "rgd87/NugRunning"                                 # NugRunning
+10474 = "Addons-By-Neotron/ButtonBin"                      # ButtonBin
+10783 = "Legacy-of-Sylvanaar/prat-3-0"                     # Prat 3.0
+10855 = "ascott18/TellMeWhen"                              # TellMeWhen
+11177 = "BigWigsMods/Capping"                              # Capping
+11190 = "Nevcairiel/Bartender4"                            # Bartender4
+11290 = "funkydude/BasicChatMods"                          # BasicChatMods
+12097 = "SFX-WoW/Masque"                                   # Masque
+12373 = "Xruptor/LagBar"                                   # LagBar
+12374 = "Xruptor/LootRollMover"                            # LootRollMover
+12375 = "Xruptor/ChatInputTop"                             # ChatInputTop
+12596 = "kemayo/wow-dropthecheapestthing"                  # DropTheCheapestThing
+13188 = "p3lim-wow/Molinari"                               # Molinari
+13270 = "funkydude/BadBoy_Levels"                          # BadBoy Levels: Filter Whispers By Level
+13526 = "funkydude/BadBoy_CCleaner"                        # BadBoy CCleaner: Filter Crap From Chat
+14339 = "rgd87/Aptechka"                                   # Aptechka
+15049 = "Xruptor/RightClickSelfCast"                       # RightClickSelfCast
+15351 = "Xruptor/BagSync"                                  # BagSync
+15353 = "Xruptor/xanEXP"                                   # xanExp
+15636 = "tullamods/tullaRange"                             # tullaRange
+15683 = "Xruptor/xanDebuffTimers"                          # xanDebuffTimers
+15716 = "Nevcairiel/HandyNotes"                            # HandyNotes
+15749 = "Backupiseasy/ThreatPlates"                        # Threat Plates
+15903 = "funkydude/TargetPercent"                          # TargetPercent
+16006 = "Myrroddin/smartres2"                              # SmartRes2
+16915 = "Xruptor/xanDurability"                            # xanDurability
+16951 = "funkydude/BadBoy_Guilded"                         # BadBoy Guilded: Block Guild Advertising
+17033 = "silverwind/idTip"                                 # idTip
+17194 = "laric/broker_leveltime"                           # Broker Leveltime
+17406 = "Talryn/CharacterNotes"                            # Character Notes
+17474 = "Talryn/GuildSearch"                               # Guild Search
+17703 = "Talryn/PeaceAndQuiet"                             # Peace And Quiet
+17929 = "parnic/breakables"                                # Breakables
+18206 = "spartanui-wow/SpartanUI"                          # SpartanUI
+18256 = "Vladinator/wow-addon-friendlistcolors"            # Friend List Colors
+18342 = "Vladinator/wow-addon-advancedxpbar"               # Advanced XP Bar
+18787 = "Xruptor/XanChat"                                  # xanChat
+18819 = "Addons-By-Neotron/BulkMail"                       # Bulk Mail
+18867 = "Addons-By-Neotron/BulkMail2Inbox"                 # Bulk Mail Inbox
+18883 = "HizurosWoWAddOns/Broker_Everything"               # Broker Everything
+19112 = "Xruptor/xanTooltipHoudini"                        # xanTooltipHoudini
+19201 = "Xruptor/XanTooltipIcon"                           # xanTooltipIcon
+19255 = "Xruptor/xanBuffTimers"                            # xanBuffTimers
+19443 = "Xruptor/xanErrorDevourer"                         # xanErrorDevourer
+19598 = "Vladinator/wow-addon-miniloot"                    # MiniLoot
+20397 = "arithmandar/Atlas-Battlegrounds"                  # Atlas Battlegrounds
+20399 = "arithmandar/Atlas-Dungeon-Locations"              # Atlas Dungeon Locations
+20401 = "arithmandar/Atlas-Transportation"                 # Atlas Transportation
+20450 = "Vladinator/wow-addon-candybuckets"                # Candy Buckets
+20513 = "arithmandar/Atlas-Kalimdor-and-Eastern-Kingdoms"  # Atlas Classic WoW
+20838 = "p3lim-wow/QuickQuest"                             # QuickQuest
+21087 = "Xruptor/xanAchievementMover"                      # xanAchievementMover
+21134 = "funkydude/BadBoy_History"                         # BadBoy History
+21293 = "Nevcairiel/GatherMate2"                           # GatherMate2
+21376 = "Vladinator/wow-addon-battlepettabs"               # Battle Pet Tabs
+21538 = "funkydude/SexyMap"                                # SexyMap
+21687 = "funkydude/BasicBuffHide"                          # BasicBuffHide
+21820 = "Trufi/TrufiGCD"                                   # TrufiGCD
+22318 = "Myrroddin/sharedmedia-classicalfonts"             # SharedMedia ClassicalFonts
+23129 = "Addons-By-Neotron/SexyReputation"                 # Sexy Reputation
+23341 = "Vladinator/wow-addon-rollhistory"                 # RollHistory
+23464 = "p3lim-wow/ExtraQuestButton"                       # ExtraQuestButton
+23782 = "Total-RP/Storyline"                               # Storyline
+23875 = "Kiatra/BlizzMove"                                 # BlizzMove
+23921 = "TimothyLuke/GSE-Advanced-Macro-Compiler"          # GSE: Advanced Macro Compiler
+23948 = "arithmandar/Currency-Tracking"                    # Currency Tracking
+24026 = "Vladinator/wow-addon-taxitimer"                   # TaxiTimer
+24113 = "Total-RP/Total-RP-3"                              # Total RP 3
+24119 = "p3lim-wow/InteractiveWormholes"                   # Interactive Wormholes
+24293 = "funkydude/BadBoy_Ignore"                          # BadBoy Ignore: Infinite Global Ignore List
+24357 = "gOOvER/Name2Chat"                                 # Name2Chat
+24380 = "keyboardturner/TalentArt"                         # TalentArt
+24402 = "arithmandar/WorldMapTrackingEnhanced"             # World Map Tracking Enhanced
+24410 = "SFX-WoW/Masque_Cirque"                            # Masque: Cirque
+24465 = "Total-RP/Total-RP-3-Extended"                     # Total RP 3: Extended
+24498 = "Myrroddin/elvui_progressive_databars_colours"     # ElvUI Progressive DataBars Colors
+24629 = "nyyr/ArcHUD3"                                     # ArcHUD3
+24714 = "seblindfors/Immersion"                            # Immersion
+24716 = "rgd87/NugCast"                                    # NugCast
+24732 = "Xruptor/xanSoundAlerts"                           # xanSoundAlerts
+24813 = "funkydude/SharedMedia_Noto"                       # SharedMedia Noto (International Fonts)
+24842 = "Xruptor/xanGoldMine"                              # xanGoldMine
+24941 = "Talryn/AutoCombatLogger"                          # AutoCombatLogger
+24950 = "Talryn/Alts"                                      # Alts
+25000 = "rgd87/ClassicSpellActivations"                    # ClassicSpellActivations
+25002 = "Stanzilla/AdvancedInterfaceOptions"               # AdvancedInterfaceOptions
+25031 = "fusionpit/WhatsTraining"                          # What's Training?
+25045 = "funkydude/MuteSoundFile"                          # MuteSoundFile
+25073 = "Vladinator/wow-addon-compactvendor"               # Compact Vendor
+25078 = "mooreatv/BetterVendorPrice"                       # Better Vendor Price
+25079 = "corporategoth/rotationmaster"                     # Rotation Master
+25159 = "mooreatv/AuctionDB"                               # Auction House DataBase (AHDB) Classic
+25223 = "Xianghar/TotemTimers_Classic"                     # TotemTimers Classic
+25251 = "Jademalo/SurroundFix"                             # SurroundFix
+25313 = "moody/Dejunk"                                     # Dejunk
+25328 = "IrcDirk/Carbonite-All-in-One-Retail-Classic"      # Carbonite All in One (Retail & Classic)
+25348 = "AssisrMatheus/TodoChecklister"                    # TodoChecklister
+25349 = "AssisrMatheus/TodoChecklister"                    # TodoChecklister
+25392 = "Myrroddin/libaboutpanel-2.0"                      # LibAboutPanel-2.0
+25415 = "Meorawr/TextureAtlasViewer"                       # Texture Atlas Viewer
+25488 = "rgd87/NugKeyFeedback"                             # NugKeyFeedback
+25658 = "SFX-WoW/AceGUI-3.0_SFX-Widgets"                   # AceGUI-3.0: SFX Widgets
+25687 = "wind-addons/ElvUI_WindTools"                      # ElvUI WindTools
+25707 = "NinerBull/NPCRPGossip"                            # Hidden NPC Gossip Enabler
+25814 = "santipaprika/SessionTime"                         # Session Time
+25942 = "Xruptor/CVarsBackup"                              # CVarsBackup
+25986 = "CDAGaming/CraftPresence-Wow-Edition"              # CraftPresence
+26065 = "BigWigsMods/BigWigs_Countdown_HeroesOfTheStorm"   # BigWigs Countdown: Heroes of the Storm
+26066 = "BigWigsMods/BigWigs_Countdown_Overwatch"          # BigWigs Countdown: Overwatch
+26083 = "MotherGinger/RecklessAbandon"                     # Reckless Abandon
+26181 = "dekallo/MapPinTimers"                             # Map Pin Timers
+26188 = "Vladinator/wow-addon-chatemotes"                  # Chat Emotes
+26189 = "Vladinator/wow-addon-chatemotes-discord"          # Chat Emotes (Discord)
+26190 = "Vladinator/wow-addon-chatemotes-twitch"           # Chat Emotes (Twitch)
+26235 = "raethkcj/RatingBuster"                            # RatingBuster Classic
+26240 = "keyboardturner/Hearthbag"                         # Hearthbag
+26245 = "arithmandar/Coordinates-Tracking"                 # Coordinates Tracking
+26252 = "RGXMods/FinalFantasyLevelUp"                      # RGX | Final Fantasy Level-Up!
+26253 = "RGXMods/FortniteLevelUp"                          # RGX | Fortnite Level-Up!
+26254 = "RGXMods/KingdomHearts3LevelUp"                    # RGX | Kingdom Hearts 3 Level-Up!
+26255 = "RGXMods/LeagueOfLegendsLevelUp"                   # RGX | League of Legends Level-Up!
+26256 = "RGXMods/MinecraftLevelUp"                         # RGX | Minecraft Level-Up!
+26257 = "RGXMods/MaplestoryLevelUp"                        # RGX | Maplestory Level-Up!
+26258 = "RGXMods/ModernWarfare2LevelUp"                    # RGX | Modern Warfare 2 Level-Up!
+26259 = "RGXMods/MorrowindLevelUp"                         # RGX | Morrowind Level-Up!
+26260 = "RGXMods/RunescapeLevelUp"                         # RGX | Runescape Level-Up!
+26261 = "RGXMods/PokemonLevelUp"                           # RGX | Pokemon Level-Up!
+26262 = "RGXMods/PathOfExileLevelUp"                       # RGX | Path of Exile Level-Up!
+26263 = "RGXMods/SonicTheHedgehogLevelUp"                  # RGX | Sonic The Hedgehog Level-Up!
+26264 = "RGXMods/SuperMarioBros3LevelUp"                   # RGX | Super Mario Bros. 3 Level-Up!
+26265 = "RGXMods/SkyrimLevelUp"                            # RGX | Skyrim Level-Up!
+26266 = "RGXMods/Warcraft3LevelUp"                         # RGX | Warcraft 3 Level-Up!
+26319 = "RGXMods/ReputationLevelUp"                        # RGX | Reputation Level-Up!
+26323 = "RGXMods/FinalFantasyRepUp"                        # RGX | Final Fantasy Rep Up!
+26329 = "xod-wow/LiteMount"                                # LiteMount
+26337 = "mooreatv/MAMA-multiboxing"                        # MAMA Multiboxing
+26354 = "Oppzippy/GlobalSearch"                            # Global Search
+26357 = "Caerdon/CaerdonWardrobe"                          # Caerdon Wardrobe
+26369 = "SFX-WoW/Masque_Fusion"                            # Masque: Fusion
+26382 = "Myrroddin/price-answer"                           # Price Answer for TradeSkillMaster
+26415 = "BujuArena/AutoGear"                               # AutoGear
+26417 = "RodiScheele/KeyBindProfiles"                      # KeyBindProfiles
+26430 = "Oppzippy/AutoPayout"                              # Auto Payout
+26439 = "Meorawr/AddonLocale"                              # AddonLocale
+26455 = "SFX-WoW/Masque_Dominos"                           # Masque: Dominos
+26456 = "p3lim-wow/LibEditMode"                            # LibEditMode
+26457 = "Azeroth-Pilot-Reloaded/azeroth-pilot-reloaded"    # Azeroth Pilot Reloaded
+26459 = "NinerBull/AccWideUILayoutSelection"               # Account Wide Interface Settings
+26475 = "keyboardturner/LoreItemTooltips"                  # Lore Item Tooltips
+26476 = "keyboardturner/SlowFaller"                        # SlowFaller
+26477 = "keyboardturner/totalRP3_UnitFrames"               # Total RP 3: Unit Frames
+26478 = "keyboardturner/GossipChatter"                     # GossipChatter
+26479 = "keyboardturner/WipeBarsConfirm"                   # WipeBarsConfirm
+26480 = "keyboardturner/TargetSwapSound"                   # TargetSwapSound
+26481 = "keyboardturner/Stay-Sheathed-Lite"                # Stay Sheathed Lite
+26482 = "keyboardturner/MovableObjectiveFrame"             # Movable Objective Frame
+26483 = "keyboardturner/MovableMenuFrames"                 # MovableMenuFrames
+26484 = "keyboardturner/MovableBagFrames"                  # MovableBagFrames
+26485 = "keyboardturner/Joke"                              # Joke
+26486 = "keyboardturner/heck-trade-chat"                   # Heck Trade Chat
+26494 = "SFX-WoW/Masque_Squarish"                          # Masque: Squarish
+26502 = "kstange/MasqueBlizzBars"                          # Masque Blizzard Bars
+26503 = "kstange/MasqueBlizzInv"                           # Masque Blizzard Inventory
+26505 = "kstange/OPieMasque"                               # OPie Masque
+26522 = "kapresoft/wow-addon-actionbar-plus"               # ActionbarPlus
+26545 = "NinerBull/tRP3_RPNameInQuests"                    # Total RP 3: RP Name in Quest Text
+26560 = "cloudbells/MakeRoomClassic"                       # MakeRoomClassic
+26570 = "kstange/MerchantPlus"                             # Merchant Plus
+26577 = "Jods-GH/CustomNames"                              # LibCustomNames-1.0.0
+26587 = "BrenoLudgero/Auction_House_Notifications"         # Auction House Notifications
+26603 = "BrenoLudgero/Floating_Combat_Text_Fix"            # Floating Combat Text Fix
+26633 = "keyboardturner/Languages"                         # Languages
+26644 = "1onar/KeyUI"                                      # KeyUI
+26687 = "martinbjeldbak/Shotta"                            # Shotta
+26689 = "Myrroddin/betterbags-hearthstones"                # BetterBags - Hearthstones
+26788 = "NinerBull/BlockBlizzChatChannels"                 # Block Blizzard Chat Channels
+26797 = "keyboardturner/DarkModeSpellBook"                 # Dark Mode Spellbook
+26799 = "McTalian-WoW-Addons/RPGLootFeed"                  # RPGLootFeed
+26811 = "keyboardturner/Lorekeeper"                        # Lorekeeper
+26826 = "ZelionGG/XIV_Databar-Continued"                   # XIV Databar Continued
+26832 = "muhmiauwauWOW/MacroSearch"                        # MacroSearch
+26834 = "muhmiauwauWOW/ColorTools"                         # ColorTools Color Picker
+26837 = "muhmiauwauWOW/AuctionHouseCustomCategories"       # Auction House - Custom Categories
+26844 = "will0w7/MoneyLooter"                              # MoneyLooter - Loot and Gold Farm Tracker Addon
+26874 = "Vladinator/wow-addon-addonpresets"                # AddOnPresets
+26933 = "Raenore/Sippy-Cup"                                # Sippy Cup
+26937 = "goobyspace/shortwave"                             # Shortwave
+26957 = "RGXMods/SimpleQuestPlates"                        # RGX | Simple Quest Plates!
+26962 = "berickus/LootAppraiserReloaded"                   # LootAppraiser Reloaded
+26975 = "LoyalFTW/CrossGambling"                           # Cross Gambling
+26992 = "SFX-WoW/Masque_Darion"                            # Masque: Darion
+26994 = "Furydins/EasyExperienceBar"                       # Easy Experience Bar
+27010 = "RodiScheele/NiceDamage"                           # NiceDamage (Reloaded)
+27015 = "Furydins/EasyReminders"                           # EasyReminders [Flasks, Food, Holidays]
+27060 = "Raenore/Eavesdropper"                             # Eavesdropper
+27090 = "Ciaanh/XPBarEnhanced"                             # XP Bar Enhanced
+27121 = "DukulWoW/BigNoteBox"                              # BigNoteBox
+27142 = "oxedtv/OxedHub"                                   # Oxed Hub
+27180 = "NerdyBertie/Itemwatch"                            # ItemWatch & Shopping List
+27181 = "Myrroddin/libresinfo-2.0"                         # LibResInfo-2.0
+27216 = "wyomarus/Wayfinder"                               # Wayfinder
+27222 = "thezephyrsong/ModernMapMarkers"                   # ModernMapMarkers
+27228 = "Synse/CozyFire"                                   # CozyFire - Camping tooltips and Campfire tracker
+27237 = "arithmandar/LibCurrencyInfo"                      # LibCurrencyInfo
+27251 = "SMoRG75/SMoRGsQoL"                                # SMoRGs QoL
+27254 = "R41z0r/LuaWorkbench"                              # LuaWorkbench
+27262 = "Sectimus/HighFidelityWorldMap"                    # High Fidelity World Map
+27266 = "xenulive/wow-pvp-history"                         # PVPHistory
+27267 = "MerchantClassGaming/PocketCFO"                    # Pocket CFO
+27272 = "jkc-be/goldbook-addon"                            # Goldbook
+27277 = "Synse/Reload"                                     # Reload - Slash commands and a keybind for reloading your ui
+27279 = "Clausi/gryphonChat"                               # Gryphon Chat
+27284 = "magnusnilsen/gutsaga"                             # Sagalore
+27287 = "RGXMods/RGX-Framework"                            # RGX | RGX-Framework

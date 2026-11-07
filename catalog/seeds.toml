@@ -176,6 +176,10 @@ repos = [
   "xod-wow/LiteMount",
   "Xruptor/BagSync",
   "ZelionGG/XIV_Databar-Continued",
+  # A port of WeakAuras to Forever under its own name. It installs into WeakAuras's own
+  # folders, which curated.toml reserves, so it has to be picked by hand to stay listed.
+  # Rethink this one if WeakAuras itself gets a Forever build: both would claim the folders.
+  "dldvlpr-addons-wow/Musca-Auras",
 ]
 
 # WoWInterface only. Keep this short: --wowi-limit always includes these.

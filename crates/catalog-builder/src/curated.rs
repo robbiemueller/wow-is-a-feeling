@@ -10,13 +10,14 @@ use feeling_core::toc::TOC_SUFFIXES;
 use serde::{Deserialize, Serialize};
 
 use crate::detect::{Flavor, flavor_of, tag_is_prerelease};
+use crate::gate::is_safe_folder;
 use crate::github::{self, RepoInfo};
 use crate::http::{Channel, Http, unix_now};
 use crate::model::{Candidate, ZipScan};
 use crate::rangezip::{HttpRange, RangeReader};
 use crate::text::{
     clean_author, clean_name, clean_summary, clean_version, encode_path, round_sig,
-    says_nothing_new,
+    says_nothing_new, valid_repo_name,
 };
 use crate::zipscan::{parse_toc, scan_zip};
 
@@ -50,6 +51,14 @@ pub struct Curated {
     pub overrides: BTreeMap<String, Override>,
     #[serde(default)]
     pub exclude: Exclude,
+    /// Folders of seeded repositories with no entry yet. Only something hand-picked may
+    /// claim these, or a name that reads the same.
+    #[serde(default)]
+    pub reserved: Vec<String>,
+    /// WoWInterface listing id to the repository it's approved to merge into. Nothing
+    /// else merges a listing, whatever a repository's own files claim.
+    #[serde(default)]
+    pub merges: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -59,6 +68,11 @@ pub struct GapSpec {
     pub reason: String,
     #[serde(default)]
     pub website: Option<String>,
+    /// The addon's real folder names, written by hand: `Leatrix_Plus` for Leatrix Plus,
+    /// `!BugGrabber` for BugGrabber. Reserved like [`Curated::reserved`], so that nobody
+    /// but a hand-picked entry can step into the gap.
+    #[serde(default)]
+    pub folders: Vec<String>,
     #[serde(default)]
     pub alternatives: Vec<String>,
     /// Catalog ids that share this name but are different projects, so finding
@@ -155,6 +169,66 @@ impl Curated {
                 .iter()
                 .any(|r| r.eq_ignore_ascii_case(repo))
     }
+
+    /// Whether this catalog id is left out on purpose, by name or by owner.
+    pub fn excludes_id(&self, id: &str) -> bool {
+        self.exclude.ids.iter().any(|x| x.eq_ignore_ascii_case(id))
+            || id
+                .strip_prefix("gh:")
+                .is_some_and(|r| self.excludes_repo(r))
+    }
+
+    fn mistake(&self) -> Option<String> {
+        for (id, repo) in &self.merges {
+            if id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()) {
+                return Some(format!("merges: {id} isn't a WoWInterface id"));
+            }
+            if !valid_repo_name(repo) {
+                return Some(format!("merges: {repo} isn't owner/repo"));
+            }
+        }
+        let gap_folders = self.gaps.iter().flat_map(|gap| gap.folders.iter());
+        gap_folders
+            .chain(self.reserved.iter())
+            .find(|folder| !is_safe_folder(folder))
+            .map(|folder| format!("{folder} can't be a folder name"))
+    }
+}
+
+/// Everything a person chose: `seeds.toml`, what `curated.toml` names, and both sides
+/// of an approved merge. Always beats anything found by search.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct HandPicked {
+    ids: BTreeSet<String>,
+}
+
+impl HandPicked {
+    pub fn new(seeds: &Seeds, curated: &Curated) -> Self {
+        let repo = |name: &str| format!("gh:{name}");
+        let named = curated
+            .featured
+            .iter()
+            .chain(curated.kits.iter().flat_map(|kit| kit.addons.iter()))
+            .chain(curated.overrides.keys())
+            .chain(curated.gaps.iter().flat_map(|gap| gap.alternatives.iter()))
+            .chain(curated.gaps.iter().flat_map(|gap| gap.unrelated.iter()))
+            .cloned();
+        let ids = named
+            .chain(seeds.repos.iter().map(|name| repo(name)))
+            .chain(seeds.wowi.iter().map(|id| format!("wowi:{id}")))
+            .chain(curated.source.iter().map(|spec| repo(&spec.repo)))
+            .chain(curated.direct.iter().map(|spec| spec.id.clone()))
+            .chain(curated.merges.keys().map(|id| format!("wowi:{id}")))
+            .chain(curated.merges.values().map(|name| repo(name)))
+            .map(|id| id.to_ascii_lowercase())
+            .collect();
+        Self { ids }
+    }
+
+    /// Whether a catalog id was chosen by hand. Case doesn't matter.
+    pub fn contains(&self, id: &str) -> bool {
+        self.ids.contains(&id.to_ascii_lowercase())
+    }
 }
 
 pub fn load_seeds(path: &Path) -> Result<Seeds, String> {
@@ -164,7 +238,12 @@ pub fn load_seeds(path: &Path) -> Result<Seeds, String> {
 
 pub fn load_curated(path: &Path) -> Result<Curated, String> {
     let text = read_config(path)?;
-    toml::from_str(&text).map_err(|e| format!("{} has a mistake in it: {e}", path.display()))
+    let curated: Curated = toml::from_str(&text)
+        .map_err(|e| format!("{} has a mistake in it: {e}", path.display()))?;
+    match curated.mistake() {
+        Some(problem) => Err(format!("{} has a mistake in it: {problem}", path.display())),
+        None => Ok(curated),
+    }
 }
 
 fn read_config(path: &Path) -> Result<String, String> {
@@ -1134,7 +1213,52 @@ mod tests {
                 "{id} isn't a catalog id"
             );
         }
+        for gap in &curated.gaps {
+            assert!(
+                !gap.folders.is_empty(),
+                "{} needs its real folder names",
+                gap.name
+            );
+        }
+        let folders_of = |name: &str| {
+            let gap = curated.gaps.iter().find(|gap| gap.name == name).unwrap();
+            gap.folders.clone()
+        };
+        assert_eq!(folders_of("Leatrix Plus"), ["Leatrix_Plus"]);
+        assert_eq!(folders_of("BugGrabber"), ["!BugGrabber"]);
+        assert!(folders_of("ElvUI").contains(&"ElvUI_Options".to_string()));
+        assert!(curated.reserved.contains(&"WeakAuras".to_string()));
+        assert!(curated.reserved.contains(&"pfQuest".to_string()));
+
+        assert!(curated.merges.len() >= 240, "today's reviewed merges");
+        assert_eq!(curated.merges["25159"], "mooreatv/AuctionDB");
+        assert!(
+            !curated
+                .merges
+                .values()
+                .any(|repo| repo.eq_ignore_ascii_case("brunohanss/Nauctions")),
+            "a repository that copied a listing's id doesn't get the listing"
+        );
+
+        let picks = HandPicked::new(&seeds, &curated);
+        for id in [
+            "gh:Questie/Questie",
+            "GH:QUESTIE/QUESTIE",
+            "wowi:7032",
+            "direct:foreverdb",
+            "gh:tukui-org/ElvUI",
+            "gh:Legacy-of-Sylvanaar/prat-3-0",
+            "gh:oUF-wow/oUF",
+            "wowi:9994",
+            "gh:dldvlpr-addons-wow/Musca-Auras",
+        ] {
+            assert!(picks.contains(id), "{id} should be hand-picked");
+        }
+        for id in ["gh:brunohanss/Nauctions", "gh:zebra/TomTom", "wowi:1"] {
+            assert!(!picks.contains(id), "{id} shouldn't be hand-picked");
+        }
         assert!(curated.excludes_repo("HIPPULI/anything"));
+        assert!(curated.excludes_id("gh:HIPPULI/anything"));
         let known: Vec<&str> = feeling_core::catalog::CATEGORIES
             .iter()
             .map(|(id, _)| *id)
@@ -1157,6 +1281,17 @@ mod tests {
         let error = load_curated(&path).unwrap_err();
         assert!(error.contains("mistake"), "{error}");
         assert!(load_seeds(&dir.path().join("missing.toml")).is_err());
+
+        for wrong in [
+            "[merges]\nabc = \"a/b\"\n",
+            "[merges]\n12 = \"not a repo\"\n",
+            "reserved = [\"../evil\"]\n",
+            "[[gaps]]\nname = \"G\"\nreason = \"R.\"\nfolders = [\"a/b\"]\n",
+        ] {
+            std::fs::write(&path, wrong).unwrap();
+            let error = load_curated(&path).unwrap_err();
+            assert!(error.contains("mistake"), "{wrong}: {error}");
+        }
     }
 
     #[test]
