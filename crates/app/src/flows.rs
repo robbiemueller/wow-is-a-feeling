@@ -175,6 +175,7 @@ fn publish_bundle(
         tier: 3,
         downloads: 100,
         trusted: true,
+        reviewed: true,
         ..Default::default()
     }
 }
@@ -960,6 +961,53 @@ fn a_required_addon_from_a_stranger_stays_out_and_the_player_is_told() {
     assert_eq!(rig.version_on_disk("Bar").as_deref(), Some("1.0"));
     assert!(!rig.addons().join("Foo").exists());
     assert!(managed(&h, FOO).is_none());
+}
+
+#[test]
+fn a_required_addon_nobody_reviewed_is_left_for_the_player_to_install() {
+    let rig = Rig::new();
+    // Old enough to trust, but no person picked it, and it could be anyone's Foo.
+    let mut foo = publish_addon(&rig.site, FOO, "Foo", "1.0");
+    foo.reviewed = false;
+    let mut bar = publish_addon(&rig.site, BAR, "Bar", "1.0");
+    bar.deps = vec!["Foo".to_owned()];
+    let mut catalog = catalog_of(vec![foo, bar]);
+    catalog.featured = vec![BAR.to_owned()];
+    rig.site.publish(&catalog);
+
+    let mut h = rig.launch_settled();
+    click(&mut h, "Bar Addon, 1.0");
+    assert!(has_label(&h, "Foo Addon"), "Requires still names the pick");
+    assert!(
+        has_label(&h, crate::views::page::INSTALL_IT_YOURSELF),
+        "and says an install won't add it"
+    );
+    click(&mut h, "Install");
+    assert!(app(&h).popup.is_none());
+    assert!(said(
+        &h,
+        "Bar Addon requires Foo Addon, which wasn't added because nobody has reviewed it. \
+         Click it under Requires on the Bar Addon page to see who made it, and install it \
+         yourself."
+    ));
+    finish_ops(&mut h);
+    assert_eq!(rig.version_on_disk("Bar").as_deref(), Some("1.0"));
+    assert!(!rig.addons().join("Foo").exists());
+    assert!(managed(&h, FOO).is_none());
+
+    // The link still goes to it, so the player can see who made it and add it from there.
+    click(&mut h, "My Addons");
+    click(&mut h, "Bar Addon, 1.0");
+    click(&mut h, "Foo Addon");
+    assert_eq!(app(&h).page_kind(), PageKind::Addon(FOO.to_owned()));
+    click(&mut h, "Install");
+    finish_ops(&mut h);
+    assert_eq!(rig.version_on_disk("Foo").as_deref(), Some("1.0"));
+    click(&mut h, "Bar Addon, 1.0");
+    assert!(
+        !has_label(&h, crate::views::page::INSTALL_IT_YOURSELF),
+        "nothing left to do"
+    );
 }
 
 #[test]

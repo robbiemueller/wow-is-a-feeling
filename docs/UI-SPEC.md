@@ -46,7 +46,7 @@ Keyboard: Up and Down move the selection and skip headers, Enter activates the m
 
 **Catalog addon:**
 - Name in the display face, "by author", the hand-drawn rule.
-- Description (summary), then Details: Version, Updated, Size, Source (who it really comes from, "GitHub: owner/repo" or "WoWInterface", linking there), Folders, Requires (required addons by name, the same pick an install would make; click to select). Display names aren't unique, so the repo is the only real signal.
+- Description (summary), then Details: Version, Updated, Size, Source (who it really comes from, "GitHub: owner/repo" or "WoWInterface", linking there), Folders, Requires (required addons by name, the same pick an install would make; click to select). One an install would leave out, because nobody has reviewed it, says "(install it yourself)". Display names aren't unique, so the repo is the only real signal.
 - An entry the catalog doesn't mark `trusted` adds one note under Details: "New in the catalog. Nobody has reviewed it, so check who made it before you install."
 - Then Screenshots (up to 3, decoded on a worker with a 5 MB and 4096 px limit, scaled to at most 640 px wide, textures freed when evicted), then About (README text, fetched on demand after a 300 ms pause on the selection, cached for the last 64 addons), then Changelog (collapsed). A README can run long, so the pictures come first.
 - Fetch failures just leave those sections out and say so in small text. The page must stay usable offline.
@@ -65,7 +65,7 @@ Keyboard: Up and Down move the selection and skip headers, Enter activates the m
 ## Installing
 
 - Up to 3 operations run at once. Two operations whose folders overlap never run together.
-- Before an install: `deps::resolve`. Required addons install first and get a yellow message. Only a trusted entry is picked by itself, and downloads never rank a stranger over it. A required folder nothing trusted provides gets a yellow warning telling the player to look for it themselves, and the install goes ahead.
+- Before an install: `deps::resolve`. Required addons install first and get a yellow message. Only a trusted entry is picked, and downloads never rank a stranger over it. The pick installs by itself only when it's also reviewed (hand-picked), because any addon can ship a library's folder name long before anything needs it. A pick nobody reviewed stays out with a yellow line naming it and the page whose Requires line links to it, so the player can see who made it and install it themselves. A required folder nothing trusted provides gets a yellow warning telling the player to look for it themselves. Either way the install goes ahead.
 - Before queuing a catalog install or update: compare its folders with the disk. See Replacing folders.
 - Before an update batch: if `backup_wtf` is on and `should_backup` says so, back up WTF first. The casting bar shows it.
 - If the game is running: a yellow message, not a block: "WoW is running. Type /reload in game to load updates. New addons appear after restarting the game." WTF restore is blocked while it's running.

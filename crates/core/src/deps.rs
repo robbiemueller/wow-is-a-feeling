@@ -50,12 +50,30 @@ pub struct Resolution {
     /// Required folders that nothing installed provides and no trusted catalog entry does
     /// either. The player has to look for these themselves.
     pub missing: Vec<String>,
+    /// Required folders whose pick is trusted but was never reviewed by a person, so it
+    /// isn't installed by itself. The player can open it from the Requires line and decide.
+    pub unreviewed: Vec<Unreviewed>,
+}
+
+/// A required addon left for the player to install, because nobody reviewed its entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unreviewed {
+    /// The addon whose TOC requires it, which is the page whose Requires line links to it.
+    pub needed_by: String,
+    /// The folder, spelled the way that TOC spells it.
+    pub folder: String,
+    /// The entry the app picked for the folder, the same one the Requires line shows.
+    pub provider: String,
 }
 
 /// Work out what installing `addon_id` needs, walking required dependencies
 /// transitively. Folders in `installed_folders` count as satisfied, along with
 /// anything they would have needed. The requested addon is always included, so the
 /// same call serves a first install, an update and a repair.
+///
+/// A dependency joins the plan only when its pick is reviewed as well as trusted: any addon
+/// can ship a library's folder name long before anything needs it, and a trusted entry only
+/// had to be old enough. The rest are left out and listed in `unreviewed`.
 pub fn resolve<I, S>(
     addon_id: &str,
     catalog: &Catalog,
@@ -76,18 +94,20 @@ where
     // itself from pulling in another provider.
     let mut planned: HashSet<String> = HashSet::new();
     let mut seen_missing: HashSet<String> = HashSet::new();
+    let mut seen_unreviewed: HashSet<(usize, String)> = HashSet::new();
 
     plan_folders(&catalog.addons[root], &mut planned);
     // An explicit stack, because a chain in a bad catalog could be thousands deep.
     let mut stack: Vec<(usize, usize)> = vec![(root, 0)];
-    while let Some((current, next_dep)) = stack.last_mut() {
-        let addon = &catalog.addons[*current];
-        let Some(dep) = addon.deps.get(*next_dep) else {
+    while let Some(top) = stack.last_mut() {
+        let current = top.0;
+        let addon = &catalog.addons[current];
+        let Some(dep) = addon.deps.get(top.1) else {
             resolution.to_install.push(addon.id.clone());
             stack.pop();
             continue;
         };
-        *next_dep += 1;
+        top.1 += 1;
 
         let folder = dep.to_lowercase();
         if folder.starts_with(GAME_ADDON_PREFIX)
@@ -97,9 +117,18 @@ where
             continue;
         }
         match best_provider(&folder, catalog, index) {
-            Some(provider) => {
+            Some(provider) if catalog.addons[provider].reviewed => {
                 plan_folders(&catalog.addons[provider], &mut planned);
                 stack.push((provider, 0));
+            }
+            Some(provider) => {
+                if seen_unreviewed.insert((current, folder)) {
+                    resolution.unreviewed.push(Unreviewed {
+                        needed_by: addon.id.clone(),
+                        folder: dep.clone(),
+                        provider: catalog.addons[provider].id.clone(),
+                    });
+                }
             }
             None => {
                 if seen_missing.insert(folder) {
@@ -115,10 +144,11 @@ fn plan_folders(addon: &Addon, planned: &mut HashSet<String>) {
     planned.extend(addon.folders.iter().map(|f| f.to_lowercase()));
 }
 
-/// The addon the app would pick by itself for this folder: the trusted one whose main folder
-/// it is, then the most downloaded trusted one. Ties keep catalog order. An untrusted entry
-/// is never picked, even when nothing else provides the folder, because its folder list is
-/// only a claim and its downloads can be inflated.
+/// The addon the app would pick for this folder: the trusted one whose main folder it is,
+/// then the most downloaded trusted one. Ties keep catalog order. An untrusted entry is never
+/// picked, even when nothing else provides the folder, because its folder list is only a
+/// claim and its downloads can be inflated. [`resolve`] installs the pick by itself only when
+/// it's reviewed too, and the Requires line links to it either way.
 pub fn best_provider(folder: &str, catalog: &Catalog, index: &FolderIndex) -> Option<usize> {
     let folder = folder.to_lowercase();
     index
@@ -202,6 +232,7 @@ mod tests {
 
     const NOTHING: [&str; 0] = [];
 
+    /// A hand-picked entry, which is trusted and reviewed.
     fn addon(id: &str, folders: &[&str], deps: &[&str]) -> Addon {
         Addon {
             id: id.to_string(),
@@ -209,6 +240,7 @@ mod tests {
             folders: folders.iter().map(|f| f.to_string()).collect(),
             deps: deps.iter().map(|d| d.to_string()).collect(),
             trusted: true,
+            reviewed: true,
             ..Default::default()
         }
     }
@@ -217,7 +249,24 @@ mod tests {
         Addon {
             downloads,
             trusted: false,
+            reviewed: false,
             ..addon(id, folders, &[])
+        }
+    }
+
+    /// Trusted for being old enough or moderated elsewhere, but no person here chose it.
+    fn unreviewed(id: &str, folders: &[&str], deps: &[&str]) -> Addon {
+        Addon {
+            reviewed: false,
+            ..addon(id, folders, deps)
+        }
+    }
+
+    fn left_out(needed_by: &str, folder: &str, provider: &str) -> Unreviewed {
+        Unreviewed {
+            needed_by: needed_by.to_string(),
+            folder: folder.to_string(),
+            provider: provider.to_string(),
         }
     }
 
@@ -346,6 +395,7 @@ mod tests {
                     vec![]
                 },
                 trusted: true,
+                reviewed: true,
                 ..Default::default()
             })
             .collect();
@@ -475,6 +525,59 @@ mod tests {
             best_provider("LIBSTUB", &catalog, &FolderIndex::build(&catalog)),
             Some(2)
         );
+    }
+
+    #[test]
+    fn a_pick_nobody_reviewed_is_left_for_the_player_and_says_who_needs_it() {
+        // Any repo can ship LibThing long before an addon needs it, then be old enough to trust.
+        let catalog = catalog(vec![
+            addon("top", &["Top"], &["Middle", "LibThing"]),
+            addon("middle", &["Middle"], &["LIBDEEP"]),
+            unreviewed("squatter", &["LibThing", "LibDeep"], &["Gone"]),
+        ]);
+        let result = resolve_in(&catalog, "top", &[]);
+        assert_eq!(result.to_install, ["middle", "top"]);
+        assert_eq!(
+            result.unreviewed,
+            [
+                left_out("middle", "LIBDEEP", "squatter"),
+                left_out("top", "LibThing", "squatter"),
+            ],
+            "whose page to look on, and nothing it would have needed"
+        );
+        assert!(result.missing.is_empty());
+        // The same pick an install makes, so the Requires line can still link to it.
+        assert_eq!(
+            best_provider("libthing", &catalog, &FolderIndex::build(&catalog)),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn an_unreviewed_pick_is_named_once_per_folder_and_never_for_what_is_covered() {
+        let catalog = catalog(vec![
+            addon(
+                "top",
+                &["Top", "Bundled"],
+                &["Lib", "LIB", "Bundled", "Installed"],
+            ),
+            unreviewed("lib", &["Lib"], &[]),
+            unreviewed("bundled", &["Bundled"], &[]),
+            unreviewed("installed", &["Installed"], &[]),
+        ]);
+        let result = resolve_in(&catalog, "top", &["installed"]);
+        assert_eq!(result.to_install, ["top"]);
+        assert_eq!(result.unreviewed, [left_out("top", "Lib", "lib")]);
+    }
+
+    #[test]
+    fn a_reviewed_pick_still_installs_by_itself() {
+        let mut lib = addon("lib", &["Lib"], &[]);
+        lib.downloads = 1;
+        let catalog = catalog(vec![addon("top", &["Top"], &["Lib"]), lib]);
+        let result = resolve_in(&catalog, "top", &[]);
+        assert_eq!(result.to_install, ["lib", "top"]);
+        assert!(result.unreviewed.is_empty());
     }
 
     #[test]
