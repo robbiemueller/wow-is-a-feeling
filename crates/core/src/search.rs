@@ -49,8 +49,11 @@ pub struct SearchIndex {
     names: Vec<Utf32String>,
     /// Which characters each name contains, to skip the fuzzy matcher cheaply.
     name_masks: Vec<u64>,
-    /// 0 to [`POPULARITY`].
+    /// What each addon's popularity adds to a search score, 0 to [`POPULARITY`]. Nothing for
+    /// an untrusted entry, whose downloads can be inflated and whose name need not be its own.
     popularity: Vec<u16>,
+    /// Which addons a catalog says aren't trusted, so an exact tie goes to the trusted one.
+    untrusted: Vec<bool>,
     folders: FieldText,
     authors: FieldText,
     summaries: FieldText,
@@ -67,8 +70,8 @@ struct Scratch {
     totals: Vec<i32>,
     /// Best substring score per addon, for the current word.
     text_scores: Vec<u16>,
-    /// `(negated score, addon)`, so plain sorting gives best first and stays stable.
-    ranked: Vec<(i32, u32)>,
+    /// `(negated score, untrusted, addon)`, so plain sorting gives best first and stays stable.
+    ranked: Vec<(i32, bool, u32)>,
 }
 
 impl SearchIndex {
@@ -117,6 +120,16 @@ impl SearchIndex {
             std::cmp::Reverse(first_seen)
         });
 
+        // Among equal matches, trusted entries come first. A catalog built before the flag
+        // existed trusts nothing, which says nothing about any one entry, so it ranks as before.
+        let any_trusted = addons.iter().any(|a| a.trusted);
+        let untrusted: Vec<bool> = addons.iter().map(|a| any_trusted && !a.trusted).collect();
+        let popularity = popularity
+            .iter()
+            .zip(&untrusted)
+            .map(|(&lift, &untrusted)| if untrusted { 0 } else { lift })
+            .collect();
+
         Self {
             names: addons
                 .iter()
@@ -124,6 +137,7 @@ impl SearchIndex {
                 .collect(),
             name_masks: addons.iter().map(|a| name_mask(&a.name)).collect(),
             popularity,
+            untrusted,
             folders,
             authors,
             summaries,
@@ -181,7 +195,11 @@ impl SearchIndex {
                 .enumerate()
                 .filter(|(_, (total, _))| **total > 0)
                 .map(|(i, (total, popularity))| {
-                    (-(total / word_count + i32::from(*popularity)), i as u32)
+                    (
+                        -(total / word_count + i32::from(*popularity)),
+                        self.untrusted[i],
+                        i as u32,
+                    )
                 }),
         );
         if ranked.len() > limit {
@@ -189,7 +207,7 @@ impl SearchIndex {
             ranked.truncate(limit);
         }
         ranked.sort_unstable();
-        ranked.iter().map(|&(_, addon)| addon as usize).collect()
+        ranked.iter().map(|&(_, _, addon)| addon as usize).collect()
     }
 
     /// Add one word's score to every addon still in the running.
@@ -566,6 +584,44 @@ mod tests {
                 "{query:?}: {results:?}"
             );
         }
+    }
+
+    #[test]
+    fn among_equal_matches_trusted_entries_come_first() {
+        let stranger = |name: &str| addon(name, 2_800_000, 5);
+        let real = |name: &str| Addon {
+            trusted: true,
+            ..addon(name, 2_600_000, 4)
+        };
+        // One word for word what the other is, with more downloads and a higher tier.
+        let (catalog, search) = index(vec![stranger("BigWigs"), real("BigWigs")]);
+        assert!(catalog.addons[1].trusted, "the real one is listed second");
+        assert_eq!(search.query("bigwigs", 2), [1, 0]);
+
+        // A trusted addon nobody has downloaded still beats the same name from a stranger.
+        let unknown = Addon {
+            trusted: true,
+            ..addon("Questie", 0, 0)
+        };
+        let (_, search) = index(vec![stranger("Questie"), unknown]);
+        assert_eq!(search.query("questie", 2), [1, 0], "a plain tie");
+
+        // It hides nothing, and a better match still wins: a stranger just counts as having
+        // no downloads, the same as anything new.
+        let scattered = Addon {
+            trusted: true,
+            ..addon("Big Wigs Helper Tools", 0, 0)
+        };
+        let (catalog, search) = index(vec![scattered, stranger("BigWigs")]);
+        assert_eq!(search.query("bigwigs", 2).len(), 2);
+        assert_eq!(names(&catalog, &search.query("bigwigs", 1)), ["BigWigs"]);
+    }
+
+    #[test]
+    fn a_catalog_that_trusts_nothing_ranks_as_it_always_did() {
+        let (catalog, search) = index(vec![addon("Questie", 5, 1), addon("Questie", 90_000, 5)]);
+        assert_eq!(names(&catalog, &search.query("questie", 1)), ["Questie"]);
+        assert_eq!(search.query("questie", 2), [1, 0], "by popularity");
     }
 
     #[test]

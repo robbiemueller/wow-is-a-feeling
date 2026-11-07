@@ -115,27 +115,45 @@ impl Site {
     }
 }
 
-/// A zip holding one addon folder with a TOC and a file that says which version this is.
-fn addon_zip(folder: &str, version: &str) -> Vec<u8> {
-    let toc = format!("{FOREVER_TOC}## Title: {folder}\n## Version: {version}\n");
-    let lua = format!("-- {version}\n");
-    let files = [
-        (format!("{folder}/{folder}.toc"), toc),
-        (format!("{folder}/{folder}.lua"), lua),
-    ];
+/// A zip holding addon folders, each with a TOC and a file that says which version this is.
+fn addons_zip(folders: &[&str], version: &str) -> Vec<u8> {
     let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
-    for (name, text) in files {
-        writer
-            .start_file(name, zip::write::SimpleFileOptions::default())
-            .unwrap();
-        writer.write_all(text.as_bytes()).unwrap();
+    for folder in folders {
+        let toc = format!("{FOREVER_TOC}## Title: {folder}\n## Version: {version}\n");
+        let lua = format!("-- {version}\n");
+        let files = [
+            (format!("{folder}/{folder}.toc"), toc),
+            (format!("{folder}/{folder}.lua"), lua),
+        ];
+        for (name, text) in files {
+            writer
+                .start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(text.as_bytes()).unwrap();
+        }
     }
     writer.finish().unwrap().into_inner()
 }
 
-/// A catalog entry whose zip the site is really serving.
+fn addon_zip(folder: &str, version: &str) -> Vec<u8> {
+    addons_zip(&[folder], version)
+}
+
+/// A catalog entry whose zip the site is really serving, the way a hand-picked one looks.
 fn publish_addon(site: &Site, id: &str, folder: &str, version: &str) -> Addon {
-    let zip = addon_zip(folder, version);
+    publish_bundle(site, id, &[folder], &[folder], version)
+}
+
+/// The same with `listed` being what the catalog says and `shipped` what's really in the zip.
+fn publish_bundle(
+    site: &Site,
+    id: &str,
+    listed: &[&str],
+    shipped: &[&str],
+    version: &str,
+) -> Addon {
+    let folder = listed[0];
+    let zip = addons_zip(shipped, version);
     let size = zip.len() as u64;
     let url = site.put(&format!("/{folder}-{version}.zip"), zip);
     Addon {
@@ -153,9 +171,10 @@ fn publish_addon(site: &Site, id: &str, folder: &str, version: &str) -> Addon {
             date: 1_793_000_000,
             ..Default::default()
         }),
-        folders: vec![folder.to_owned()],
+        folders: listed.iter().map(|f| (*f).to_owned()).collect(),
         tier: 3,
         downloads: 100,
+        trusted: true,
         ..Default::default()
     }
 }
@@ -208,6 +227,18 @@ impl Rig {
         let lua = self.addons().join(folder).join(format!("{folder}.lua"));
         let text = fs::read_to_string(lua).ok()?;
         Some(text.trim_start_matches("-- ").trim().to_owned())
+    }
+
+    /// Put a folder on disk the way some other tool, or the player, left it.
+    fn plant(&self, folder: &str, version: &str) {
+        let dir = self.addons().join(folder);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join(format!("{folder}.toc")),
+            format!("{FOREVER_TOC}## Title: {folder} from elsewhere\n## Version: {version}\n"),
+        )
+        .unwrap();
+        fs::write(dir.join(format!("{folder}.lua")), format!("-- {version}\n")).unwrap();
     }
 
     fn set_up_state(&self, change: impl FnOnce(&mut State)) {
@@ -381,6 +412,10 @@ fn type_text(h: &mut Harness<'static, Option<App>>, text: &str) {
 
 fn has_label(h: &Harness<'static, Option<App>>, label: &str) -> bool {
     h.query_all_by_label(label).next().is_some()
+}
+
+fn said(h: &Harness<'static, Option<App>>, part: &str) -> bool {
+    app(h).messages.texts().iter().any(|t| t.contains(part))
 }
 
 fn managed<'a>(
@@ -749,6 +784,82 @@ fn a_zip_dropped_over_a_catalog_addon_takes_its_place() {
         "no more updates for what's been replaced"
     );
     assert_eq!(managed(&h, "local:Foo").unwrap().version, "9.9");
+    assert!(said(
+        &h,
+        "The zip you dropped replaced Foo. Install Foo Addon again to get its own back."
+    ));
+}
+
+#[test]
+fn a_dropped_zip_and_a_rollback_say_what_they_replaced() {
+    let rig = Rig::new();
+    rig.plant("Mine", "my own");
+    rig.site.publish(&catalog_of(vec![publish_bundle(
+        &rig.site,
+        FOO,
+        &["Foo", "FooLib"],
+        &["Foo", "FooLib"],
+        "1.0",
+    )]));
+    let mut h = rig.launch_settled();
+
+    // Over a folder nothing else knows about. It's the player's own choice, so no question.
+    let zip = rig.home.path().join("Dropped.zip");
+    fs::write(&zip, addon_zip("Mine", "2.0")).unwrap();
+    drop_file(&mut h, zip);
+    assert!(app(&h).popup.is_none());
+    finish_ops(&mut h);
+    assert_eq!(rig.version_on_disk("Mine").as_deref(), Some("2.0"));
+    assert!(said(
+        &h,
+        "The zip you dropped replaced Mine, and the old copy is gone."
+    ));
+
+    // The same zip again only replaces its own older copy, which isn't worth a word.
+    app_mut(&mut h).messages = Default::default();
+    let zip = rig.home.path().join("Newer.zip");
+    fs::write(&zip, addon_zip("Mine", "3.0")).unwrap();
+    drop_file(&mut h, zip);
+    finish_ops(&mut h);
+    assert_eq!(rig.version_on_disk("Mine").as_deref(), Some("3.0"));
+    assert!(!said(&h, "replaced"), "{:?}", app(&h).messages.texts());
+
+    // Over a part of a catalog addon, which goes on claiming it.
+    click(&mut h, "Browse");
+    click(&mut h, "Foo Addon, 1.0");
+    click(&mut h, "Install");
+    finish_ops(&mut h);
+    let zip = rig.home.path().join("JustTheLib.zip");
+    fs::write(&zip, addon_zip("FooLib", "9.9")).unwrap();
+    drop_file(&mut h, zip);
+    finish_ops(&mut h);
+    assert_eq!(rig.version_on_disk("FooLib").as_deref(), Some("9.9"));
+    assert!(
+        managed(&h, FOO).is_some(),
+        "its main folder is still its own"
+    );
+    assert!(said(
+        &h,
+        "The zip you dropped replaced FooLib. Install Foo Addon again to get its own back."
+    ));
+    close(h);
+
+    // A new version drops the folder. Then something else takes the name, and the old
+    // version's zip, which still has it, is rolled back to.
+    rig.site.publish(&catalog_of(vec![publish_addon(
+        &rig.site, FOO, "Foo", "2.0",
+    )]));
+    let mut h = rig.launch_settled();
+    click(&mut h, "Foo Addon, update");
+    click(&mut h, "Update");
+    assert!(app(&h).popup.is_none());
+    finish_ops(&mut h);
+    rig.plant("FooLib", "other");
+    click(&mut h, "Roll back to 1.0");
+    assert!(app(&h).popup.is_none());
+    finish_ops(&mut h);
+    assert_eq!(rig.version_on_disk("FooLib").as_deref(), Some("1.0"));
+    assert!(said(&h, "Rolling back replaced FooLib"));
 }
 
 #[test]
@@ -814,6 +925,759 @@ fn required_addons_land_first_and_missing_ones_warn() {
         &h,
         "These installed addons require it and may stop working: Bar Addon."
     ));
+}
+
+const PINS: &str = "direct:CoolPins";
+
+#[test]
+fn a_required_addon_from_a_stranger_stays_out_and_the_player_is_told() {
+    let rig = Rig::new();
+    // The only entry that provides it, and it says it's popular.
+    let mut foo = publish_addon(&rig.site, FOO, "Foo", "1.0");
+    foo.trusted = false;
+    foo.downloads = 9_000_000;
+    let mut bar = publish_addon(&rig.site, BAR, "Bar", "1.0");
+    bar.deps = vec!["Foo".to_owned()];
+    let mut catalog = catalog_of(vec![foo, bar]);
+    catalog.featured = vec![BAR.to_owned()];
+    rig.site.publish(&catalog);
+
+    let mut h = rig.launch_settled();
+    click(&mut h, "Bar Addon, 1.0");
+    assert!(
+        !has_label(&h, "Foo Addon"),
+        "the page doesn't call a stranger's entry what this requires"
+    );
+    assert!(has_label(&h, "Foo"), "just the name of the folder");
+    click(&mut h, "Install");
+    assert!(app(&h).popup.is_none(), "never a popup for this");
+    assert!(said(
+        &h,
+        "Bar Addon requires Foo, which this app can't pick for you. Look for it yourself, \
+         in Browse or on the web. Installing Bar Addon anyway."
+    ));
+    finish_ops(&mut h);
+    assert_eq!(rig.version_on_disk("Bar").as_deref(), Some("1.0"));
+    assert!(!rig.addons().join("Foo").exists());
+    assert!(managed(&h, FOO).is_none());
+}
+
+#[test]
+fn a_required_addon_that_would_replace_something_is_left_out() {
+    let rig = Rig::new();
+    rig.plant("Questie", "mine");
+    let foo = publish_bundle(
+        &rig.site,
+        FOO,
+        &["Foo", "Questie"],
+        &["Foo", "Questie"],
+        "1.0",
+    );
+    let mut bar = publish_addon(&rig.site, BAR, "Bar", "1.0");
+    bar.deps = vec!["Foo".to_owned()];
+    let mut catalog = catalog_of(vec![foo, bar]);
+    catalog.featured = vec![BAR.to_owned()];
+    rig.site.publish(&catalog);
+
+    let mut h = rig.launch_settled();
+    click(&mut h, "Browse");
+    click(&mut h, "Bar Addon, 1.0");
+    click(&mut h, "Install");
+    assert!(app(&h).popup.is_none(), "a dependency never opens a popup");
+    assert!(said(
+        &h,
+        "Bar Addon requires Foo Addon, which wasn't added because it would replace Questie. \
+         Install it from its own page to choose."
+    ));
+    finish_ops(&mut h);
+    assert_eq!(rig.version_on_disk("Bar").as_deref(), Some("1.0"));
+    assert!(!rig.addons().join("Foo").exists());
+    assert_eq!(rig.version_on_disk("Questie").as_deref(), Some("mine"));
+    assert!(managed(&h, FOO).is_none());
+}
+
+#[test]
+fn replacing_a_folder_on_disk_asks_first_and_cancel_changes_nothing() {
+    let rig = Rig::new();
+    rig.plant("Questie", "mine");
+    rig.site.publish(&catalog_of(vec![publish_bundle(
+        &rig.site,
+        PINS,
+        &["CoolPins", "Questie"],
+        &["CoolPins", "Questie"],
+        "1.0",
+    )]));
+    let mut h = rig.launch_settled();
+    click(&mut h, "Browse");
+    click(&mut h, "CoolPins Addon, 1.0");
+
+    click(&mut h, "Install");
+    assert!(matches!(app(&h).popup, Some(Popup::Replace(_))));
+    assert!(app(&h).queue.is_idle(), "nothing has started");
+    assert!(has_label(
+        &h,
+        "Installing CoolPins Addon would replace these folders already in your AddOns:"
+    ));
+    assert!(has_label(
+        &h,
+        "Questie: Questie from elsewhere, not installed by this app"
+    ));
+    click_last(&mut h, "Cancel");
+    assert!(app(&h).popup.is_none());
+    assert!(app(&h).queue.is_idle(), "and nothing starts");
+    assert_eq!(rig.version_on_disk("Questie").as_deref(), Some("mine"));
+    assert!(!rig.addons().join("CoolPins").exists());
+    assert!(managed(&h, PINS).is_none());
+
+    click(&mut h, "Install");
+    press(&mut h, Key::Escape);
+    assert!(app(&h).popup.is_none(), "Escape is Cancel too");
+    assert!(app(&h).queue.is_idle());
+
+    // Enter is the same button, so it's the same question.
+    press(&mut h, Key::Enter);
+    h.step();
+    assert!(matches!(app(&h).popup, Some(Popup::Replace(_))));
+    click(&mut h, "Replace them");
+    finish_ops(&mut h);
+    assert_eq!(rig.version_on_disk("Questie").as_deref(), Some("1.0"));
+    assert_eq!(rig.version_on_disk("CoolPins").as_deref(), Some("1.0"));
+    assert_eq!(
+        managed(&h, PINS).unwrap().folders,
+        vec!["CoolPins".to_owned(), "Questie".to_owned()],
+        "it's that addon's from here on"
+    );
+
+    // So it only ever asks once.
+    click(&mut h, "Reinstall");
+    assert!(app(&h).popup.is_none());
+    finish_ops(&mut h);
+}
+
+#[test]
+fn a_zip_with_a_surprise_folder_is_refused_in_red() {
+    const REFUSAL: &str = "This download would also replace Questie, which isn't part of this addon, so nothing was changed.";
+    let rig = Rig::new();
+    rig.plant("Questie", "mine");
+    // The catalog says one thing and the zip brings another, so no question gets asked.
+    let surprising = |version: &str| {
+        publish_bundle(
+            &rig.site,
+            PINS,
+            &["CoolPins"],
+            &["CoolPins", "Questie"],
+            version,
+        )
+    };
+    rig.site.publish(&catalog_of(vec![surprising("1.0")]));
+    let mut h = rig.launch_settled();
+    click(&mut h, "Browse");
+    click(&mut h, "CoolPins Addon, 1.0");
+    click(&mut h, "Install");
+    assert!(app(&h).popup.is_none());
+    finish_ops(&mut h);
+    assert_eq!(rig.version_on_disk("Questie").as_deref(), Some("mine"));
+    assert!(!rig.addons().join("CoolPins").exists());
+    assert!(managed(&h, PINS).is_none());
+    assert!(
+        app(&h).messages.errors().contains(&REFUSAL),
+        "{:?}",
+        app(&h).messages.texts()
+    );
+    assert!(has_label(&h, REFUSAL), "it's really on screen");
+    close(h);
+
+    // An addon the player already has can't start doing it in an update either.
+    rig.site.publish(&catalog_of(vec![publish_addon(
+        &rig.site, PINS, "CoolPins", "1.0",
+    )]));
+    let mut h = rig.launch_settled();
+    click(&mut h, "Browse");
+    click(&mut h, "CoolPins Addon, 1.0");
+    click(&mut h, "Install");
+    finish_ops(&mut h);
+    close(h);
+    rig.site.publish(&catalog_of(vec![surprising("2.0")]));
+    let mut h = rig.launch_settled();
+    click(&mut h, "Update all (1)");
+    finish_ops(&mut h);
+    assert_eq!(rig.version_on_disk("Questie").as_deref(), Some("mine"));
+    assert_eq!(rig.version_on_disk("CoolPins").as_deref(), Some("1.0"));
+    assert_eq!(managed(&h, PINS).unwrap().version, "1.0");
+    assert!(app(&h).messages.errors().contains(&REFUSAL));
+    close(h);
+
+    // A folder new to the disk costs nobody anything, listed or not.
+    rig.site.publish(&catalog_of(vec![publish_bundle(
+        &rig.site,
+        PINS,
+        &["CoolPins"],
+        &["CoolPins", "CoolPins_Extra"],
+        "3.0",
+    )]));
+    let mut h = rig.launch_settled();
+    click(&mut h, "Update all (1)");
+    finish_ops(&mut h);
+    assert_eq!(
+        rig.version_on_disk("CoolPins_Extra").as_deref(),
+        Some("3.0")
+    );
+    assert_eq!(managed(&h, PINS).unwrap().version, "3.0");
+    assert!(app(&h).messages.errors().is_empty());
+}
+
+#[test]
+fn update_all_never_asks_and_leaves_out_what_would_replace_something_new() {
+    const AAA: &str = "direct:Aaa";
+    const BBB: &str = "direct:Bbb";
+    const SKIPPED: &str = "Aaa Addon wasn't updated because it would replace Extra. \
+                           Update it from its own page to choose.";
+    let rig = Rig::new();
+    rig.site.publish(&catalog_of(vec![
+        publish_addon(&rig.site, AAA, "Aaa", "1.0"),
+        publish_addon(&rig.site, BBB, "Bbb", "1.0"),
+    ]));
+    let mut h = rig.launch_settled();
+    app_mut(&mut h)
+        .actions
+        .push(Action::Install(vec![AAA.to_owned(), BBB.to_owned()]));
+    h.step();
+    finish_ops(&mut h);
+    close(h);
+
+    // Aaa's next version brings a folder that's already there, from somewhere else.
+    rig.plant("Extra", "mine");
+    rig.site.publish(&catalog_of(vec![
+        publish_bundle(&rig.site, AAA, &["Aaa", "Extra"], &["Aaa", "Extra"], "2.0"),
+        publish_addon(&rig.site, BBB, "Bbb", "2.0"),
+    ]));
+    let mut h = rig.launch_settled();
+    click(&mut h, "Update all (2)");
+    assert!(app(&h).popup.is_none());
+    assert!(said(&h, SKIPPED), "{:?}", app(&h).messages.texts());
+    finish_ops(&mut h);
+    assert_eq!(rig.version_on_disk("Bbb").as_deref(), Some("2.0"));
+    assert_eq!(rig.version_on_disk("Aaa").as_deref(), Some("1.0"));
+    assert_eq!(rig.version_on_disk("Extra").as_deref(), Some("mine"));
+    assert_eq!(app(&h).updates, vec![AAA.to_owned()]);
+
+    // With only that one left, it still doesn't ask.
+    app_mut(&mut h).messages = Default::default();
+    click(&mut h, "Update all (1)");
+    assert!(app(&h).popup.is_none());
+    assert!(app(&h).queue.is_idle());
+    assert!(said(&h, SKIPPED));
+    assert_eq!(rig.version_on_disk("Aaa").as_deref(), Some("1.0"));
+
+    // Its own page is where the player gets to say.
+    click(&mut h, "Aaa Addon, update");
+    click(&mut h, "Update");
+    assert!(has_label(
+        &h,
+        "Updating Aaa Addon would replace these folders already in your AddOns:"
+    ));
+    click(&mut h, "Replace them");
+    finish_ops(&mut h);
+    assert_eq!(rig.version_on_disk("Aaa").as_deref(), Some("2.0"));
+    assert_eq!(rig.version_on_disk("Extra").as_deref(), Some("2.0"));
+    close(h);
+
+    // After that it's that addon's own, and Update all has nothing to ask about.
+    rig.site.publish(&catalog_of(vec![
+        publish_bundle(&rig.site, AAA, &["Aaa", "Extra"], &["Aaa", "Extra"], "3.0"),
+        publish_addon(&rig.site, BBB, "Bbb", "2.0"),
+    ]));
+    let mut h = rig.launch_settled();
+    click(&mut h, "Update all (1)");
+    assert!(app(&h).popup.is_none());
+    assert!(!said(&h, "wasn't updated"));
+    finish_ops(&mut h);
+    assert_eq!(rig.version_on_disk("Extra").as_deref(), Some("3.0"));
+}
+
+const DOMINOS: &str = "gh-like:Dominos";
+const MASQUE: &str = "gh-like:Masque_Dominos";
+
+/// Real Dominos ships `Masque_Dominos`, which another entry has as its main folder.
+fn dominos(site: &Site, version: &str) -> Addon {
+    let folders = ["Dominos", "Masque_Dominos"];
+    publish_bundle(site, DOMINOS, &folders, &folders, version)
+}
+
+#[test]
+fn dominos_shares_a_folder_and_only_asks_about_it_once() {
+    let rig = Rig::new();
+    let masque = publish_addon(&rig.site, MASQUE, "Masque_Dominos", "1.0");
+    rig.site
+        .publish(&catalog_of(vec![masque.clone(), dominos(&rig.site, "1.0")]));
+    let mut h = rig.launch_settled();
+    click(&mut h, "Masque_Dominos Addon, 1.0");
+    click(&mut h, "Install");
+    finish_ops(&mut h);
+
+    // The first install over another addon's folder asks, naming that addon.
+    click(&mut h, "Dominos Addon, 1.0");
+    click(&mut h, "Install");
+    assert!(has_label(
+        &h,
+        "Masque_Dominos: part of Masque_Dominos Addon"
+    ));
+    click(&mut h, "Replace them");
+    finish_ops(&mut h);
+    assert_eq!(rig.version_on_disk("Dominos").as_deref(), Some("1.0"));
+    let claims =
+        |h: &Harness<'static, Option<App>>, id: &str| managed(h, id).unwrap().folders.clone();
+    assert_eq!(
+        claims(&h, DOMINOS),
+        vec!["Dominos".to_owned(), "Masque_Dominos".to_owned()]
+    );
+    assert_eq!(claims(&h, MASQUE), vec!["Masque_Dominos".to_owned()]);
+    close(h);
+
+    // A plain update of either one, from its own page, says nothing about it.
+    rig.site
+        .publish(&catalog_of(vec![masque.clone(), dominos(&rig.site, "2.0")]));
+    let mut h = rig.launch_settled();
+    click(&mut h, "Dominos Addon, update");
+    click(&mut h, "Update");
+    assert!(app(&h).popup.is_none(), "no question on every update");
+    finish_ops(&mut h);
+    assert_eq!(rig.version_on_disk("Dominos").as_deref(), Some("2.0"));
+    assert_eq!(
+        rig.version_on_disk("Masque_Dominos").as_deref(),
+        Some("2.0")
+    );
+    assert!(app(&h).messages.errors().is_empty());
+    close(h);
+
+    let masque = publish_addon(&rig.site, MASQUE, "Masque_Dominos", "1.1");
+    rig.site
+        .publish(&catalog_of(vec![masque.clone(), dominos(&rig.site, "3.0")]));
+    let mut h = rig.launch_settled();
+    click(&mut h, "Update all (2)");
+    assert!(app(&h).popup.is_none());
+    assert!(!said(&h, "wasn't updated"));
+    finish_ops(&mut h);
+    assert_eq!(managed(&h, DOMINOS).unwrap().version, "3.0");
+    assert_eq!(managed(&h, MASQUE).unwrap().version, "1.1");
+    assert!(app(&h).messages.errors().is_empty());
+
+    // Remove Dominos and the folder stays for the addon still claiming it.
+    click(&mut h, "Dominos Addon, 3.0");
+    click(&mut h, "Remove");
+    click_last(&mut h, "Remove");
+    finish_ops(&mut h);
+    assert!(!rig.addons().join("Dominos").exists());
+    assert!(rig.addons().join("Masque_Dominos").exists());
+}
+
+#[test]
+fn a_shared_folder_the_zip_did_not_bring_is_only_asked_about_once() {
+    // The catalog keeps one list of folders per addon, so a build can have fewer than it says.
+    let rig = Rig::new();
+    let without_it = |version: &str| {
+        publish_bundle(
+            &rig.site,
+            DOMINOS,
+            &["Dominos", "Masque_Dominos"],
+            &["Dominos"],
+            version,
+        )
+    };
+    rig.site.publish(&catalog_of(vec![
+        publish_addon(&rig.site, MASQUE, "Masque_Dominos", "1.0"),
+        without_it("1.0"),
+    ]));
+    let mut h = rig.launch_settled();
+    click(&mut h, "Masque_Dominos Addon, 1.0");
+    click(&mut h, "Install");
+    finish_ops(&mut h);
+    click(&mut h, "Dominos Addon, 1.0");
+    click(&mut h, "Install");
+    click(&mut h, "Replace them");
+    finish_ops(&mut h);
+    assert_eq!(
+        rig.version_on_disk("Masque_Dominos").as_deref(),
+        Some("1.0")
+    );
+    for _ in 0..2 {
+        click(&mut h, "Reinstall");
+        assert!(app(&h).popup.is_none(), "it asked again");
+        finish_ops(&mut h);
+    }
+    assert!(rig.addons().join("Masque_Dominos").exists());
+    assert!(app(&h).messages.errors().is_empty());
+}
+
+#[test]
+fn a_folder_the_zip_did_not_bring_stays_the_players_own() {
+    let rig = Rig::new();
+    rig.plant("Extra", "mine");
+    let listed = ["Foo", "Extra"];
+    rig.site.publish(&catalog_of(vec![publish_bundle(
+        &rig.site,
+        FOO,
+        &listed,
+        &["Foo"],
+        "1.0",
+    )]));
+    let mut h = rig.launch_settled();
+    click(&mut h, "Browse");
+    click(&mut h, "Foo Addon, 1.0");
+    click(&mut h, "Install");
+    click(&mut h, "Replace them");
+    finish_ops(&mut h);
+    assert_eq!(managed(&h, FOO).unwrap().folders, vec!["Foo".to_owned()]);
+    assert_eq!(rig.version_on_disk("Extra").as_deref(), Some("mine"));
+
+    // If it had gone in the record, this next install, whose zip doesn't have it either,
+    // would delete a folder that was never replaced. So the question comes back instead.
+    click(&mut h, "Reinstall");
+    assert!(matches!(app(&h).popup, Some(Popup::Replace(_))));
+    click(&mut h, "Replace them");
+    finish_ops(&mut h);
+    assert_eq!(rig.version_on_disk("Extra").as_deref(), Some("mine"));
+    assert_eq!(rig.version_on_disk("Foo").as_deref(), Some("1.0"));
+}
+
+#[test]
+fn a_long_list_of_folders_scrolls_and_the_buttons_stay_on_screen() {
+    let rig = Rig::new();
+    let names: Vec<String> = (0..60).map(|i| format!("Taken{i:02}")).collect();
+    for name in &names {
+        rig.plant(name, "mine");
+    }
+    let mut listed = vec!["Greedy"];
+    listed.extend(names.iter().map(String::as_str));
+    rig.site.publish(&catalog_of(vec![publish_bundle(
+        &rig.site, FOO, &listed, &listed, "1.0",
+    )]));
+    let mut h = rig.launch_settled();
+    click(&mut h, "Browse");
+    click(&mut h, "Greedy Addon, 1.0");
+    click(&mut h, "Install");
+    let button = h.get_by_label("Replace them").rect();
+    let screen = h.ctx.content_rect();
+    assert!(button.max.y <= screen.max.y, "{button:?} is off {screen:?}");
+    assert!(has_label(&h, "and 20 more"), "the list stops somewhere");
+    click(&mut h, "Replace them");
+    finish_ops(&mut h);
+    assert_eq!(rig.version_on_disk("Taken59").as_deref(), Some("1.0"));
+}
+
+#[test]
+fn dominos_on_its_own_needs_no_question_and_the_other_addon_asks_once() {
+    let rig = Rig::new();
+    let masque = publish_addon(&rig.site, MASQUE, "Masque_Dominos", "1.0");
+    rig.site
+        .publish(&catalog_of(vec![dominos(&rig.site, "1.0"), masque.clone()]));
+    let mut h = rig.launch_settled();
+    click(&mut h, "Dominos Addon, 1.0");
+    click(&mut h, "Install");
+    assert!(app(&h).popup.is_none(), "both folders are new to the disk");
+    finish_ops(&mut h);
+    assert_eq!(
+        rig.version_on_disk("Masque_Dominos").as_deref(),
+        Some("1.0")
+    );
+
+    click(&mut h, "Masque_Dominos Addon, 1.0");
+    click(&mut h, "Install");
+    assert!(has_label(&h, "Masque_Dominos: part of Dominos Addon"));
+    click(&mut h, "Replace them");
+    finish_ops(&mut h);
+    assert!(managed(&h, MASQUE).is_some());
+
+    click(&mut h, "Reinstall");
+    assert!(app(&h).popup.is_none());
+    finish_ops(&mut h);
+}
+
+#[test]
+fn two_addons_in_one_batch_can_share_a_folder_new_to_the_disk() {
+    let rig = Rig::new();
+    let mut catalog = catalog_of(vec![
+        publish_addon(&rig.site, MASQUE, "Masque_Dominos", "1.0"),
+        dominos(&rig.site, "1.0"),
+    ]);
+    catalog.kits = vec![Kit {
+        name: "Bars".to_owned(),
+        description: "Bars and their skin.".to_owned(),
+        addons: vec![MASQUE.to_owned(), DOMINOS.to_owned()],
+    }];
+    rig.site.publish(&catalog);
+    let mut h = rig.launch_settled();
+    click(&mut h, "Bars, 2 addons");
+    click(&mut h, "Install all (2)");
+    assert!(app(&h).popup.is_none());
+    finish_ops(&mut h);
+    assert!(
+        app(&h).messages.errors().is_empty(),
+        "the second didn't get refused for what the first just brought: {:?}",
+        app(&h).messages.texts()
+    );
+    assert!(managed(&h, MASQUE).is_some() && managed(&h, DOMINOS).is_some());
+}
+
+#[test]
+fn a_batch_leaves_out_what_would_replace_something_and_installs_the_rest() {
+    let rig = Rig::new();
+    rig.plant("Questie", "mine");
+    let mut catalog = catalog_of(vec![
+        publish_bundle(
+            &rig.site,
+            PINS,
+            &["CoolPins", "Questie"],
+            &["CoolPins", "Questie"],
+            "1.0",
+        ),
+        publish_addon(&rig.site, FOO, "Foo", "1.0"),
+    ]);
+    catalog.kits = vec![Kit {
+        name: "Handy Kit".to_owned(),
+        description: "Two good things.".to_owned(),
+        addons: vec![PINS.to_owned(), FOO.to_owned()],
+    }];
+    rig.site.publish(&catalog);
+    let mut h = rig.launch_settled();
+    click(&mut h, "Browse");
+    click(&mut h, "Handy Kit, 2 addons");
+    click(&mut h, "Install all (2)");
+    assert!(app(&h).popup.is_none());
+    assert!(said(
+        &h,
+        "CoolPins Addon wasn't installed because it would replace Questie. \
+         Install it from its own page to choose."
+    ));
+    finish_ops(&mut h);
+    assert!(rig.addons().join("Foo").exists());
+    assert!(!rig.addons().join("CoolPins").exists());
+    assert_eq!(rig.version_on_disk("Questie").as_deref(), Some("mine"));
+}
+
+#[test]
+fn a_strangers_entry_is_not_matched_to_a_folder_on_disk() {
+    let rig = Rig::new();
+    // The player's own copy, carrying the id the entry claims and with the name it lists.
+    let folder = rig.addons().join("Foo");
+    fs::create_dir_all(&folder).unwrap();
+    fs::write(
+        folder.join("Foo.toc"),
+        format!("{FOREVER_TOC}## Title: Foo from elsewhere\n## Version: 0.5\n## X-WoWI-ID: 777\n"),
+    )
+    .unwrap();
+    fs::write(folder.join("Foo.lua"), "-- 0.5\n").unwrap();
+    let entry = |trusted: bool| {
+        let mut addon = publish_addon(&rig.site, FOO, "Foo", "1.0");
+        addon.ids.wowi = Some("777".to_owned());
+        addon.downloads = 9_000_000;
+        addon.trusted = trusted;
+        addon
+    };
+    rig.site.publish(&catalog_of(vec![entry(false)]));
+
+    let mut h = rig.launch_settled();
+    assert!(app(&h).adoptions.is_empty());
+    assert!(has_label(&h, "Other folders (1)"));
+    click(&mut h, "Foo from elsewhere, 0.5");
+    assert_eq!(app(&h).page_kind(), PageKind::Other("Foo".to_owned()));
+    assert!(!has_label(&h, "Manage with this app"));
+
+    // On its own page it's only something to install, and that asks about the folder first.
+    click(&mut h, "Browse");
+    click(&mut h, "Foo Addon, 1.0");
+    assert!(has_label(&h, crate::model::UNTRUSTED_NOTE));
+    assert!(has_label(&h, "Install") && !has_label(&h, "Manage with this app"));
+    click(&mut h, "Install");
+    assert!(has_label(
+        &h,
+        "Foo: Foo from elsewhere, not installed by this app"
+    ));
+    click_last(&mut h, "Cancel");
+    assert_eq!(rig.version_on_disk("Foo").as_deref(), Some("0.5"));
+    close(h);
+
+    // Once the catalog vouches for it, the same folder matches, and says who it's from.
+    rig.site.publish(&catalog_of(vec![entry(true)]));
+    let mut h = rig.launch_settled();
+    click(&mut h, "Foo from elsewhere, 0.5");
+    assert!(has_label(
+        &h,
+        "It matches Foo Addon (Direct link) in the catalog. Let this app manage it and it gets updates."
+    ));
+    click(&mut h, "Manage with this app");
+    assert_eq!(managed(&h, FOO).unwrap().origin, Origin::Adopted);
+}
+
+#[test]
+fn an_install_asked_for_with_no_game_yet_waits_for_the_first_look_at_the_disk() {
+    let rig = Rig::new();
+    rig.plant("Foo", "mine");
+    let mut foo = publish_addon(&rig.site, FOO, "Foo", "1.0");
+    foo.trusted = false;
+    rig.site.publish(&catalog_of(vec![foo]));
+    let launch = Launch {
+        game: Some(rig.home.path().join("nowhere")),
+        test_rig: true,
+        catalog_url: Some(format!("{}/catalog.json", rig.site.base)),
+        ..Launch::default()
+    };
+    let mut h = harness(launch, rig.dirs.clone(), rig.saved_state());
+    settle(&mut h);
+    click(&mut h, "Install");
+    assert!(matches!(app(&h).popup, Some(Popup::Folder(_))));
+
+    app_mut(&mut h)
+        .actions
+        .push(Action::BrowseTo(rig.game.clone()));
+    pump(
+        &mut h,
+        "the listing",
+        |a| matches!(&a.popup, Some(Popup::Folder(b)) if b.waiting_for.is_none()),
+    );
+    click(&mut h, "Use this folder");
+    // Choosing the folder doesn't make its contents known yet. The question has to wait for
+    // them, or the install would run blind and be refused for a folder nobody asked about.
+    pump(&mut h, "the question about the folder", |a| {
+        matches!(&a.popup, Some(Popup::Replace(_)))
+    });
+    assert!(app(&h).queue.is_idle());
+    assert!(app(&h).messages.errors().is_empty());
+    assert_eq!(rig.version_on_disk("Foo").as_deref(), Some("mine"));
+}
+
+#[test]
+fn a_folder_another_install_is_about_to_bring_counts_as_taken() {
+    let rig = Rig::new();
+    let slow = slow_addon(&rig);
+    let bar = publish_bundle(&rig.site, BAR, &["Bar", "Foo"], &["Bar", "Foo"], "1.0");
+    rig.site.publish(&catalog_of(vec![slow, bar]));
+    let mut h = rig.launch_settled();
+    click(&mut h, "Foo Addon, 1.0");
+    click(&mut h, "Install");
+    pump(&mut h, "the download to start", |a| {
+        a.casting().is_some_and(|c| c.fraction > 0.0)
+    });
+    assert!(!rig.addons().join("Foo").exists(), "not on disk yet");
+    click(&mut h, "Bar Addon, 1.0");
+    click(&mut h, "Install");
+    assert!(has_label(&h, "Foo: part of Foo Addon"));
+    click_last(&mut h, "Cancel");
+    click(&mut h, "Cancel");
+    pump(&mut h, "the op to stop", |a| a.queue.is_idle());
+}
+
+#[test]
+fn a_message_sits_below_an_open_popup_not_across_its_first_lines() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = demo_harness(Scene::Normal, dir.path());
+    app_mut(&mut h).yellow("Something else happened a moment ago.");
+    h.step();
+    h.step();
+    let alone = h
+        .get_by_label("Something else happened a moment ago.")
+        .rect();
+    let opened = Action::Install(vec![demo::UNTRUSTED_ID.to_owned()]);
+    app_mut(&mut h).actions.push(opened);
+    for _ in 0..4 {
+        h.step();
+    }
+    let popup = h
+        .ctx
+        .memory(|m| m.area_rect(egui::Id::unique("static-popup")))
+        .unwrap();
+    let message = h
+        .get_by_label("Something else happened a moment ago.")
+        .rect();
+    assert!(
+        alone.min.y < popup.max.y && message.min.y >= popup.max.y,
+        "{message:?} covers {popup:?}"
+    );
+    press(&mut h, Key::Escape);
+    h.step();
+    assert_eq!(
+        h.get_by_label("Something else happened a moment ago.")
+            .rect()
+            .min
+            .y,
+        alone.min.y,
+        "and it goes back where it was"
+    );
+}
+
+#[test]
+fn the_page_says_who_an_addon_really_comes_from() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = demo_harness(Scene::Normal, dir.path());
+    let note = crate::model::UNTRUSTED_NOTE;
+    click(&mut h, "Browse");
+
+    // Trusted, from GitHub: the repo, and no note.
+    click(&mut h, "Questie, update");
+    assert!(has_label(&h, "GitHub: Questie/Questie"));
+    assert!(!has_label(&h, note));
+
+    click(&mut h, "Maps and Navigation (2)");
+    click(&mut h, "TomTom, installed");
+    assert!(has_label(&h, "WoWInterface"));
+    assert!(!has_label(&h, note));
+
+    // One nobody has vouched for.
+    click(&mut h, "Quests and Leveling (4)");
+    click(&mut h, "Shortest Path Forever, 1.3.0");
+    assert!(has_label(&h, "GitHub: cjber/shortest-path-forever"));
+    assert!(has_label(&h, note));
+
+    // It claims folders the fake disk already has, so the demo can show the question too.
+    click(&mut h, "Install");
+    assert!(has_label(
+        &h,
+        "Installing Shortest Path Forever would replace these folders already in your AddOns:"
+    ));
+    assert!(has_label(
+        &h,
+        "HandyNotes_Extras: HandyNotes Extras, not installed by this app"
+    ));
+    assert!(has_label(&h, "Pawn: part of Pawn"));
+    assert!(has_label(&h, "Source: GitHub: cjber/shortest-path-forever"));
+    let popup = h
+        .ctx
+        .memory(|m| m.area_rect(egui::Id::unique("static-popup")))
+        .unwrap();
+    assert!(
+        popup.max.y >= h.get_by_label("Replace them").rect().max.y,
+        "the popup holds its buttons"
+    );
+
+    // Waiting on the player costs no frames.
+    h.run();
+    let delay = h.output().viewport_output[&ViewportId::ROOT].repaint_delay;
+    assert!(delay > Duration::from_secs(60 * 60), "{delay:?}");
+
+    click(&mut h, "Replace them");
+    finish_ops(&mut h);
+    assert!(managed(&h, demo::UNTRUSTED_ID).is_some());
+}
+
+#[test]
+fn a_very_long_repo_name_stays_on_the_page() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = demo_harness(Scene::Normal, dir.path());
+    let long = format!("{}/{}", "o".repeat(39), "r".repeat(100));
+    let mut catalog = demo::catalog();
+    catalog.addons[0].source = Source::Github { repo: long.clone() };
+    app_mut(&mut h).bundle = Some(Arc::new(crate::model::CatalogBundle::new(catalog)));
+    click(&mut h, "Browse");
+    click(&mut h, "Questie, update");
+    let link = h.get_by_label(&format!("GitHub: {long}")).rect();
+    let share = h.get_by_label("Share").rect();
+    assert!(link.width() > 100.0);
+    let page_right = h.ctx.content_rect().max.x - 20.0;
+    assert!(
+        link.max.x <= page_right,
+        "{link:?} runs off past {page_right}"
+    );
+    assert!(link.max.y < share.min.y);
 }
 
 #[test]
@@ -1247,6 +2111,9 @@ fn every_settings_page_draws_and_can_be_operated() {
         "unknown ids and strange lines are shown, not run"
     );
     click_last(&mut h, "Install these");
+    // Its folder is on disk already, from some other tool. Same question as its own button.
+    assert!(matches!(app(&h).popup, Some(Popup::Replace(_))));
+    click(&mut h, "Replace them");
     finish_ops(&mut h);
     assert_eq!(
         managed(&h, "gh:Nevcairiel/GatherMate2").unwrap().channel,

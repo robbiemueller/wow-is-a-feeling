@@ -5,7 +5,7 @@ use crate::demo;
 use crate::dialogs::Popup;
 use crate::easter;
 use crate::model::{self, CatalogStatus, GameState, Section, Selection, Tab};
-use crate::ops::{self, Op, OpKind, Verb};
+use crate::ops::{self, Op, OpKind, Verb, folder_set};
 use crate::views::settings::VERSION;
 use crate::worker::{CatalogSource, Event, LocalZipFacts, OpFailure, OpOutcome};
 use eframe::egui::{TextureOptions, ViewportCommand};
@@ -175,6 +175,7 @@ impl App {
     ) {
         self.scan_running = false;
         self.scanned = true;
+        self.actions.append(&mut self.after_scan);
         if let Some(error) = error {
             self.red(error);
         }
@@ -314,9 +315,41 @@ impl App {
                 )
             }
         };
+        // A dropped zip and a rollback don't ask first, because the player chose exactly that
+        // file. They still get told what went.
+        let how = match &op.kind {
+            OpKind::LocalZip { .. } => Some("The zip you dropped"),
+            OpKind::Rollback { .. } => Some("Rolling back"),
+            _ => None,
+        };
+        let replaced_line = how
+            .zip(self.managed_map())
+            .and_then(|(how, managed)| ops::replaced_line(how, &id, &outcome.replaced, managed));
+        if let Some(line) = replaced_line {
+            self.yellow(line);
+        }
         let mut folders = outcome.folders.clone();
         folders.sort_by_key(|folder| !same_main(folder, &id));
         if let Some(addon) = self.bundle.as_deref().and_then(|b| b.addon(&id)) {
+            // A folder this addon shares stays claimed while the catalog lists it, even if this
+            // zip didn't bring it, or the next update would ask about it all over again. One
+            // nothing else claims stays out unless the zip really brought it, because a later
+            // version without it would then delete a folder that was never replaced.
+            if let OpKind::Download { may_replace, .. } = &op.kind
+                && let Some(managed) = self.managed_map()
+            {
+                let listed = folder_set(&addon.folders);
+                let mut have = folder_set(&folders);
+                for folder in may_replace {
+                    let lower = folder.to_lowercase();
+                    if listed.contains(&lower)
+                        && ops::claimed_by_another(managed, &id, &lower)
+                        && have.insert(lower)
+                    {
+                        folders.push(folder.clone());
+                    }
+                }
+            }
             // Main folder first, the order the catalog lists them in.
             let order = |folder: &String| {
                 addon

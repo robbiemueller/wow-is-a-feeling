@@ -601,12 +601,14 @@ impl Worker {
             OpKind::Download {
                 release,
                 old_folders,
+                may_replace,
                 ..
             } => {
                 let (install, layout) = game_layout(env)?;
                 detect::ensure_addons_dir(&install)?;
                 let mut request = InstallRequest::for_release(&op.addon_id, release);
                 request.old_folders = old_folders.clone();
+                request.may_replace = Some(may_replace.clone());
                 request.cache_dir = self.zip_cache(env);
                 let size = request.size;
                 let mut report = self.stage_reporter(op.id, size);

@@ -3,6 +3,7 @@
 
 use crate::actions::Action;
 use crate::app::App;
+use crate::ops::{FolderConflict, Verb};
 use crate::theme;
 use crate::widgets::{self, ButtonKind};
 use crate::worker::{DirListing, FoundGame};
@@ -24,6 +25,27 @@ pub struct RemovePlan {
     pub dependents: Vec<String>,
 }
 
+/// What an install would take from something else, worked out when the popup opens.
+#[derive(Clone, Debug)]
+pub struct ReplacePlan {
+    pub addon_id: String,
+    pub name: String,
+    /// Who it's from, because a display name isn't unique and this is.
+    pub source: String,
+    pub verb: Verb,
+    pub conflicts: Vec<FolderConflict>,
+}
+
+impl ReplacePlan {
+    /// Saying yes to this.
+    pub fn confirmed(&self) -> Action {
+        Action::ReplaceAndInstall(
+            self.addon_id.clone(),
+            self.conflicts.iter().map(|c| c.folder.clone()).collect(),
+        )
+    }
+}
+
 /// What a pasted list would do.
 #[derive(Clone, Debug, Default)]
 pub struct ListPreview {
@@ -36,6 +58,7 @@ pub struct ListPreview {
 pub enum Popup {
     AlreadyRunning,
     Remove(RemovePlan),
+    Replace(ReplacePlan),
     AppUpdate(Box<UpdateInfo>),
     Restore { zip: PathBuf, when: String },
     Folder(Box<FolderBrowser>),
@@ -67,7 +90,7 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
     let mut keep = !escape;
     let width: f32 = match &popup {
         Popup::Folder(_) => 560.0,
-        Popup::AppUpdate(_) | Popup::List(_) => 460.0,
+        Popup::AppUpdate(_) | Popup::List(_) | Popup::Replace(_) => 460.0,
         _ => 400.0,
     };
     let mut popup = popup;
@@ -94,6 +117,7 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
             match &mut popup {
                 Popup::AlreadyRunning => already_running(ui, ctx),
                 Popup::Remove(plan) => remove(ui, app, plan, &mut keep),
+                Popup::Replace(plan) => replace(ui, app, plan, &mut keep),
                 Popup::AppUpdate(info) => app_update(ui, app, info, &mut keep),
                 Popup::Restore { zip, when } => restore(ui, app, zip, when, &mut keep),
                 Popup::Folder(browser) => folder(ui, app, browser, &mut keep),
@@ -195,6 +219,57 @@ fn remove(ui: &mut Ui, app: &mut App, plan: &RemovePlan, keep: &mut bool) {
     button_row(ui, |ui| {
         if widgets::button(ui, "Remove", ButtonKind::Main, true).clicked() {
             app.actions.push(Action::ConfirmRemove(plan.clone()));
+            *keep = false;
+        }
+        if widgets::button(ui, "Cancel", ButtonKind::Quiet, true).clicked() {
+            *keep = false;
+        }
+    });
+}
+
+fn replace(ui: &mut Ui, app: &mut App, plan: &ReplacePlan, keep: &mut bool) {
+    yellow(
+        ui,
+        &format!(
+            "{} {} would replace these folders already in your AddOns:",
+            plan.verb.gerund(),
+            plan.name
+        ),
+    );
+    ui.add_space(6.0);
+    ScrollArea::vertical()
+        .id_salt("replace-list")
+        .max_height(160.0)
+        .show(ui, |ui| {
+            // A real addon never gets near this. A strange catalog entry could.
+            const MOST_SHOWN: usize = 40;
+            for conflict in plan.conflicts.iter().take(MOST_SHOWN) {
+                plain(ui, &conflict.describe());
+            }
+            if plan.conflicts.len() > MOST_SHOWN {
+                plain(
+                    ui,
+                    &format!("and {} more", plan.conflicts.len() - MOST_SHOWN),
+                );
+            }
+        });
+    ui.add_space(6.0);
+    plain(
+        ui,
+        "What's in them now gets deleted, and anything that needs them may stop working until you install it again. Your saved settings in WTF stay.",
+    );
+    ui.add_space(6.0);
+    ui.add(
+        egui::Label::new(
+            RichText::new(format!("Source: {}", plan.source))
+                .font(theme::body(13.0))
+                .color(theme::TEXT_DIM),
+        )
+        .wrap(),
+    );
+    button_row(ui, |ui| {
+        if widgets::button(ui, "Replace them", ButtonKind::Main, true).clicked() {
+            app.actions.push(plan.confirmed());
             *keep = false;
         }
         if widgets::button(ui, "Cancel", ButtonKind::Quiet, true).clicked() {

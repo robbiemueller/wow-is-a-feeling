@@ -11,6 +11,7 @@ use eframe::egui::{
     self, Color32, Rect, RichText, ScrollArea, Sense, Stroke, StrokeKind, Ui, UiBuilder, pos2, vec2,
 };
 use feeling_core::catalog::{Addon, Channel};
+use feeling_core::deps;
 use feeling_core::state::{ManagedAddon, Origin};
 
 const BUTTON_HEIGHT: f32 = 26.0;
@@ -347,6 +348,11 @@ fn addon_body(
         ui.add_space(10.0);
     }
     widgets::section(ui, "Details");
+    // First in the section, so it's on screen without scrolling even in the smallest window.
+    if !addon.trusted {
+        widgets::ink(ui, model::UNTRUSTED_NOTE, theme::body(14.5), theme::INK);
+        ui.add_space(3.0);
+    }
     let release = addon.release(channel);
     match (record, release) {
         (Some(record), Some(release)) if model::update_for(record, addon).is_some() => {
@@ -371,15 +377,15 @@ fn addon_body(
             widgets::fact(ui, "Size:", &model::size_text(release.size));
         }
     }
-    let source = model::source_label(addon);
-    match model::addon_page_url(addon) {
+    let source = model::source_text(addon);
+    match model::source_url(addon) {
         Some(url) => widgets::fact_with(ui, "Source:", |ui| {
-            let link = widgets::ink_link(ui, source, theme::strong(15.0)).on_hover_text(&url);
+            let link = widgets::ink_link_fit(ui, &source, theme::strong(15.0)).on_hover_text(&url);
             if link.clicked() {
                 app.actions.push(Action::OpenLink(url.clone()));
             }
         }),
-        None => widgets::fact(ui, "Source:", source),
+        None => widgets::fact(ui, "Source:", &source),
     }
     if !addon.folders.is_empty() {
         widgets::fact(ui, "Folders:", &clean_line(&addon.folders.join(", "), 600));
@@ -399,9 +405,11 @@ fn requires(app: &mut App, ui: &mut Ui, addon: &Addon) {
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
             for dep in &addon.deps {
+                // The same pick an install would make, so a stranger's entry never gets to
+                // stand here as what this addon requires.
                 let provider = bundle.as_deref().and_then(|b| {
-                    let first = *b.folders.providers(dep).first()?;
-                    b.catalog.addons.get(first)
+                    let best = deps::best_provider(dep, &b.catalog, &b.folders)?;
+                    b.catalog.addons.get(best)
                 });
                 match provider {
                     Some(provider) => {
@@ -540,7 +548,7 @@ fn other_page(app: &mut App, ui: &mut Ui, rect: Rect, primary: &str) {
         bundle
             .as_deref()
             .and_then(|b| b.addon(&a.addon_id))
-            .map(|addon| addon.name.clone())
+            .map(|addon| format!("{} ({})", addon.name, model::source_text(addon)))
     });
 
     let mut buttons = Vec::new();

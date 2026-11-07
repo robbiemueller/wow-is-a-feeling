@@ -4,6 +4,7 @@
 //! ```text
 //! wait              # until the game, catalog and every operation have settled
 //! install <id>      # the Install button, whatever it says today
+//! replace           # Replace them, on the popup that can open next
 //! rollback <id>
 //! remove <id>
 //! adopt <id>
@@ -94,6 +95,11 @@ impl Script {
         self.log(&format!("> {line}"));
         match command {
             "install" => app.actions.push(Action::Install(vec![rest.to_owned()])),
+            "replace" => {
+                if let Some(crate::dialogs::Popup::Replace(plan)) = app.popup.take() {
+                    app.actions.push(plan.confirmed());
+                }
+            }
             "rollback" => app.actions.push(Action::Rollback(rest.to_owned())),
             "remove" => {
                 app.ask_remove(&Selection::Addon(rest.to_owned()));

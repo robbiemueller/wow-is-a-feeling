@@ -256,6 +256,11 @@ pub struct Adoption {
 /// Match unmanaged folders to catalog addons, by TOC ids first and then by the addon's
 /// main folder name. Titles are never used, because same-named projects exist, and a
 /// folder whose ids contradict an addon is never matched to it by name.
+///
+/// Only trusted entries can match, because a match hands the folder over to that entry's
+/// updates, and a stranger's ids and folder names are only claims. A match by id also needs
+/// the entry to list the folder, so copying an id can't take over a folder the entry has
+/// nothing to do with. Whatever doesn't match stays with the player, under Other folders.
 pub fn match_to_catalog<I, S>(
     folders: &[LocalFolder],
     catalog: &Catalog,
@@ -281,7 +286,7 @@ where
 
     for (i, folder) in folders.iter().enumerate() {
         if matcher.can_adopt(folder)
-            && let Some((addon, how)) = index.by_toc_ids(&folder.toc)
+            && let Some((addon, how)) = index.by_toc_ids(folder, &catalog.addons)
         {
             matcher.adopt(addon, i, how);
         }
@@ -301,10 +306,11 @@ where
     matcher.into_adoptions()
 }
 
+/// The trusted entries, by what could match them, most downloaded first.
 struct CatalogIds {
-    wowi: HashMap<String, usize>,
-    curse: HashMap<String, usize>,
-    wago: HashMap<String, usize>,
+    wowi: HashMap<String, Vec<usize>>,
+    curse: HashMap<String, Vec<usize>>,
+    wago: HashMap<String, Vec<usize>>,
     main_folders: HashMap<String, Vec<usize>>,
 }
 
@@ -316,15 +322,15 @@ impl CatalogIds {
             wago: HashMap::new(),
             main_folders: HashMap::new(),
         };
-        for (i, addon) in addons.iter().enumerate() {
+        for (i, addon) in addons.iter().enumerate().filter(|(_, a)| a.trusted) {
             if let Some(id) = addon_wowi_id(addon) {
-                keep_most_downloaded(&mut index.wowi, id, i, addons);
+                index.wowi.entry(id).or_default().push(i);
             }
             if let Some(id) = &addon.ids.curse {
-                keep_most_downloaded(&mut index.curse, id.clone(), i, addons);
+                index.curse.entry(id.clone()).or_default().push(i);
             }
             if let Some(id) = &addon.ids.wago {
-                keep_most_downloaded(&mut index.wago, id.clone(), i, addons);
+                index.wago.entry(id.clone()).or_default().push(i);
             }
             if let Some(main) = addon.folders.first() {
                 index
@@ -335,16 +341,28 @@ impl CatalogIds {
             }
         }
         // Stable sort, so the catalog's order settles exact ties.
-        for candidates in index.main_folders.values_mut() {
-            candidates.sort_by_key(|&i| Reverse(popularity(&addons[i])));
+        for map in [
+            &mut index.wowi,
+            &mut index.curse,
+            &mut index.wago,
+            &mut index.main_folders,
+        ] {
+            for candidates in map.values_mut() {
+                candidates.sort_by_key(|&i| Reverse(popularity(&addons[i])));
+            }
         }
         index
     }
 
-    fn by_toc_ids(&self, toc: &Toc) -> Option<(usize, MatchHow)> {
-        let look = |map: &HashMap<String, usize>, id: &Option<String>| {
-            id.as_deref().and_then(|id| map.get(id)).copied()
+    fn by_toc_ids(&self, folder: &LocalFolder, addons: &[Addon]) -> Option<(usize, MatchHow)> {
+        let name = folder.name.to_lowercase();
+        let look = |map: &HashMap<String, Vec<usize>>, id: &Option<String>| {
+            map.get(id.as_deref()?)?
+                .iter()
+                .copied()
+                .find(|&addon| lists_folder(&addons[addon], &name))
         };
+        let toc = &folder.toc;
         look(&self.wowi, &toc.wowi_id)
             .map(|addon| (addon, MatchHow::WowiId))
             .or_else(|| look(&self.curse, &toc.curse_id).map(|addon| (addon, MatchHow::CurseId)))
@@ -360,16 +378,8 @@ impl CatalogIds {
     }
 }
 
-fn keep_most_downloaded(
-    map: &mut HashMap<String, usize>,
-    id: String,
-    addon: usize,
-    addons: &[Addon],
-) {
-    let slot = map.entry(id).or_insert(addon);
-    if popularity(&addons[addon]) > popularity(&addons[*slot]) {
-        *slot = addon;
-    }
+fn lists_folder(addon: &Addon, lower_name: &str) -> bool {
+    addon.folders.iter().any(|f| f.to_lowercase() == lower_name)
 }
 
 fn popularity(addon: &Addon) -> (u64, u32) {
@@ -520,6 +530,7 @@ mod tests {
             name: id.to_string(),
             folders: folders.iter().map(|f| f.to_string()).collect(),
             downloads,
+            trusted: true,
             ..Default::default()
         }
     }
@@ -959,13 +970,13 @@ mod tests {
 
     #[test]
     fn matches_by_each_kind_of_toc_id() {
-        let mut wowi = addon("wowi:5086", &["Different"], 1);
+        let mut wowi = addon("wowi:5086", &["Main1", "A"], 1);
         wowi.source = Source::Wowi { id: 5086 };
-        let mut explicit_wowi = addon("gh:a/explicit", &["AlsoDifferent"], 1);
+        let mut explicit_wowi = addon("gh:a/explicit", &["Main2", "B"], 1);
         explicit_wowi.ids.wowi = Some("777".to_string());
-        let mut curse = addon("gh:a/curse", &["Other"], 1);
+        let mut curse = addon("gh:a/curse", &["Main3", "C"], 1);
         curse.ids.curse = Some("2382".to_string());
-        let mut wago = addon("gh:a/wago", &["Another"], 1);
+        let mut wago = addon("gh:a/wago", &["Main4", "D", "E"], 1);
         wago.ids.wago = Some("e56n8DG8".to_string());
 
         let folders = vec![
@@ -998,9 +1009,9 @@ mod tests {
 
     #[test]
     fn wowi_id_wins_over_curse_id() {
-        let mut by_curse = addon("gh:a/curse", &[], 1);
+        let mut by_curse = addon("gh:a/curse", &["Main1", "X"], 1);
         by_curse.ids.curse = Some("1".to_string());
-        let mut by_wowi = addon("gh:a/wowi", &[], 1);
+        let mut by_wowi = addon("gh:a/wowi", &["Main2", "X"], 1);
         by_wowi.ids.wowi = Some("2".to_string());
         let folders = vec![folder("X", "## X-Curse-Project-ID: 1\n## X-WoWI-ID: 2\n")];
         let found = match_to_catalog(&folders, &catalog(vec![by_curse, by_wowi]), NO_MANAGED);
@@ -1025,7 +1036,7 @@ mod tests {
 
     #[test]
     fn ids_beat_the_folder_name() {
-        let mut real = addon("gh:real/thing", &["SomethingElse"], 1);
+        let mut real = addon("gh:real/thing", &["SomethingElse", "Thing"], 1);
         real.ids.wowi = Some("42".to_string());
         let lookalike = addon("gh:fake/thing", &["Thing"], 1_000_000);
         let folders = vec![folder("Thing", "## X-WoWI-ID: 42\n")];
@@ -1118,12 +1129,81 @@ mod tests {
     }
 
     #[test]
-    fn a_folder_matched_by_id_is_kept_even_if_the_catalog_does_not_list_it() {
-        let mut addon = addon("gh:a/thing", &["Thing"], 1);
-        addon.ids.curse = Some("9".to_string());
-        let folders = vec![folder("Thing_Renamed", "## X-Curse-Project-ID: 9\n")];
-        let found = match_to_catalog(&folders, &catalog(vec![addon]), NO_MANAGED);
-        assert_eq!(found[0].folders, ["Thing_Renamed"]);
+    fn an_id_match_needs_the_entry_to_list_the_folder() {
+        // A TOC id is only a claim. Otherwise a repo copying BigWigs's id would adopt it
+        // and, listing none of its folders, delete it at the next update.
+        let mut stranger = addon("gh:stranger/thing", &["Unrelated"], 1_000_000);
+        stranger.ids.wowi = Some("5086".to_string());
+        let folders = vec![folder("BigWigs", "## X-WoWI-ID: 5086\n")];
+        assert!(match_to_catalog(&folders, &catalog(vec![stranger]), NO_MANAGED).is_empty());
+        assert_eq!(
+            group_names(&group_unmanaged(&folders, NO_MANAGED)),
+            [("BigWigs", vec!["BigWigs"])]
+        );
+    }
+
+    #[test]
+    fn an_id_goes_to_an_entry_that_lists_the_folder_even_if_another_is_bigger() {
+        let mut big = addon("gh:a/big", &["Elsewhere"], 1_000_000);
+        big.ids.wowi = Some("7".to_string());
+        let mut small = addon("gh:a/small", &["Thing"], 1);
+        small.ids.wowi = Some("7".to_string());
+        let folders = vec![folder("Thing", "## X-WoWI-ID: 7\n")];
+        let found = match_to_catalog(&folders, &catalog(vec![big, small]), NO_MANAGED);
+        assert_eq!(found[0].addon_id, "gh:a/small");
+        assert_eq!(found[0].how, MatchHow::WowiId);
+    }
+
+    #[test]
+    fn an_untrusted_entry_never_matches_however_well_it_fits() {
+        let mut by_id = addon(
+            "gh:stranger/bigwigs",
+            &["BigWigs", "BigWigs_Core"],
+            9_000_000,
+        );
+        by_id.ids.wowi = Some("5086".to_string());
+        by_id.trusted = false;
+        let mut by_name = addon("gh:stranger/questie", &["Questie"], 9_000_000);
+        by_name.trusted = false;
+        let folders = vec![
+            folder("BigWigs", "## X-WoWI-ID: 5086\n"),
+            folder("BigWigs_Core", "## X-WoWI-ID: 5086\n"),
+            folder("Questie", ""),
+        ];
+        assert!(match_to_catalog(&folders, &catalog(vec![by_id, by_name]), NO_MANAGED).is_empty());
+        assert_eq!(
+            group_names(&group_unmanaged(&folders, NO_MANAGED)),
+            [
+                ("BigWigs", vec!["BigWigs", "BigWigs_Core"]),
+                ("Questie", vec!["Questie"]),
+            ],
+            "so they stay under Other folders"
+        );
+    }
+
+    #[test]
+    fn a_trusted_entry_wins_however_many_downloads_a_stranger_reports() {
+        let mut stranger = addon("gh:0-free/details", &["Details"], 9_000_000);
+        stranger.ids.wowi = Some("7".to_string());
+        stranger.trusted = false;
+        let mut real = addon("gh:tercioo/details", &["Details"], 0);
+        real.ids.wowi = Some("7".to_string());
+
+        let by_id = vec![folder("Details", "## X-WoWI-ID: 7\n")];
+        let both = catalog(vec![stranger.clone(), real.clone()]);
+        assert_eq!(
+            match_to_catalog(&by_id, &both, NO_MANAGED)[0].addon_id,
+            "gh:tercioo/details"
+        );
+
+        stranger.ids.wowi = None;
+        real.ids.wowi = None;
+        let by_name = vec![folder("Details", "")];
+        let both = catalog(vec![stranger, real]);
+        assert_eq!(
+            match_to_catalog(&by_name, &both, NO_MANAGED)[0].addon_id,
+            "gh:tercioo/details"
+        );
     }
 
     #[test]
@@ -1178,9 +1258,9 @@ mod tests {
             wowi: Some("7".to_string()),
             ..Default::default()
         };
-        let mut small = addon("gh:a/small", &[], 1);
+        let mut small = addon("gh:a/small", &["X"], 1);
         small.ids = ids.clone();
-        let mut big = addon("gh:a/big", &[], 100);
+        let mut big = addon("gh:a/big", &["X"], 100);
         big.ids = ids;
         let folders = vec![folder("X", "## X-WoWI-ID: 7\n")];
         let found = match_to_catalog(&folders, &catalog(vec![small, big]), NO_MANAGED);

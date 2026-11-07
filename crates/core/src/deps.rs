@@ -47,7 +47,8 @@ pub struct Resolution {
     /// Addon ids in install order: dependencies first, the requested addon last.
     /// Empty when the requested id isn't in the catalog.
     pub to_install: Vec<String>,
-    /// Required folders that nothing installed and nothing in the catalog provides.
+    /// Required folders that nothing installed provides and no trusted catalog entry does
+    /// either. The player has to look for these themselves.
     pub missing: Vec<String>,
 }
 
@@ -114,16 +115,25 @@ fn plan_folders(addon: &Addon, planned: &mut HashSet<String>) {
     planned.extend(addon.folders.iter().map(|f| f.to_lowercase()));
 }
 
-/// The addon whose main folder this is, then the most downloaded. Ties keep catalog order.
-fn best_provider(folder: &str, catalog: &Catalog, index: &FolderIndex) -> Option<usize> {
-    index.providers(folder).iter().copied().min_by_key(|&i| {
-        let addon = &catalog.addons[i];
-        let is_main = addon
-            .folders
-            .first()
-            .is_some_and(|main| main.to_lowercase() == folder);
-        (!is_main, std::cmp::Reverse(addon.downloads), i)
-    })
+/// The addon the app would pick by itself for this folder: the trusted one whose main folder
+/// it is, then the most downloaded trusted one. Ties keep catalog order. An untrusted entry
+/// is never picked, even when nothing else provides the folder, because its folder list is
+/// only a claim and its downloads can be inflated.
+pub fn best_provider(folder: &str, catalog: &Catalog, index: &FolderIndex) -> Option<usize> {
+    let folder = folder.to_lowercase();
+    index
+        .providers(&folder)
+        .iter()
+        .copied()
+        .filter(|&i| catalog.addons[i].trusted)
+        .min_by_key(|&i| {
+            let addon = &catalog.addons[i];
+            let is_main = addon
+                .folders
+                .first()
+                .is_some_and(|main| main.to_lowercase() == folder);
+            (!is_main, std::cmp::Reverse(addon.downloads), i)
+        })
 }
 
 /// Names of addons left on disk that require a folder being removed, for a warning
@@ -198,7 +208,16 @@ mod tests {
             name: format!("Name of {id}"),
             folders: folders.iter().map(|f| f.to_string()).collect(),
             deps: deps.iter().map(|d| d.to_string()).collect(),
+            trusted: true,
             ..Default::default()
+        }
+    }
+
+    fn untrusted(id: &str, folders: &[&str], downloads: u64) -> Addon {
+        Addon {
+            downloads,
+            trusted: false,
+            ..addon(id, folders, &[])
         }
     }
 
@@ -326,6 +345,7 @@ mod tests {
                 } else {
                     vec![]
                 },
+                trusted: true,
                 ..Default::default()
             })
             .collect();
@@ -428,6 +448,43 @@ mod tests {
         also_embeds.downloads = 2_000_000;
         let catalog2 = catalog(vec![root, embedded, also_embeds]);
         assert_eq!(resolve_in(&catalog2, "a", &[]).to_install, ["also", "a"]);
+    }
+
+    #[test]
+    fn an_untrusted_entry_is_never_picked_even_when_nothing_else_provides_the_folder() {
+        // Nobody else lists ElvUI, so anyone could. It counts as missing, and the player
+        // goes looking for it.
+        let catalog = catalog(vec![
+            addon("plugin", &["ElvUI_WindTools"], &["ElvUI"]),
+            untrusted("gh:free-account/ElvUI", &["ElvUI"], 1),
+        ]);
+        let result = resolve_in(&catalog, "plugin", &[]);
+        assert_eq!(result.to_install, ["plugin"]);
+        assert_eq!(result.missing, ["ElvUI"]);
+    }
+
+    #[test]
+    fn downloads_never_lift_an_untrusted_entry_over_a_trusted_one() {
+        let root = addon("a", &["A"], &["LibStub"]);
+        let stranger = untrusted("stranger", &["LibStub"], 9_000_000);
+        let mut embeds = addon("embeds", &["Big", "LibStub"], &[]);
+        embeds.downloads = 5;
+        let catalog = catalog(vec![root, stranger, embeds]);
+        assert_eq!(resolve_in(&catalog, "a", &[]).to_install, ["embeds", "a"]);
+        assert_eq!(
+            best_provider("LIBSTUB", &catalog, &FolderIndex::build(&catalog)),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn asking_for_an_untrusted_addon_still_installs_it_and_what_it_needs() {
+        let mut asked_for = untrusted("stranger", &["Cool"], 1);
+        asked_for.deps = vec!["Lib".to_string(), "Gone".to_string()];
+        let catalog = catalog(vec![asked_for, addon("lib", &["Lib"], &[])]);
+        let result = resolve_in(&catalog, "stranger", &[]);
+        assert_eq!(result.to_install, ["lib", "stranger"]);
+        assert_eq!(result.missing, ["Gone"]);
     }
 
     #[test]
