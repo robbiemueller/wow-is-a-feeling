@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       accept_smaller:
-        description: "Publish even if many addons went missing, after you've checked why. If the last catalog can't be read, this also starts every addon's age over."
+        description: "Publish even if many addons went missing, after you've checked why. If the last catalog can't be read, this also goes on without it, and then only addons the scan cache remembers being published in the last 30 days keep their age."
         type: boolean
         default: false
   push:

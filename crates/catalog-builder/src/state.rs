@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 
-use feeling_core::catalog::Catalog;
+use feeling_core::catalog::{Addon, Catalog};
 use serde::{Deserialize, Serialize};
 
 use crate::curated::{DirectState, SourceState};
@@ -18,6 +18,13 @@ use crate::wowi::WowiState;
 /// price is one slow run.
 const STATE_SCHEMA: u32 = 1;
 const DAY_SECS: i64 = 24 * 60 * 60;
+/// How long an entry gone from the catalog keeps its age and its claims: the 30 days after the
+/// day of the last catalog it was published in. The memory only keeps that day, so counting whole
+/// days is what makes it never less than 30 days.
+const AWAY_DAYS: u64 = 30;
+/// Folders the memory keeps of an entry, the most a real zip brings today. An entry with more
+/// keeps none, so padded zips can't make each entry ever published cost kilobytes.
+const MAX_FOLDERS_REMEMBERED: usize = 32;
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct State {
@@ -43,8 +50,9 @@ pub struct State {
 }
 
 /// The main folder an entry was last published with, the former ones the catalog vouched for
-/// then, when that was, how old the entry was, and its id, name and folders as that catalog had
-/// them. Each of the later fields is empty or 0 for an entry noted before it was kept.
+/// then, when that was, how old the entry was and its id as that catalog had it, and for the 30
+/// days they count, its name, its folders and the repository it was forked from. Each of the later
+/// fields is empty or 0 for an entry noted before it was kept.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LastPublished {
     pub main: String,
@@ -61,49 +69,141 @@ pub struct LastPublished {
     /// Its id as that catalog spells it. The memory is keyed by the id in lower case.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub id: String,
-    /// Its name in that catalog.
+    /// Its name in that catalog, until it stops counting (see [`LastPublished::is_recent`]).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub name: String,
-    /// Its folders in that catalog, the main one first.
+    /// Its folders in that catalog, the main one first, or none for an entry with more than 32.
+    /// Kept until they stop counting, as the name is.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub folders: Vec<String>,
+    /// For a fork, the repository GitHub says it was forked from, as owner/name. Kept until it
+    /// stops counting, as the name is.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub fork_of: String,
 }
 
 impl LastPublished {
+    /// What `addon` was published as in a catalog made on the day `at`, forked from `fork_of`.
+    fn of(addon: &Addon, at: i64, fork_of: &str) -> Option<Self> {
+        let main = addon.folders.first()?;
+        let few = addon.folders.len() <= MAX_FOLDERS_REMEMBERED;
+        Some(Self {
+            main: main.clone(),
+            formerly: addon.formerly.clone(),
+            at,
+            created: addon.created,
+            id: addon.id.clone(),
+            name: addon.name.clone(),
+            folders: if few {
+                addon.folders.clone()
+            } else {
+                Vec::new()
+            },
+            fork_of: fork_of.to_string(),
+        })
+    }
+
     /// Its id as the catalog spelled it, or `key`, the lower case one, for an entry noted before
     /// the spelling was kept.
     pub fn id_or<'a>(&'a self, key: &'a str) -> &'a str {
         if self.id.is_empty() { key } else { &self.id }
     }
+
+    /// Whether it was published in the last 30 days, counted in whole days from the day of that
+    /// catalog, so nothing lapses early. One noted before the day was kept counts as recent, and
+    /// so does one from a day after `now`.
+    pub fn is_recent(&self, now: i64) -> bool {
+        let day = |time: i64| u64::try_from(time.div_euclid(DAY_SECS)).unwrap_or(0);
+        self.at == 0 || day(now).saturating_sub(day(self.at)) <= AWAY_DAYS
+    }
 }
 
-/// What each entry was last published as, by lowercased id. Nothing is ever taken out: it's a
-/// short line for each entry ever listed, a few hundred kilobytes at most.
+/// What a build knew of an entry it published that the catalog doesn't say.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Origin {
+    /// The repository GitHub says it was forked from, as owner/name.
+    pub fork_of: Option<String>,
+    /// The ids it had before GitHub renamed it.
+    pub renamed_from: Vec<String>,
+}
+
+impl Origin {
+    pub fn of(candidate: &Candidate) -> Self {
+        Self {
+            fork_of: candidate.fork_of.clone(),
+            renamed_from: candidate.renamed_from.clone(),
+        }
+    }
+}
+
+/// Each published entry's [`Origin`], by lowercased id.
+pub type Origins = BTreeMap<String, Origin>;
+
+/// What each entry was last published as, by lowercased id. An entry stays a short line once its
+/// name and folders stop counting, until a maintainer excludes it or GitHub renames its repository
+/// and the entry is published under its new id.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Remembered(BTreeMap<String, LastPublished>);
 
 impl Remembered {
-    /// Notes what each entry of a catalog that went out was published as, and on which day.
-    /// Entries it left out keep what was noted before.
-    pub fn note(&mut self, catalog: &Catalog) {
+    /// Notes what each entry of a catalog that went out was published as, and on which day, with
+    /// where `origins` says it came from. Entries it left out keep what was noted before, except
+    /// under an id an entry it lists had before GitHub renamed it: what was published under that id
+    /// is the renamed entry's past, so nothing speaks for it any more. Then every entry whose
+    /// name, folders and parent have stopped counting forgets them.
+    pub fn note(&mut self, catalog: &Catalog, origins: &Origins) {
+        let at = catalog.generated.div_euclid(DAY_SECS) * DAY_SECS;
+        let origin = |addon: &Addon| origins.get(&addon.id.to_ascii_lowercase());
         for addon in &catalog.addons {
-            let Some(main) = addon.folders.first() else {
-                continue;
-            };
-            self.0.insert(
-                addon.id.to_ascii_lowercase(),
-                LastPublished {
-                    main: main.clone(),
-                    formerly: addon.formerly.clone(),
-                    at: catalog.generated.div_euclid(DAY_SECS) * DAY_SECS,
-                    created: addon.created,
-                    id: addon.id.clone(),
-                    name: addon.name.clone(),
-                    folders: addon.folders.clone(),
-                },
-            );
+            for old in origin(addon).into_iter().flat_map(|o| &o.renamed_from) {
+                self.0.remove(&old.to_ascii_lowercase());
+            }
         }
+        for addon in &catalog.addons {
+            let fork_of = origin(addon).and_then(|o| o.fork_of.as_deref());
+            if let Some(last) = LastPublished::of(addon, at, fork_of.unwrap_or_default()) {
+                self.0.insert(addon.id.to_ascii_lowercase(), last);
+            }
+        }
+        for last in self.0.values_mut() {
+            if !last.is_recent(catalog.generated) {
+                last.name.clear();
+                last.folders.clear();
+                last.fork_of.clear();
+            }
+        }
+    }
+
+    /// Notes each entry a catalog lists that the memory has nothing of, or only from before that
+    /// catalog's day, as of that day. So the memory starts from the last catalog, such as when the
+    /// scan cache had none, and a build that leaves an entry out still keeps what it was. A catalog
+    /// with no time on it says nothing about when.
+    pub fn note_missing(&mut self, catalog: &Catalog) {
+        if catalog.generated <= 0 {
+            return;
+        }
+        let at = catalog.generated.div_euclid(DAY_SECS) * DAY_SECS;
+        for addon in &catalog.addons {
+            let key = addon.id.to_ascii_lowercase();
+            if self.0.get(&key).is_some_and(|last| last.at >= at) {
+                continue;
+            }
+            if let Some(last) = LastPublished::of(addon, at, "") {
+                self.0.insert(key, last);
+            }
+        }
+    }
+
+    /// Forgets every entry whose lowercased id `keep` turns down, such as one a maintainer
+    /// excluded.
+    pub fn retain(&mut self, mut keep: impl FnMut(&str) -> bool) {
+        self.0.retain(|id, _| keep(id));
+    }
+
+    /// How many bytes the memory takes in the scan cache.
+    pub fn size(&self) -> usize {
+        serde_json::to_vec(self).map_or(0, |bytes| bytes.len())
     }
 
     /// What the entry with this id was last published as. Case doesn't matter.
@@ -383,11 +483,11 @@ mod tests {
             ("gh:A/Addon", &["Addon", "Addon_Options"], &[]),
         ]);
         first.generated = 1_800_000_000;
-        state.remembered.note(&first);
+        state.remembered.note(&first, &Origins::new());
         // The next catalog leaves the listing out and moves the repository's main folder.
         let mut next = catalog_of(&[("gh:a/addon", &["AddonCore", "Addon"], &[])]);
         next.generated = 1_800_086_400;
-        state.remembered.note(&next);
+        state.remembered.note(&next, &Origins::new());
         let tomtom = state.remembered.get("WOWI:7032").unwrap();
         assert_eq!(tomtom.main, "TomTomForever");
         assert_eq!(tomtom.formerly, ["TomTom"]);
@@ -446,6 +546,181 @@ mod tests {
                 .contains("remembered"),
             "nothing written while there's nothing to remember"
         );
+    }
+
+    #[test]
+    fn the_memory_of_entries_that_are_gone_stays_small_whatever_they_listed() {
+        // Catalogs whose entries are as big as the gate lets out, each with fresh ids, as a
+        // stranger's repositories that come and go would be.
+        let folder = |entry: usize, at: usize| format!("{entry:06}{at:03}{}", "x".repeat(111));
+        let entry = |n: usize| Addon {
+            id: format!("gh:stranger{}/repo{n}", n / 40),
+            name: format!("Stranger Addon {n}"),
+            folders: (0..crate::zipscan::MAX_FOLDERS)
+                .map(|at| folder(n, at))
+                .collect(),
+            created: 1_800_000_000,
+            ..Addon::default()
+        };
+        let one = Catalog {
+            addons: vec![entry(0)],
+            generated: 1_800_000_000,
+            ..Catalog::default()
+        };
+        let one_bytes = serde_json::to_vec(&one).unwrap().len();
+        let mut remembered = Remembered::default();
+        remembered.note(&one, &Origins::new());
+        let per_entry = remembered.size();
+        // As many such entries as one catalog can carry.
+        let per_catalog = 8 * 1024 * 1024 / one_bytes;
+        let added_per_catalog = per_entry * per_catalog;
+        let catalogs_to_95_mib = 95 * 1024 * 1024 / added_per_catalog.max(1);
+        assert!(
+            per_entry < 400,
+            "one published entry costs {per_entry} bytes of memory; one catalog of {per_catalog} such entries adds {added_per_catalog} bytes, so {catalogs_to_95_mib} catalogs with fresh ids take the scan cache past 95 MiB"
+        );
+    }
+
+    #[test]
+    fn what_a_padded_entry_costs_the_memory_now_and_a_month_on() {
+        let padded = |folders: usize| Addon {
+            id: "gh:stranger0/repo0".into(),
+            name: "Stranger Addon 0".into(),
+            folders: (0..folders)
+                .map(|at| format!("{at:03}{}", "x".repeat(117)))
+                .collect(),
+            created: 1_800_000_000,
+            ..Addon::default()
+        };
+        for folders in [32, 33, 256] {
+            let mut remembered = Remembered::default();
+            let noted = Catalog {
+                addons: vec![padded(folders)],
+                generated: 1_800_000_000,
+                ..Catalog::default()
+            };
+            remembered.note(&noted, &Origins::new());
+            let fresh = remembered.size();
+            let kept = remembered.get("gh:stranger0/repo0").unwrap().folders.len();
+            assert_eq!(kept, if folders <= 32 { folders } else { 0 }, "{folders}");
+            // A month on, another catalog goes out without it.
+            let later = Catalog {
+                generated: 1_800_000_000 + 31 * DAY_SECS,
+                ..Catalog::default()
+            };
+            remembered.note(&later, &Origins::new());
+            let last = remembered.get("gh:stranger0/repo0").unwrap();
+            assert!(last.name.is_empty() && last.folders.is_empty(), "{folders}");
+            assert_eq!(last.id, "gh:stranger0/repo0", "still known");
+            assert_eq!(last.main, padded(folders).folders[0], "and still pinned");
+            let month_on = remembered.size();
+            assert!(fresh < 4_500, "{folders} folders: {fresh} bytes when noted");
+            assert!(
+                month_on < 250,
+                "{folders} folders: {month_on} bytes a month on"
+            );
+        }
+    }
+
+    #[test]
+    fn an_id_a_published_entry_had_before_github_renamed_it_is_forgotten() {
+        let mut remembered = Remembered::default();
+        let before = catalog_of(&[("gh:zebra/Helpers", &["Helpers"], &[])]);
+        remembered.note(&before, &Origins::new());
+        // The rename goes out, beside something unrelated published at the old name.
+        let renamed = Origin {
+            renamed_from: vec!["gh:zebra/Helpers".into()],
+            ..Origin::default()
+        };
+        let origins = Origins::from([("gh:zebra2/helpers".to_string(), renamed)]);
+        let mut after = catalog_of(&[
+            ("gh:zebra2/Helpers", &["Helpers"], &[]),
+            ("gh:zebra/Helpers", &["Other"], &[]),
+        ]);
+        after.generated = DAY_SECS;
+        remembered.note(&after, &origins);
+        assert_eq!(remembered.get("gh:zebra/Helpers").unwrap().main, "Other");
+        // Without it, nothing is remembered under the old id at all.
+        let alone = catalog_of(&[("gh:zebra2/Helpers", &["Helpers"], &[])]);
+        remembered.note(&alone, &origins);
+        assert_eq!(remembered.get("gh:zebra/Helpers"), None);
+        assert_eq!(remembered.get("gh:zebra2/Helpers").unwrap().main, "Helpers");
+
+        // A fork's parent is noted with it.
+        let fork = Origin {
+            fork_of: Some("up/Stream".into()),
+            ..Origin::default()
+        };
+        let forked = catalog_of(&[("gh:fork/Stream", &["Stream"], &[])]);
+        remembered.note(&forked, &Origins::from([("gh:fork/stream".into(), fork)]));
+        assert_eq!(
+            remembered.get("gh:fork/Stream").unwrap().fork_of,
+            "up/Stream"
+        );
+    }
+
+    #[test]
+    fn a_memory_entry_counts_for_the_30_days_after_the_day_it_was_noted() {
+        let day = 20_833 * DAY_SECS;
+        let noted = LastPublished {
+            at: day,
+            ..LastPublished::default()
+        };
+        assert!(
+            noted.is_recent(day + 31 * DAY_SECS - 1),
+            "the last second of the 30th day"
+        );
+        assert!(!noted.is_recent(day + 31 * DAY_SECS));
+        assert!(noted.is_recent(day - 5 * DAY_SECS), "from a day after now");
+        assert!(LastPublished::default().is_recent(i64::MAX), "undated");
+        // Whatever a damaged scan cache says, nothing overflows.
+        let early = LastPublished {
+            at: i64::MIN,
+            ..LastPublished::default()
+        };
+        assert!(!early.is_recent(i64::MAX));
+        let late = LastPublished {
+            at: i64::MAX,
+            ..LastPublished::default()
+        };
+        assert!(late.is_recent(i64::MIN));
+    }
+
+    #[test]
+    fn the_memory_starts_from_the_last_catalog_for_what_it_has_nothing_newer_of() {
+        let mut remembered = Remembered::default();
+        let mut newer = catalog_of(&[("wowi:1", &["New"], &[])]);
+        newer.generated = 10 * DAY_SECS;
+        remembered.note(&newer, &Origins::new());
+        let mut older = catalog_of(&[("wowi:2", &["Two"], &[])]);
+        older.generated = 2 * DAY_SECS;
+        remembered.note(&older, &Origins::new());
+
+        let mut last = catalog_of(&[
+            ("wowi:1", &["Old"], &[]),
+            ("wowi:2", &["TwoNow"], &[]),
+            ("gh:a/Addon", &["Addon"], &[]),
+        ]);
+        last.generated = 5 * DAY_SECS + 600;
+        remembered.note_missing(&last);
+        let main = |id: &str| remembered.get(id).map(|last| (last.main.clone(), last.at));
+        assert_eq!(
+            main("wowi:1"),
+            Some(("New".into(), 10 * DAY_SECS)),
+            "newer stays"
+        );
+        assert_eq!(main("wowi:2"), Some(("TwoNow".into(), 5 * DAY_SECS)));
+        assert_eq!(main("gh:a/addon"), Some(("Addon".into(), 5 * DAY_SECS)));
+        let filled = remembered.get("gh:a/Addon").unwrap();
+        assert_eq!((filled.name.as_str(), filled.folders.len()), ("Listed", 1));
+
+        // Again, nothing changes, and a catalog with no time on it fills nothing.
+        let before = remembered.clone();
+        remembered.note_missing(&last);
+        assert_eq!(remembered, before);
+        let undated = catalog_of(&[("gh:b/Other", &["Other"], &[])]);
+        remembered.note_missing(&undated);
+        assert_eq!(remembered, before);
     }
 
     #[test]

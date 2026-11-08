@@ -83,6 +83,7 @@ fn scanned(state: &State, curated: &Curated) -> Scanned {
             .values()
             .filter_map(|direct| direct.entry.clone())
             .collect(),
+        left_out: BTreeSet::new(),
     }
 }
 
