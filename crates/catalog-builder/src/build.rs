@@ -1129,7 +1129,8 @@ fn keep_last_known(
     entries
 }
 
-/// The WoWInterface scan. Also returns every id on the site's list, when the list came.
+/// The WoWInterface scan. Also returns every id on the site's list, when the list came and
+/// looks complete (see [`list_is_complete`]).
 fn run_wowi(
     http: &Http,
     state: &mut State,
@@ -1139,8 +1140,8 @@ fn run_wowi(
     saver: &mut Saver,
     tally: &mut Tally,
 ) -> (Vec<Candidate>, Option<BTreeSet<u64>>) {
-    let rows = match wowi::fetch_rows(http) {
-        Ok(rows) => rows,
+    let list = match wowi::fetch_rows(http) {
+        Ok(list) => list,
         Err(problem) => {
             eprintln!("wowinterface: {problem}. Keeping what we knew.");
             let kept = state
@@ -1151,7 +1152,18 @@ fn run_wowi(
             return (kept, None);
         }
     };
+    let rows = list.rows;
     let listed: BTreeSet<u64> = rows.iter().map(|row| row.id).collect();
+    let known: Vec<u64> = state.wowi.keys().copied().collect();
+    let complete = match list_is_complete(&listed, list.skipped, &known) {
+        Ok(()) => true,
+        Err(why) => {
+            eprintln!(
+                "wowinterface: the file list looks incomplete ({why}), so no listing counts as taken off the site in this build."
+            );
+            false
+        }
+    };
     let selected = wowi::select_rows(rows, &seeds.wowi, limit);
     eprintln!(
         "wowinterface: checking {} recently updated addons",
@@ -1174,12 +1186,29 @@ fn run_wowi(
         tally.answered.insert(format!("wowi:{id}"));
     }
     state.wowi.retain(|id, _| listed.contains(id));
-    (entries, Some(listed))
+    (entries, complete.then_some(listed))
+}
+
+/// Whether WoWInterface's file list can be trusted to say which listings are off the site: it
+/// isn't empty, no row was skipped as malformed, and nine in ten of the listings the scan cache
+/// knows are still on it. A few go each day; a truncated or broken list would lose many, and
+/// would otherwise free the claims of listings that are still there.
+fn list_is_complete(listed: &BTreeSet<u64>, skipped: usize, known: &[u64]) -> Result<(), String> {
+    let still = known.iter().filter(|id| listed.contains(id)).count();
+    if listed.is_empty() || skipped > 0 || still * 10 < known.len() * 9 {
+        return Err(format!(
+            "{} rows, {skipped} skipped as malformed, and {still} of the {} listings the scan cache knows",
+            listed.len(),
+            known.len()
+        ));
+    }
+    Ok(())
 }
 
 /// The listings the last catalog lists, or the scan cache remembers, that WoWInterface's list no
 /// longer has, by lowercased id. A listing taken off the site is gone on purpose, so it claims
-/// nothing, unlike a repository GitHub can't find, which could be private for a while.
+/// nothing, unlike a repository GitHub can't find, which could be private for a while. Only
+/// called with a list that looks complete.
 fn delisted(
     listed: &BTreeSet<u64>,
     previous: Option<&Catalog>,
@@ -6888,6 +6917,49 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_listing_with_more_folders_than_the_memory_keeps_stays_held_for_a_taken_folder() {
+        // As above, with 40 folders, more than the scan cache's memory keeps. Once it's held, the
+        // memory can't tell whether the folder is new to it, so it stays held rather than going
+        // out with that folder after one build.
+        let mut w = world();
+        let names: Vec<String> = (0..40).map(|n| format!("Big{n:02}")).collect();
+        let own: Vec<&str> = names.iter().map(String::as_str).collect();
+        let big = listing_entry(5555, "Big", &own, 1_000);
+        let bait = claim_of("zebra/Options", "Zebra Options", &["Big_Options"], 1);
+        w.previous.addons.push(big.addon.clone());
+        w.previous.addons.push(bait.addon.clone());
+        w.repos.push(bait);
+        w.wowi.push(big);
+        let (first, _d) = w.build(vec![]);
+        assert!(!is_held(&first, "wowi:5555"), "{:?}", first.held);
+        w.after(&first);
+        assert!(w.remembered.get("wowi:5555").unwrap().more_folders);
+        w.wowi
+            .last_mut()
+            .unwrap()
+            .addon
+            .folders
+            .push("Big_Options".into());
+        w.now += DAY_SECS;
+        let (built, _d) = w.build(vec![]);
+        assert_eq!(
+            held_reason(&built, "wowi:5555"),
+            "it just added the folder Big_Options, which gh:zebra/Options already lists"
+        );
+        w.after(&built);
+        for day in 2..=3 {
+            w.now += DAY_SECS;
+            let (built, _d) = w.build(vec![]);
+            assert_eq!(
+                held_reason(&built, "wowi:5555"),
+                "it ships the folder Big_Options, which gh:zebra/Options already lists, and the scan cache doesn't keep enough of its folders to tell whether that one is new",
+                "day {day}"
+            );
+            w.after(&built);
+        }
+    }
+
     /// A target listed before ages were kept and a copy with its name and main folder held behind
     /// it, then one build the target is missing from, then the target back. Returns each build.
     fn a_copy_waiting_on(target: Candidate, is_listing: bool, copy: Candidate) -> Vec<Published> {
@@ -6979,9 +7051,10 @@ mod tests {
     }
 
     #[test]
-    fn a_new_repository_from_the_same_owner_can_take_the_place_of_one_that_left() {
-        // The real move from gh:MaddisonM79/ryna-wow_forever to gh:MaddisonM79/ryna_agent, from
-        // one live catalog to the next.
+    fn a_new_repository_under_the_same_owner_name_waits_unless_github_renamed_it() {
+        // gh:MaddisonM79/ryna-wow_forever left the catalog, and gh:MaddisonM79/ryna_agent took its
+        // name. An owner name proves nothing, since an account renamed away frees it for anyone,
+        // so a new repository under it waits out the old entry's claims like any other.
         let mut w = world();
         let old = real_entry("MaddisonM79/ryna-wow_forever", "Ryna", &["Ryna"], 100);
         w.previous.addons.push(old.addon.clone());
@@ -6991,13 +7064,31 @@ mod tests {
         w.repos
             .retain(|c| c.addon.id != "gh:MaddisonM79/ryna-wow_forever");
         w.now += DAY_SECS;
-        let moved = real_entry(
-            "maddisonm79/ryna_agent",
-            "Ryna",
-            &["Ryna", "Ryna_Chronicle"],
-            1,
+        let moved = || {
+            real_entry(
+                "maddisonm79/ryna_agent",
+                "Ryna",
+                &["Ryna", "Ryna_Chronicle"],
+                1,
+            )
+        };
+        let settled = w.settle(vec![moved()]);
+        let (published, _d) = w.build(vec![moved()]);
+        assert_eq!(
+            held_reason(&published, "gh:maddisonm79/ryna_agent"),
+            "its name is gh:MaddisonM79/ryna-wow_forever's, which isn't listed in this build"
         );
-        let (published, _d) = w.build(vec![moved]);
+        assert_eq!(
+            settled.waiting,
+            [
+                "gh:maddisonm79/ryna_agent: its name is gh:MaddisonM79/ryna-wow_forever's, which isn't listed in this build. If it's the same addon moved, seed gh:maddisonm79/ryna_agent in seeds.toml or exclude gh:MaddisonM79/ryna-wow_forever in curated.toml"
+            ]
+        );
+
+        // The real move was GitHub's rename, which the builder follows, so that one is listed.
+        let mut renamed = moved();
+        renamed.renamed_from = vec!["gh:MaddisonM79/ryna-wow_forever".into()];
+        let (published, _d) = w.build(vec![renamed]);
         assert!(
             !is_held(&published, "gh:maddisonm79/ryna_agent"),
             "{:?}",
@@ -7767,6 +7858,27 @@ mod tests {
         assert!(delisted(&listed, None, &Remembered::default()).is_empty());
     }
 
+    #[test]
+    fn a_wowinterface_list_that_looks_cut_short_takes_no_listing_off_the_site() {
+        let known: Vec<u64> = (1..=100).collect();
+        let whole: BTreeSet<u64> = (1..=100).collect();
+        assert!(list_is_complete(&whole, 0, &known).is_ok());
+        // A few listings taken off the site since the last build is normal.
+        let a_few_gone: BTreeSet<u64> = (1..=95).collect();
+        assert!(list_is_complete(&a_few_gone, 0, &known).is_ok());
+        // The first build has nothing to compare with.
+        assert!(list_is_complete(&whole, 0, &[]).is_ok());
+        // A malformed row, an empty list, or a list without a tenth of what we knew isn't trusted.
+        assert!(list_is_complete(&whole, 1, &known).is_err());
+        assert!(list_is_complete(&BTreeSet::new(), 0, &[]).is_err());
+        let cut_short: BTreeSet<u64> = (1..=89).collect();
+        let why = list_is_complete(&cut_short, 0, &known).unwrap_err();
+        assert_eq!(
+            why,
+            "89 rows, 0 skipped as malformed, and 89 of the 100 listings the scan cache knows"
+        );
+    }
+
     /// The world with a fork listed while its parent had no Forever build, from before ages were
     /// kept, built once.
     fn with_a_listed_fork() -> World {
@@ -8052,7 +8164,7 @@ mod tests {
     }
 
     #[test]
-    fn a_new_repository_from_the_same_owner_can_ship_a_folder_the_old_one_was_vouched_for() {
+    fn a_new_repository_under_the_same_owner_name_cant_ship_a_folder_the_old_one_was_vouched_for() {
         // Alice's repository was Wayfarer and before that WayfarerOld, as a person wrote down.
         let mut w = world();
         w.curated.pins = pinned_by_hand("gh:alice/Wayfarer", "Wayfarer", &["WayfarerOld"]).pins;
@@ -8066,13 +8178,28 @@ mod tests {
         );
         w.after(&first);
 
-        // She carries it on in a new repository, without a transfer, and the old one is gone.
+        // A new repository under the name alice, which GitHub didn't rename or transfer, ships the
+        // vouched folder while the old one is gone. The owner name proves nothing, since an
+        // account renamed away frees it for anyone, so it waits until a maintainer lets it in.
         w.repos.retain(|c| c.addon.id != "gh:alice/Wayfarer");
         let reborn = || {
-            let folders = ["Wayfarer", "WayfarerOld"];
-            vec![real_entry("alice/WayfarerReborn", "Wayfarer", &folders, 10)]
+            vec![real_entry(
+                "alice/Reborn",
+                "Reborn",
+                &["Reborn", "WayfarerOld"],
+                10,
+            )]
         };
-        let held = days_held(&mut w, &reborn, "gh:alice/WayfarerReborn", 2);
+        let held = days_held(&mut w, &reborn, "gh:alice/Reborn", 2);
+        assert_eq!(
+            held,
+            [1, 2].map(|day| (
+                day,
+                "its folder WayfarerOld was gh:alice/Wayfarer's main folder".to_string()
+            ))
+        );
+        w.seeds.repos.push("alice/Reborn".into());
+        let held = days_held(&mut w, &reborn, "gh:alice/Reborn", 1);
         assert!(held.is_empty(), "{}", summary_of(&held));
 
         // Another owner's repository shipping that folder is held.

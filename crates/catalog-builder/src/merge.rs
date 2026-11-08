@@ -1032,14 +1032,22 @@ impl<'a> LastCatalog<'a> {
         now: i64,
     ) -> Option<String> {
         let from_memory: HashSet<String>;
+        let mut unsure = false;
         let had = match self.folders_of_entry(candidate) {
             Some(had) => had,
             None => {
                 let last = candidate
                     .known_as()
                     .find_map(|id| remembered.get(id))
-                    .filter(|last| last.is_recent(now) && !last.folders.is_empty())?;
-                from_memory = last.folders.iter().map(|f| fold_folder(f)).collect();
+                    .filter(|last| last.is_recent(now))?;
+                // Without every folder it had, any folder another entry lists may be new to it, so
+                // it counts as added: padding a zip past what the memory keeps mustn't skip this.
+                unsure = last.folders.is_empty() || last.more_folders;
+                from_memory = if unsure {
+                    HashSet::from([fold_folder(&last.main)])
+                } else {
+                    last.folders.iter().map(|f| fold_folder(f)).collect()
+                };
                 &from_memory
             }
         };
@@ -1056,9 +1064,13 @@ impl<'a> LastCatalog<'a> {
                     .find_map(|owner| present.get(&owner.to_ascii_lowercase()))
             });
             if let Some(owner) = owner {
-                return Some(format!(
-                    "it just added the folder {folder}, which {owner} already lists"
-                ));
+                return Some(if unsure {
+                    format!(
+                        "it ships the folder {folder}, which {owner} already lists, and the scan cache doesn't keep enough of its folders to tell whether that one is new"
+                    )
+                } else {
+                    format!("it just added the folder {folder}, which {owner} already lists")
+                });
             }
         }
         None
@@ -1145,8 +1157,9 @@ impl Hold {
 /// A former main folder says an installed copy with it is that entry's addon, so it's that
 /// entry's claim. Anything else shipping it is held unless it has the better claim (see
 /// [`keeps_vouched_folder`]), so it can't take the copies the vouch is for, or strip the vouch.
-/// While the entry is away from the build, its own GitHub owner may ship the folder, as it may
-/// take the entry's name and main folder: that's the author's own move.
+/// That goes for a repository under the same GitHub owner name too: an account renamed away
+/// frees its name for anyone, so the name proves nothing. A real rename or transfer is
+/// followed by GitHub's redirect instead, and a maintainer can let any other move in.
 fn ships_a_vouched_folder(
     candidate: &Candidate,
     claims: &FolderMap<Claim>,
@@ -1155,12 +1168,9 @@ fn ships_a_vouched_folder(
 ) -> Option<Hold> {
     let id = &candidate.addon.id;
     let rank = Rank::of(candidate, picks);
-    let owner = owner_of(candidate);
     candidate.addon.folders.iter().find_map(|folder| {
         let claim = claims.alike(folder).find(|claim| {
-            let own_move = claim.away && owner.is_some() && owner_of_id(&claim.id) == owner;
             !claim.id.eq_ignore_ascii_case(id)
-                && !own_move
                 && !keeps_vouched_folder(candidate, rank, folder, claim.rank, last)
         })?;
         Some(Hold {
@@ -1197,8 +1207,6 @@ fn without_parenthetical(name: &str) -> Option<&str> {
 #[derive(Debug, Clone)]
 struct Absent {
     id: String,
-    /// The GitHub owner, in lower case, for a repository or one of its release lines.
-    owner: Option<String>,
     /// Its name, and for a hand-picked entry whose hand-given name ends in a parenthetical, that
     /// name without it, as the ledger has them.
     names: Vec<String>,
@@ -1218,7 +1226,6 @@ impl Absent {
         names.dedup();
         Self {
             id: id.to_string(),
-            owner: owner_of_id(id),
             names,
             main: fold_folder(addon.main),
             rank: Rank::new(id, addon.created, picks),
@@ -1288,8 +1295,10 @@ fn absent_entries(
 
 /// An entry that isn't listed in this build keeps its name and main folder, so a stranger can't
 /// take them while it's held or away for a build and then shut it out as the older entry. One
-/// that ranks behind it with that name or main folder is held, unless it's from the same GitHub
-/// owner, whose own move it is. Only called for an entry nobody picked by hand.
+/// that ranks behind it with that name or main folder is held, even under the same GitHub owner
+/// name, which an account renamed away frees for anyone. A real rename or transfer is followed by
+/// GitHub's redirect instead, and a maintainer can let any other move in (see the build summary).
+/// Only called for an entry nobody picked by hand.
 fn takes_an_absent_entrys_place(
     candidate: &Candidate,
     absent: &[Absent],
@@ -1298,13 +1307,11 @@ fn takes_an_absent_entrys_place(
     let rank = Rank::of(candidate, picks);
     let name = fold_name(&candidate.addon.name);
     let main = candidate.addon.folders.first();
-    let owner = owner_of(candidate);
     absent.iter().find_map(|entry| {
         let itself = candidate
             .known_as()
             .any(|id| id.eq_ignore_ascii_case(&entry.id));
-        let same_owner = owner.is_some() && owner == entry.owner;
-        if itself || same_owner || !entry.rank.ahead_of(rank) {
+        if itself || !entry.rank.ahead_of(rank) {
             return None;
         }
         let reason = if entry.names.contains(&name) {

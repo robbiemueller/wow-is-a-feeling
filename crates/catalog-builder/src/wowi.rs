@@ -91,14 +91,27 @@ pub struct WowiState {
     pub entry: Option<Candidate>,
 }
 
+/// What `filelist.json` held: the rows that parse, and how many didn't.
+pub struct FileList {
+    pub rows: Vec<Row>,
+    /// Rows skipped as malformed. The real list has none, so any at all means it can't be
+    /// trusted to say which listings are gone from the site.
+    pub skipped: usize,
+}
+
 /// Parse `filelist.json`, skipping malformed rows rather than failing on them.
-pub fn parse_filelist(body: &[u8]) -> Result<Vec<Row>, String> {
-    let rows: Vec<serde_json::Value> = serde_json::from_slice(body)
+pub fn parse_filelist(body: &[u8]) -> Result<FileList, String> {
+    let values: Vec<serde_json::Value> = serde_json::from_slice(body)
         .map_err(|e| format!("the WoWInterface file list doesn't parse: {e}"))?;
-    Ok(rows
+    let total = values.len();
+    let rows: Vec<Row> = values
         .into_iter()
         .filter_map(|row| serde_json::from_value(row).ok())
-        .collect())
+        .collect();
+    Ok(FileList {
+        skipped: total - rows.len(),
+        rows,
+    })
 }
 
 /// The rows worth looking at, seeds first and then the most downloaded this month,
@@ -293,7 +306,7 @@ pub fn examine(row: &Row, probe: &mut dyn WowiProbe) -> Result<Option<Candidate>
 }
 
 /// Fetch and parse the file list.
-pub fn fetch_rows(http: &Http) -> Result<Vec<Row>, String> {
+pub fn fetch_rows(http: &Http) -> Result<FileList, String> {
     let url = format!("{API}/filelist.json");
     let reply = http
         .get_with(Channel::Wowi, &url, &[], SMALL_BODY)
@@ -369,7 +382,9 @@ mod tests {
             {"no":"id"},
             "garbage"
         ]"#;
-        let rows = parse_filelist(body).unwrap();
+        let list = parse_filelist(body).unwrap();
+        assert_eq!(list.skipped, 2);
+        let rows = list.rows;
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].id, 3896);
         assert_eq!(

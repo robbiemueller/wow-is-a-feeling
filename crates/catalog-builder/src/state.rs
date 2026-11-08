@@ -23,7 +23,8 @@ const DAY_SECS: i64 = 24 * 60 * 60;
 /// days is what makes it never less than 30 days.
 const AWAY_DAYS: u64 = 30;
 /// Folders the memory keeps of an entry, the most a real zip brings today. An entry with more
-/// keeps none, so padded zips can't make each entry ever published cost kilobytes.
+/// keeps none, so padded zips can't make each entry ever published cost kilobytes, and is marked
+/// as having more, so a folder check from memory fails closed for it rather than passing.
 const MAX_FOLDERS_REMEMBERED: usize = 32;
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -72,10 +73,14 @@ pub struct LastPublished {
     /// Its name in that catalog, until it stops counting (see [`LastPublished::is_recent`]).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub name: String,
-    /// Its folders in that catalog, the main one first, or none for an entry with more than 32.
-    /// Kept until they stop counting, as the name is.
+    /// Its folders in that catalog, the main one first, or none for an entry with more than 32,
+    /// which `more_folders` marks. Kept until they stop counting, as the name is.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub folders: Vec<String>,
+    /// It had more folders than the memory keeps, so `folders` can't tell whether one is new to
+    /// it, and a folder check from memory fails closed.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub more_folders: bool,
     /// For a fork, the repository GitHub says it was forked from, as owner/name. Kept until it
     /// stops counting, as the name is.
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -99,6 +104,7 @@ impl LastPublished {
             } else {
                 Vec::new()
             },
+            more_folders: !few,
             fork_of: fork_of.to_string(),
         })
     }
@@ -170,6 +176,7 @@ impl Remembered {
             if !last.is_recent(catalog.generated) {
                 last.name.clear();
                 last.folders.clear();
+                last.more_folders = false;
                 last.fork_of.clear();
             }
         }
@@ -275,6 +282,10 @@ pub struct LineState {
 
 fn is_zero(n: &u64) -> bool {
     *n == 0
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 fn is_zero_i64(n: &i64) -> bool {
@@ -601,8 +612,13 @@ mod tests {
             };
             remembered.note(&noted, &Origins::new());
             let fresh = remembered.size();
-            let kept = remembered.get("gh:stranger0/repo0").unwrap().folders.len();
-            assert_eq!(kept, if folders <= 32 { folders } else { 0 }, "{folders}");
+            let last = remembered.get("gh:stranger0/repo0").unwrap();
+            assert_eq!(
+                last.folders.len(),
+                if folders <= 32 { folders } else { 0 },
+                "{folders}"
+            );
+            assert_eq!(last.more_folders, folders > 32, "{folders}");
             // A month on, another catalog goes out without it.
             let later = Catalog {
                 generated: 1_800_000_000 + 31 * DAY_SECS,
@@ -611,6 +627,7 @@ mod tests {
             remembered.note(&later, &Origins::new());
             let last = remembered.get("gh:stranger0/repo0").unwrap();
             assert!(last.name.is_empty() && last.folders.is_empty(), "{folders}");
+            assert!(!last.more_folders, "{folders}");
             assert_eq!(last.id, "gh:stranger0/repo0", "still known");
             assert_eq!(last.main, padded(folders).folders[0], "and still pinned");
             let month_on = remembered.size();
