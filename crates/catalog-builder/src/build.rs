@@ -1171,8 +1171,8 @@ fn run_wowi(
     );
 
     let mut probe = wowi::LiveProbe { http };
-    let entries = scan_wowi_rows(&selected, state, &mut probe, out_of_time, saver, tally);
-    // Read at its current version, or no longer on the site at all: both are answers.
+    let mut entries = scan_wowi_rows(&selected, state, &mut probe, out_of_time, saver, tally);
+    // Read at its current version: an answer.
     for row in &selected {
         if state
             .wowi
@@ -1182,11 +1182,34 @@ fn run_wowi(
             tally.answered.insert(format!("wowi:{}", row.id));
         }
     }
+    entries.extend(after_the_list(state, &listed, complete, tally));
+    (entries, complete.then_some(listed))
+}
+
+/// What becomes of the listings the scan cache knows that WoWInterface's list doesn't have. From
+/// a list that looks complete, they're gone from the site, which is an answer, and their records
+/// go. From one that doesn't, nothing is dropped, and what we knew of them stays in the build, as
+/// when the list can't be fetched, so a list cut short can't quietly empty the catalog. Returns
+/// the entries kept that way.
+fn after_the_list(
+    state: &mut State,
+    listed: &BTreeSet<u64>,
+    complete: bool,
+    tally: &mut Tally,
+) -> Vec<Candidate> {
+    if !complete {
+        return state
+            .wowi
+            .iter()
+            .filter(|(id, _)| !listed.contains(id))
+            .filter_map(|(_, seen)| seen.entry.clone())
+            .collect();
+    }
     for id in state.wowi.keys().filter(|id| !listed.contains(id)) {
         tally.answered.insert(format!("wowi:{id}"));
     }
     state.wowi.retain(|id, _| listed.contains(id));
-    (entries, complete.then_some(listed))
+    Vec::new()
 }
 
 /// Whether WoWInterface's file list can be trusted to say which listings are off the site: it
@@ -7876,6 +7899,42 @@ mod tests {
         assert_eq!(
             why,
             "89 rows, 0 skipped as malformed, and 89 of the 100 listings the scan cache knows"
+        );
+    }
+
+    #[test]
+    fn a_wowinterface_list_cut_short_keeps_what_the_scan_cache_knew_of_the_listings_it_left_out() {
+        let known = || {
+            let mut state = State::empty();
+            for id in [1, 2, 3] {
+                let entry = listing_entry(id, &format!("Addon {id}"), &[&format!("A{id}")], 1);
+                let seen = wowi::WowiState {
+                    version: "1".into(),
+                    entry: Some(entry),
+                };
+                state.wowi.insert(id, seen);
+            }
+            state
+        };
+        let listed = BTreeSet::from([1]);
+
+        // Cut short: nothing is dropped or counted as answered, and listings 2 and 3 stay in.
+        let mut state = known();
+        let mut tally = Tally::default();
+        let kept = after_the_list(&mut state, &listed, false, &mut tally);
+        let ids: Vec<&str> = kept.iter().map(|c| c.addon.id.as_str()).collect();
+        assert_eq!(ids, ["wowi:2", "wowi:3"]);
+        assert_eq!(state.wowi.len(), 3);
+        assert!(tally.answered.is_empty());
+
+        // Complete: listings 2 and 3 are gone from the site, which answers for them.
+        let mut state = known();
+        let mut tally = Tally::default();
+        assert!(after_the_list(&mut state, &listed, true, &mut tally).is_empty());
+        assert_eq!(state.wowi.keys().copied().collect::<Vec<_>>(), [1]);
+        assert_eq!(
+            tally.answered,
+            BTreeSet::from(["wowi:2".to_string(), "wowi:3".to_string()])
         );
     }
 
