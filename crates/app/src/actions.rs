@@ -2,7 +2,9 @@
 //! halfway through being drawn.
 
 use crate::app::App;
-use crate::dialogs::{ListAddon, ListDep, ListPreview, PackPlan, Popup, RemovePlan, ReplacePlan};
+use crate::dialogs::{
+    ListAddon, ListDep, ListPreview, ListUpdate, PackPlan, Popup, RemovePlan, ReplacePlan,
+};
 use crate::easter;
 use crate::model::{self, CatalogBundle, HeaderId, Section, Selection, Tab};
 use crate::ops::{self, FolderConflict, Op, OpKind, Verb, folder_set};
@@ -89,11 +91,25 @@ struct InstallPlan {
     steps: Vec<Step>,
     /// The yellow lines installing says, in order.
     lines: Vec<String>,
+    /// Those of the lines that say what the asked-for addons require and don't get, and why,
+    /// which a pasted list's preview shows before anything happens.
+    left_out: Vec<String>,
+    /// Asked-for addons already on their way, which aren't queued again.
+    coming: Vec<String>,
+    /// Asked-for addons that sit out because they would replace a folder, each with those
+    /// folders. Only a batch with nothing agreed has any.
+    sitting_out: Vec<(String, Vec<String>)>,
 }
 
 impl InstallPlan {
     fn queues(&self, id: &str) -> bool {
         self.steps.iter().any(|step| step.id == id)
+    }
+
+    /// Say why something an asked-for addon requires doesn't come along.
+    fn leave_out(&mut self, line: String) {
+        self.left_out.push(line.clone());
+        self.lines.push(line);
     }
 }
 
@@ -575,6 +591,7 @@ impl App {
         let mut told: HashSet<String> = HashSet::new();
         for id in ids {
             if self.queue.busy_with(id) {
+                plan.coming.push(id.clone());
                 continue;
             }
             if let Some(line) = self.another_addon_now(id) {
@@ -587,9 +604,10 @@ impl App {
             {
                 let conflicts = self.folder_conflicts(addon);
                 if !conflicts.is_empty() {
-                    let folders: Vec<&str> = conflicts.iter().map(|c| c.folder.as_str()).collect();
+                    let folders: Vec<String> = conflicts.into_iter().map(|c| c.folder).collect();
                     let line = ops::sitting_out_line(name, self.managed(id).is_some(), &folders);
                     plan.lines.push(line);
+                    plan.sitting_out.push((id.clone(), folders));
                     continue;
                 }
             }
@@ -601,7 +619,7 @@ impl App {
                 &channel,
             );
             for missing in &resolved.missing {
-                plan.lines.push(format!(
+                plan.leave_out(format!(
                     "{name} requires {}, which this app can't pick for you. Look for it yourself, \
                      in Browse or on the web. Installing {name} anyway.",
                     model::clean_line(missing, 60)
@@ -612,14 +630,14 @@ impl App {
                 if !self.here_or_coming(&left.provider, ids, coming)
                     && told.insert(left.provider.clone())
                 {
-                    plan.lines.push(unreviewed_line(bundle, left));
+                    plan.leave_out(unreviewed_line(bundle, left));
                 }
             }
             for left in &resolved.too_big {
                 if !self.here_or_coming(&left.provider, ids, coming)
                     && told.insert(left.provider.clone())
                 {
-                    plan.lines.push(too_big_line(bundle, left));
+                    plan.leave_out(too_big_line(bundle, left));
                 }
             }
             for (position, step) in resolved.to_install.iter().enumerate() {
@@ -630,16 +648,11 @@ impl App {
                     && let Some(dep) = bundle.addon(step)
                 {
                     let asked_for = ids.contains(step);
-                    let conflicts = self.folder_conflicts(dep);
-                    if !conflicts.is_empty() {
-                        // One that was asked for says so in its own turn.
+                    if let Some(why) = self.not_brought(name, dep) {
+                        // One that was asked for has its own turn, which says what happens
+                        // to it.
                         if !asked_for {
-                            plan.lines.push(format!(
-                                "{name} requires {}, which wasn't added because it would replace \
-                                 {}. Install it from its own page to choose.",
-                                dep.name,
-                                conflict_names(&conflicts)
-                            ));
+                            plan.leave_out(why);
                         }
                         continue;
                     }
@@ -658,6 +671,39 @@ impl App {
             }
         }
         plan
+    }
+
+    /// Why an addon that `name` requires can't come along with it, or `None` when it can. The
+    /// player's own copy of it may be a different addon from what the catalog lists now, or be
+    /// set not to update while only the catalog's newer build has what's required. Or it would
+    /// replace a folder, which only its own page can ask about.
+    fn not_brought(&self, name: &str, dep: &Addon) -> Option<String> {
+        if let Some(record) = self.managed(&dep.id) {
+            if !model::same_addon(record, dep) {
+                return Some(format!(
+                    "{name} requires {}, which wasn't added because the catalog now lists it in \
+                     place of your {}. To switch, remove yours, then install that one.",
+                    dep.name, record.name
+                ));
+            }
+            if record.pinned
+                && let Some(release) = model::update_for(record, dep)
+            {
+                return Some(format!(
+                    "{name} requires {} {}, but {} is set not to update.",
+                    dep.name, release.version, record.name
+                ));
+            }
+        }
+        let conflicts = self.folder_conflicts(dep);
+        (!conflicts.is_empty()).then(|| {
+            format!(
+                "{name} requires {}, which wasn't added because it would replace {}. Install it \
+                 from its own page to choose.",
+                dep.name,
+                conflict_names(&conflicts)
+            )
+        })
     }
 
     /// Everything that counts as already there for a dependency: on disk, or in a record.
@@ -932,9 +978,10 @@ impl App {
     }
 
     /// A list is data from a stranger: it can only name addons the catalog already has, and
-    /// the player sees what installing it would do, and how big each download is, before
-    /// anything happens. That includes what its addons require that it doesn't name. An
-    /// installed addon whose entry has become another addon is left alone, and says so.
+    /// the player sees what installing it would do before anything happens, from the same plan
+    /// installing follows. That's what it adds and how big each download is, what those
+    /// require that comes along or gets updated, and what it leaves out and why. An installed
+    /// addon whose entry has become another addon is left alone, and says so.
     fn preview_list(&mut self) {
         let Some(bundle) = self.bundle.clone() else {
             return;
@@ -949,9 +996,11 @@ impl App {
                     preview.have.push(addon.name.clone());
                 }
                 // Installing it would only say why it's left alone.
-                Some(_) if self.another_addon_now(&id).is_some() => {
+                Some(addon) if self.another_addon_now(&id).is_some() => {
                     let yours = record.map_or(id.as_str(), |record| record.name.as_str());
-                    preview.left_alone.push(model::clean_line(yours, 60));
+                    preview
+                        .left_alone
+                        .push((model::clean_line(yours, 60), addon.name.clone()));
                 }
                 Some(addon) => preview.add.push(ListAddon {
                     name: addon.name.clone(),
@@ -967,14 +1016,18 @@ impl App {
                 .iter()
                 .map(|line| model::clean_line(line, 80)),
         );
-        preview.brings = self.brought_along(&bundle, &preview.add);
+        self.plan_list(&bundle, &mut preview);
         self.show_popup(Popup::List(preview));
     }
 
-    /// What installing these listed addons brings with them, from the same plan installing
-    /// follows: each addon they require that the list doesn't name and the player doesn't
-    /// have or have on its way, once, with the listed addon it comes with.
-    fn brought_along(&self, bundle: &CatalogBundle, listed: &[ListAddon]) -> Vec<ListDep> {
+    /// Sort the listed addons by what installing them would do, from the same plan installing
+    /// follows. Only what it queues stays in `add`. One already on its way is named as that,
+    /// and one that would replace a folder, which only a list of several leaves out, gets a
+    /// note. What the rest require that the list doesn't name comes along once, with the
+    /// listed addon it comes with, and so does an update of one the player has. What the plan
+    /// says about what they require and don't get becomes notes.
+    fn plan_list(&self, bundle: &CatalogBundle, preview: &mut ListPreview) {
+        let listed = std::mem::take(&mut preview.add);
         let ids: Vec<String> = listed.iter().map(|addon| addon.id.clone()).collect();
         // Install these sets each listed addon's channel before installing. The rest install
         // from their own.
@@ -998,25 +1051,49 @@ impl App {
             _ => Vec::new(),
         };
         let plan = self.install_plan(bundle, &ids, &agreed, &[], channel);
-        plan.steps
-            .iter()
-            .filter(|step| !ids.contains(&step.id) && self.managed(&step.id).is_none())
-            .filter_map(|step| {
-                let addon = bundle.addon(&step.id)?;
-                let channel = channel(&step.id);
-                Some(ListDep {
-                    addon: ListAddon {
-                        id: step.id.clone(),
-                        name: addon.name.clone(),
-                        channel,
-                        size: addon.release(channel).map_or(0, |release| release.size),
-                    },
-                    needed_by: bundle
-                        .addon(&step.with)
-                        .map_or_else(|| step.with.clone(), |with| with.name.clone()),
-                })
-            })
-            .collect()
+        for step in plan.steps.iter().filter(|step| !ids.contains(&step.id)) {
+            let Some(addon) = bundle.addon(&step.id) else {
+                continue;
+            };
+            let channel = channel(&step.id);
+            let release = addon.release(channel);
+            let brought = ListAddon {
+                id: step.id.clone(),
+                name: addon.name.clone(),
+                channel,
+                size: release.map_or(0, |release| release.size),
+            };
+            let needed_by = bundle
+                .addon(&step.with)
+                .map_or_else(|| step.with.clone(), |with| with.name.clone());
+            match self.managed(&step.id) {
+                None => preview.brings.push(ListDep {
+                    addon: brought,
+                    needed_by,
+                }),
+                Some(record) => preview.updates.push(ListUpdate {
+                    to: release
+                        .filter(|release| !model::same_version(&record.version, &release.version))
+                        .map(|release| release.version.clone()),
+                    addon: brought,
+                    needed_by,
+                }),
+            }
+        }
+        for addon in listed {
+            if plan.queues(&addon.id) {
+                preview.add.push(addon);
+            } else if plan.coming.contains(&addon.id) {
+                preview.coming.push(addon.name);
+            } else if let Some((_, folders)) =
+                plan.sitting_out.iter().find(|(id, _)| *id == addon.id)
+            {
+                preview
+                    .sitting_out
+                    .push((addon.name, ops::short_list(folders)));
+            }
+        }
+        preview.notes = plan.left_out;
     }
 
     fn retry_catalog(&mut self) {
@@ -1101,23 +1178,30 @@ fn unreviewed_line(bundle: &CatalogBundle, left: &Unreviewed) -> String {
 
 /// Why a required pack with a big download wasn't added, and how big it is, so getting it is
 /// the player's own choice. The addon that requires it won't load until they do. A pack the
-/// catalog gives no size for could be any size, and the line says so rather than "1 KB".
+/// catalog gives no size for could be any size, and the line says so rather than "1 KB". One
+/// with no build at all has no size either, and nothing to install yet, so it says that.
 fn too_big_line(bundle: &CatalogBundle, left: &TooBig) -> String {
     let named = |id: &str, fallback: &str| {
         bundle
             .addon(id)
             .map_or_else(|| model::clean_line(fallback, 60), |a| a.name.clone())
     };
+    let needed_by = named(&left.needed_by, &left.needed_by);
+    let pack = named(&left.provider, &left.folder);
+    let has_build = bundle
+        .addon(&left.provider)
+        .is_some_and(|pack| pack.stable.is_some() || pack.beta.is_some());
+    if !has_build {
+        return format!(
+            "{needed_by} won't load without {pack}, which has no build for Forever yet."
+        );
+    }
     let download = if left.size > 0 {
         format!("a {} download", model::size_text(left.size))
     } else {
         "a download of unknown size".to_owned()
     };
-    format!(
-        "{} won't load without {}, {download}. Install it from its page.",
-        named(&left.needed_by, &left.needed_by),
-        named(&left.provider, &left.folder),
-    )
+    format!("{needed_by} won't load without {pack}, {download}. Install it from its page.")
 }
 
 fn conflict_names(conflicts: &[FolderConflict]) -> String {

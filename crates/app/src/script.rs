@@ -178,6 +178,7 @@ impl Script {
 
 /// What a list's popup showed, one line for each part of it.
 fn describe_list(preview: &crate::dialogs::ListPreview) -> String {
+    use crate::dialogs::{coming_line, left_alone_line, sitting_out_line};
     let mut lines: Vec<String> = vec![format!("list: {} to add", preview.count())];
     lines.extend(
         preview
@@ -188,9 +189,25 @@ fn describe_list(preview: &crate::dialogs::ListPreview) -> String {
     lines.extend(preview.brings.iter().map(|dep| format!("  {}", dep.line())));
     lines.extend(
         preview
+            .updates
+            .iter()
+            .map(|update| format!("  {}", update.line())),
+    );
+    lines.extend(preview.notes.iter().map(|note| format!("  {note}")));
+    if !preview.coming.is_empty() {
+        lines.push(format!("  {}", coming_line(&preview.coming)));
+    }
+    lines.extend(
+        preview
             .left_alone
             .iter()
-            .map(|name| format!("  {}", crate::dialogs::left_alone_line(name))),
+            .map(|(yours, listed)| format!("  {}", left_alone_line(yours, listed))),
+    );
+    lines.extend(
+        preview
+            .sitting_out
+            .iter()
+            .map(|(name, folders)| format!("  {}", sitting_out_line(name, folders))),
     );
     if let Some(total) = preview.total() {
         lines.push(format!("  {total}"));

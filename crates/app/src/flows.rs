@@ -4293,11 +4293,15 @@ fn a_kit_or_a_list_that_names_an_entry_now_another_addon_says_why_it_is_left_alo
     // adds nothing for it.
     let preview = list_preview(&mut h, &format!("{SHORT}\n"));
     assert!(preview.have.is_empty() && preview.add.is_empty());
-    assert_eq!(preview.left_alone, ["ShortKings"]);
+    assert_eq!(
+        preview.left_alone,
+        [("ShortKings".to_owned(), "ShortRoyalty".to_owned())]
+    );
     assert!(on_the_popup(&h, "This list wouldn't add anything."));
     assert!(on_the_popup(
         &h,
-        "Left alone: ShortKings, which the catalog now lists as another addon."
+        "Left alone: ShortKings, since the catalog now lists a different addon in its place, \
+         ShortRoyalty."
     ));
     assert!(!popup_button_enabled(&h, "Install these"));
     close(h);
@@ -4843,13 +4847,51 @@ fn a_pasted_list_shows_nothing_more_for_what_is_here_or_on_its_way() {
     assert!(managed(&h, MUSICIAN).is_some());
     let preview = list_preview(&mut h, &list);
     assert!(preview.brings.is_empty(), "{:?}", preview.brings);
+    assert!(preview.updates.is_empty(), "{:?}", preview.updates);
     assert!(on_the_popup(&h, "This list adds 1 addon:"));
 }
 
 #[test]
-fn a_pasted_list_never_says_it_also_installs_an_addon_the_player_has() {
+fn a_pasted_list_does_not_count_an_addon_it_names_that_is_already_on_its_way() {
+    let rig = Rig::new();
+    let mut addons = musician_and_its_list(&rig.site, false);
+    let foo = publish_addon(&rig.site, FOO, "Foo", "1.0");
+    let foo_size = size_text(foo.stable.as_ref().unwrap().size);
+    addons.push(foo);
+    rig.site.publish(&catalog_of(addons));
+    let mut h = rig.launch_settled();
+    // Asked without drawing a frame, so it's still on its way when the list is read.
+    app_mut(&mut h).apply(Action::Install(vec![MUSICIAN.to_owned()]));
+    app_mut(&mut h).list_text = format!("{MUSICIAN}\n{FOO}\n");
+    app_mut(&mut h).apply(Action::PreviewList);
+    assert!(app(&h).queue.busy_with(MUSICIAN));
+    let Some(Popup::List(preview)) = &app(&h).popup else {
+        panic!("the list is shown first");
+    };
+    let listed: Vec<&str> = preview.add.iter().map(|addon| addon.id.as_str()).collect();
+    assert_eq!(listed, [FOO]);
+    assert_eq!(preview.coming, ["Musician"]);
+    assert_eq!(preview.count(), 1);
+    assert_eq!(
+        preview.total(),
+        Some(format!("{foo_size} to download in all."))
+    );
+    // The popup says so, whenever Musician gets here.
+    h.step();
+    h.step();
+    h.step();
+    assert!(on_the_popup(&h, "This list adds 1 addon:"));
+    assert!(on_the_popup(&h, "Already on its way: Musician."));
+    click_last(&mut h, "Install these");
+    finish_ops(&mut h);
+    assert!(managed(&h, MUSICIAN).is_some() && managed(&h, FOO).is_some());
+}
+
+#[test]
+fn a_pasted_list_says_it_also_updates_an_addon_the_player_has_when_its_addons_require_that() {
     // Musician's new build adds a folder that Musician List now requires, and the player has
-    // the old build. Installing the list brings the new one, but Musician is no addon to add.
+    // the old build. Installing the list updates Musician, which is no addon to add, so it's
+    // counted in the total but not the heading.
     let rig = Rig::new();
     rig.site
         .publish(&catalog_of(musician_and_its_list(&rig.site, false)));
@@ -4858,20 +4900,227 @@ fn a_pasted_list_never_says_it_also_installs_an_addon_the_player_has() {
     finish_ops(&mut h);
     close(h);
 
+    // A couple of MB, so the total shows whether it's counted.
     let both = ["Musician", "MusicianCore"];
+    let zip = padded_zip_of(&both, "2.0", 2_000_000);
+    let newer_size = zip.len() as u64;
+    let url = rig.site.put("/Musician-2.0-big.zip", zip);
     let mut newer = named(
         publish_bundle(&rig.site, MUSICIAN, &both, &both, "2.0"),
         "Musician",
     );
     newer.downloads = 35_600;
+    newer.source = Source::Direct { url: url.clone() };
+    let release = newer.stable.as_mut().unwrap();
+    release.url = url;
+    release.size = newer_size;
     let mut addons = musician_and_its_list(&rig.site, false);
     addons[0].deps = vec!["MusicianCore".to_owned()];
+    let list_size = addons[0].stable.as_ref().unwrap().size;
     addons[1] = newer;
     rig.site.publish(&catalog_of(addons));
     let mut h = rig.launch_settled();
     let preview = list_preview(&mut h, &format!("{MUSICIAN_LIST}\n"));
     assert!(preview.brings.is_empty(), "{:?}", preview.brings);
-    assert!(on_the_popup(&h, "This list adds 1 addon:"));
+    assert_eq!(preview.count(), 1);
+    let updates: Vec<String> = preview.updates.iter().map(|update| update.line()).collect();
+    let update = format!(
+        "Also updates Musician to 2.0 ({}), which Musician List requires.",
+        size_text(newer_size)
+    );
+    assert_eq!(updates, std::slice::from_ref(&update));
+    let total = format!("{} to download in all.", size_text(list_size + newer_size));
+    assert_eq!(total, "2.0 MB to download in all.");
+    assert_eq!(preview.total(), Some(total.clone()));
+    for line in ["This list adds 1 addon:", update.as_str(), total.as_str()] {
+        assert!(on_the_popup(&h, line), "{line} isn't on the popup");
+    }
+
+    // What installing the list does.
+    click_last(&mut h, "Install these");
+    finish_ops(&mut h);
+    assert_eq!(rig.version_on_disk("Musician").as_deref(), Some("2.0"));
+    assert_eq!(rig.version_on_disk("MusicianCore").as_deref(), Some("2.0"));
+    assert!(managed(&h, MUSICIAN_LIST).is_some());
+}
+
+const PINNED_LINE: &str = "Musician List requires Musician 2.0, but Musician is set not to update.";
+
+/// The player installs Musician 1.9.18.0 and sets it not to update. Then Musician 2.0 adds a
+/// folder, MusicianCore, which Musician List now requires. These are the catalog's addons after
+/// that, for the test to publish.
+fn pin_musician_then_give_musician_list_a_new_requirement(rig: &Rig) -> Vec<Addon> {
+    rig.site
+        .publish(&catalog_of(musician_and_its_list(&rig.site, false)));
+    let mut h = rig.launch_settled();
+    app_mut(&mut h).apply(Action::Install(vec![MUSICIAN.to_owned()]));
+    finish_ops(&mut h);
+    app_mut(&mut h).apply(Action::SetPin(MUSICIAN.to_owned(), true));
+    close(h);
+    newer_musician_and_a_list_that_requires_its_new_folder(&rig.site)
+}
+
+/// Musician 2.0, which adds MusicianCore, and Musician List 1.17.0, which requires it.
+fn newer_musician_and_a_list_that_requires_its_new_folder(site: &Site) -> Vec<Addon> {
+    let both = ["Musician", "MusicianCore"];
+    let mut newer = named(
+        publish_bundle(site, MUSICIAN, &both, &both, "2.0"),
+        "Musician",
+    );
+    newer.downloads = 35_600;
+    let mut addons = musician_and_its_list(site, false);
+    addons[0].deps = vec!["MusicianCore".to_owned()];
+    addons[1] = newer;
+    addons
+}
+
+/// Musician is still the build the player pinned, and nothing of 2.0 came.
+fn musician_stays_pinned(rig: &Rig, h: &Harness<'static, Option<App>>) {
+    assert_eq!(
+        rig.version_on_disk("Musician").as_deref(),
+        Some("1.9.18.0"),
+        "a pinned addon isn't updated"
+    );
+    assert!(!rig.addons().join("MusicianCore").exists());
+    let record = managed(h, MUSICIAN).unwrap();
+    assert!(record.pinned);
+    assert_eq!(record.version, "1.9.18.0");
+}
+
+#[test]
+fn a_pinned_addon_is_not_updated_because_a_list_names_an_addon_that_requires_its_new_folder() {
+    // The list shows nothing more to download, and says what installing it will say.
+    let rig = Rig::new();
+    let addons = pin_musician_then_give_musician_list_a_new_requirement(&rig);
+    let list_size = addons[0].stable.as_ref().unwrap().size;
+    rig.site.publish(&catalog_of(addons));
+    let mut h = rig.launch_settled();
+    assert!(managed(&h, MUSICIAN).unwrap().pinned);
+    let preview = list_preview(&mut h, &format!("{MUSICIAN_LIST}\n"));
+    assert_eq!(preview.count(), 1);
+    assert!(preview.brings.is_empty() && preview.updates.is_empty());
+    assert_eq!(preview.notes, [PINNED_LINE]);
+    let total = format!("{} to download in all.", size_text(list_size));
+    assert_eq!(preview.total(), Some(total.clone()));
+    for line in ["This list adds 1 addon:", PINNED_LINE, total.as_str()] {
+        assert!(on_the_popup(&h, line), "{line} isn't on the popup");
+    }
+    click_last(&mut h, "Install these");
+    assert!(said(&h, PINNED_LINE));
+    assert!(!said(&h, "so that installs first"));
+    finish_ops(&mut h);
+    musician_stays_pinned(&rig, &h);
+    assert!(managed(&h, MUSICIAN_LIST).is_some());
+}
+
+#[test]
+fn a_pinned_addon_is_not_updated_by_installing_an_addon_that_requires_its_new_folder() {
+    let rig = Rig::new();
+    let addons = pin_musician_then_give_musician_list_a_new_requirement(&rig);
+    rig.site.publish(&catalog_of(addons));
+    let mut h = rig.launch_settled();
+    // What the page's Install button sends.
+    app_mut(&mut h).apply(Action::InstallFromPage(MUSICIAN_LIST.to_owned()));
+    assert!(said(&h, PINNED_LINE));
+    assert!(!app(&h).queue.busy_with(MUSICIAN));
+    finish_ops(&mut h);
+    musician_stays_pinned(&rig, &h);
+    assert!(managed(&h, MUSICIAN_LIST).is_some());
+
+    // Once the player lifts the pin, installing it again updates Musician too.
+    app_mut(&mut h).apply(Action::SetPin(MUSICIAN.to_owned(), false));
+    app_mut(&mut h).apply(Action::InstallFromPage(MUSICIAN_LIST.to_owned()));
+    assert!(said(
+        &h,
+        "Musician List requires Musician, so that installs first."
+    ));
+    finish_ops(&mut h);
+    assert_eq!(rig.version_on_disk("MusicianCore").as_deref(), Some("2.0"));
+}
+
+#[test]
+fn a_pinned_addon_is_not_updated_by_a_kit_with_an_addon_that_requires_its_new_folder() {
+    let rig = Rig::new();
+    let mut addons = pin_musician_then_give_musician_list_a_new_requirement(&rig);
+    addons.push(publish_addon(&rig.site, FOO, "Foo", "1.0"));
+    let mut catalog = catalog_of(addons);
+    catalog.kits = vec![Kit {
+        name: "Bards".to_owned(),
+        description: "Music for the party.".to_owned(),
+        addons: vec![MUSICIAN_LIST.to_owned(), FOO.to_owned()],
+    }];
+    rig.site.publish(&catalog);
+    let mut h = rig.launch_settled();
+    click(&mut h, "Browse");
+    click(&mut h, "Bards, 2 addons");
+    click(&mut h, "Install all (2)");
+    assert!(said(&h, PINNED_LINE));
+    finish_ops(&mut h);
+    musician_stays_pinned(&rig, &h);
+    assert!(managed(&h, MUSICIAN_LIST).is_some() && managed(&h, FOO).is_some());
+}
+
+#[test]
+fn a_pinned_addon_is_not_updated_by_update_all_when_an_update_requires_its_new_folder() {
+    let rig = Rig::new();
+    let mut list = named(
+        publish_addon(&rig.site, MUSICIAN_LIST, "MusicianList", "1.16.0"),
+        "Musician List",
+    );
+    list.reviewed = false;
+    list.deps = vec!["Musician".to_owned()];
+    let mut addons = musician_and_its_list(&rig.site, false);
+    addons[0] = list;
+    rig.site.publish(&catalog_of(addons));
+    let mut h = rig.launch_settled();
+    app_mut(&mut h).apply(Action::Install(vec![MUSICIAN_LIST.to_owned()]));
+    finish_ops(&mut h);
+    assert!(managed(&h, MUSICIAN).is_some());
+    app_mut(&mut h).apply(Action::SetPin(MUSICIAN.to_owned(), true));
+    close(h);
+
+    rig.site.publish(&catalog_of(
+        newer_musician_and_a_list_that_requires_its_new_folder(&rig.site),
+    ));
+    let mut h = rig.launch_settled();
+    assert_eq!(
+        app(&h).updates,
+        [MUSICIAN_LIST],
+        "the pinned one sits it out"
+    );
+    click(&mut h, "Update all (1)");
+    assert!(said(&h, PINNED_LINE));
+    finish_ops(&mut h);
+    musician_stays_pinned(&rig, &h);
+    assert_eq!(
+        rig.version_on_disk("MusicianList").as_deref(),
+        Some("1.17.0")
+    );
+}
+
+#[test]
+fn a_pinned_addon_is_not_updated_when_the_packs_question_installs_an_addon_that_requires_it() {
+    let rig = Rig::new();
+    let mut addons = pin_musician_then_give_musician_list_a_new_requirement(&rig);
+    let mut spoken = spoken(&rig.site, "v3.8.3");
+    spoken.deps = vec!["MusicianCore".to_owned()];
+    addons.push(spoken);
+    addons.push(quest_voices(&rig.site, "v2.5.0"));
+    rig.site.publish(&catalog_of(addons));
+    let mut h = rig.launch_settled();
+    app_mut(&mut h).apply(Action::InstallFromPage(SPOKEN.to_owned()));
+    h.step();
+    h.step();
+    h.step();
+    assert!(matches!(app(&h).popup, Some(Popup::Packs(_))));
+    click(&mut h, "Install both");
+    assert!(said(
+        &h,
+        "Spoken requires Musician 2.0, but Musician is set not to update."
+    ));
+    finish_ops(&mut h);
+    musician_stays_pinned(&rig, &h);
+    assert!(managed(&h, SPOKEN).is_some() && managed(&h, QUEST_VOICES).is_some());
 }
 
 #[test]
@@ -4904,7 +5153,7 @@ fn a_list_of_one_addon_that_would_replace_a_folder_still_shows_what_comes_along(
 #[test]
 fn a_list_of_several_shows_nothing_for_what_an_addon_sitting_out_requires() {
     // Several never ask, so an addon that would replace a folder sits out, and what it
-    // requires doesn't come either. The addon itself is still counted.
+    // requires doesn't come either. The addon gets a note instead, and isn't counted.
     let rig = Rig::new();
     rig.plant("MusicianList", "1.16.0");
     let mut addons = musician_and_its_list(&rig.site, false);
@@ -4913,14 +5162,155 @@ fn a_list_of_several_shows_nothing_for_what_an_addon_sitting_out_requires() {
     let mut h = rig.launch_settled();
     let preview = list_preview(&mut h, &format!("{MUSICIAN_LIST}\n{FOO}\n"));
     assert!(preview.brings.is_empty(), "{:?}", preview.brings);
-    assert_eq!(preview.add.len(), 2);
+    let listed: Vec<&str> = preview.add.iter().map(|addon| addon.id.as_str()).collect();
+    assert_eq!(listed, [FOO]);
+    assert_eq!(
+        preview.sitting_out,
+        [("Musician List".to_owned(), "MusicianList".to_owned())]
+    );
+    assert!(preview.notes.is_empty(), "{:?}", preview.notes);
+    for line in [
+        "This list adds 1 addon:",
+        "Left alone: Musician List, which would replace MusicianList. Install it from its own \
+         page to choose.",
+    ] {
+        assert!(on_the_popup(&h, line), "{line} isn't on the popup");
+    }
     click_last(&mut h, "Install these");
     finish_ops(&mut h);
-    assert!(said(
+    assert!(managed(&h, FOO).is_some());
+    assert!(managed(&h, MUSICIAN_LIST).is_none() && managed(&h, MUSICIAN).is_none());
+    assert_eq!(
+        rig.version_on_disk("MusicianList").as_deref(),
+        Some("1.16.0")
+    );
+}
+
+#[test]
+fn a_copied_list_does_not_count_an_addon_the_player_put_in_by_hand() {
+    // A friend's list, as Copy my list writes it, names Musician and Musician List. This
+    // player put Musician in AddOns by hand, so in a list of several it sits out, and Musician
+    // List needs nothing more. Installing the list downloads Musician List alone, so that's
+    // all the preview counts. Musician is 101.8 MB live; nothing downloads it here.
+    let rig = Rig::new();
+    rig.plant("Musician", "1.9.0");
+    let mut addons = musician_and_its_list(&rig.site, false);
+    addons[1].stable.as_mut().unwrap().size = 101_799_121;
+    let list_size = addons[0].stable.as_ref().unwrap().size;
+    rig.site.publish(&catalog_of(addons));
+    let mut h = rig.launch_settled();
+    let preview = list_preview(
+        &mut h,
+        &format!("# WoW is a Feeling addon list\n{MUSICIAN}\n{MUSICIAN_LIST}\n"),
+    );
+    let listed: Vec<String> = preview.add.iter().map(ListAddon::line).collect();
+    assert_eq!(
+        listed,
+        [format!("Musician List ({})", size_text(list_size))]
+    );
+    assert!(preview.brings.is_empty(), "{:?}", preview.brings);
+    assert_eq!(preview.count(), 1);
+    let total = format!("{} to download in all.", size_text(list_size));
+    assert_eq!(preview.total(), Some(total.clone()));
+    for line in [
+        "This list adds 1 addon:",
+        "Left alone: Musician, which would replace Musician. Install it from its own page to \
+         choose.",
+        total.as_str(),
+    ] {
+        assert!(on_the_popup(&h, line), "{line} isn't on the popup");
+    }
+    assert!(!on_the_popup(&h, "Musician (101.8 MB)"));
+    click_last(&mut h, "Install these");
+    finish_ops(&mut h);
+    assert_eq!(rig.version_on_disk("Musician").as_deref(), Some("1.9.0"));
+    assert!(managed(&h, MUSICIAN).is_none() && managed(&h, MUSICIAN_LIST).is_some());
+}
+
+#[test]
+fn a_pasted_list_that_names_spoken_installs_it_without_asking_about_its_quest_voices() {
+    // Only Spoken's own page asks about its quest voices. A pasted list, like a kit, never
+    // asks, and Spoken's page then says it needs a pack.
+    let rig = Rig::new();
+    rig.site.publish(&catalog_of(vec![
+        spoken(&rig.site, "v3.8.3"),
+        quest_voices(&rig.site, "v2.5.0"),
+    ]));
+    let mut h = rig.launch_settled();
+    let preview = list_preview(&mut h, &format!("{SPOKEN}\n"));
+    assert_eq!(preview.count(), 1);
+    click_last(&mut h, "Install these");
+    assert!(!matches!(app(&h).popup, Some(Popup::Packs(_))));
+    finish_ops(&mut h);
+    assert!(managed(&h, SPOKEN).is_some() && managed(&h, QUEST_VOICES).is_none());
+    app_mut(&mut h).apply(Action::Select(Selection::Addon(SPOKEN.to_owned())));
+    h.step();
+    h.step();
+    h.step();
+    assert!(has_label(&h, NEEDS_A_PACK));
+}
+
+#[test]
+fn a_pasted_list_shows_what_installing_it_leaves_out_before_anything_happens() {
+    const MAPS: &str = "gh:nutiler/dandymapdata";
+    let rig = Rig::new();
+    // A big pack, as Spoken lists it, an old enough addon nobody reviewed, a small library a
+    // person did, and a folder nothing provides.
+    let mut voices = named(
+        quest_voices(&rig.site, "v2.5.0"),
+        "Spoken Audio: Quests (English)",
+    );
+    voices.reviewed = false;
+    voices.stable.as_mut().unwrap().size = 1_479_966_451;
+    let mut maps = named(
+        publish_addon(&rig.site, MAPS, "DandyMapData", "1.0"),
+        "Dandy Map Data",
+    );
+    maps.reviewed = false;
+    let bar = publish_addon(&rig.site, BAR, "Bar", "1.0");
+    let mut foo = publish_addon(&rig.site, FOO, "Foo", "1.0");
+    foo.deps = vec![
+        "Bar".to_owned(),
+        "SpokenQuestsAudioAlliance".to_owned(),
+        "DandyMapData".to_owned(),
+        "LibNowhere".to_owned(),
+    ];
+    rig.site.publish(&catalog_of(vec![
+        foo,
+        bar,
+        maps,
+        spoken(&rig.site, "v3.8.3"),
+        voices,
+    ]));
+    let mut h = rig.launch_settled();
+    let preview = list_preview(&mut h, &format!("{FOO}\n"));
+    let notes = [
+        "Foo Addon requires LibNowhere, which this app can't pick for you. Look for it yourself, \
+         in Browse or on the web. Installing Foo Addon anyway.",
+        "Foo Addon requires Dandy Map Data, which wasn't added because nobody has reviewed it. \
+         Click it under Requires on the Foo Addon page to see who made it, and install it \
+         yourself.",
+        "Foo Addon won't load without Spoken Audio: Quests (English), a 1.5 GB download. \
+         Install it from its page.",
+    ];
+    assert_eq!(preview.notes, notes);
+    let brought: Vec<&str> = preview
+        .brings
+        .iter()
+        .map(|dep| dep.addon.id.as_str())
+        .collect();
+    assert_eq!(brought, [BAR]);
+    for line in notes {
+        assert!(on_the_popup(&h, line), "{line} isn't on the popup");
+    }
+    // What comes along has its own line, so the popup doesn't say it again.
+    assert!(!on_the_popup(
         &h,
-        "Musician List wasn't installed because it would replace"
+        "Foo Addon requires Bar Addon, so that installs first."
     ));
-    assert!(managed(&h, FOO).is_some() && managed(&h, MUSICIAN).is_none());
+    assert!(on_the_popup(&h, "This list adds 2 addons:"));
+    click_last(&mut h, "Cancel");
+    assert!(app(&h).queue.is_idle());
 }
 
 #[test]
@@ -4951,12 +5341,16 @@ fn a_pasted_lists_total_leaves_out_an_entry_installing_it_refuses() {
     let preview = list_preview(&mut h, &format!("{SHORT}\n{FOO}\n"));
     let listed: Vec<String> = preview.add.iter().map(ListAddon::line).collect();
     assert_eq!(listed, [format!("Foo Addon ({foo_size})")]);
-    assert_eq!(preview.left_alone, ["ShortKings"]);
+    assert_eq!(
+        preview.left_alone,
+        [("ShortKings".to_owned(), "ShortRoyalty".to_owned())]
+    );
     let total = format!("{foo_size} to download in all.");
     assert_eq!(preview.total(), Some(total.clone()));
     for line in [
         "This list adds 1 addon:",
-        "Left alone: ShortKings, which the catalog now lists as another addon.",
+        "Left alone: ShortKings, since the catalog now lists a different addon in its place, \
+         ShortRoyalty.",
         total.as_str(),
     ] {
         assert!(on_the_popup(&h, line), "{line} isn't on the popup");
@@ -5080,22 +5474,29 @@ fn a_second_click_while_the_first_waits_asks_nothing_twice_and_reinstalls_nothin
 /// A zip `padding` bytes bigger than an ordinary one, stored rather than compressed, so it
 /// crosses a size limit for real.
 fn padded_zip(folder: &str, version: &str, padding: usize) -> Vec<u8> {
+    padded_zip_of(&[folder], version, padding)
+}
+
+/// The same with several folders, the first of which holds the padding.
+fn padded_zip_of(folders: &[&str], version: &str, padding: usize) -> Vec<u8> {
     let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
     let plain = zip::write::SimpleFileOptions::default();
-    let toc = format!("{FOREVER_TOC}## Title: {folder}\n## Version: {version}\n");
-    writer
-        .start_file(format!("{folder}/{folder}.toc"), plain)
-        .unwrap();
-    writer.write_all(toc.as_bytes()).unwrap();
-    writer
-        .start_file(format!("{folder}/{folder}.lua"), plain)
-        .unwrap();
-    writer
-        .write_all(format!("-- {version}\n").as_bytes())
-        .unwrap();
+    for folder in folders {
+        let toc = format!("{FOREVER_TOC}## Title: {folder}\n## Version: {version}\n");
+        writer
+            .start_file(format!("{folder}/{folder}.toc"), plain)
+            .unwrap();
+        writer.write_all(toc.as_bytes()).unwrap();
+        writer
+            .start_file(format!("{folder}/{folder}.lua"), plain)
+            .unwrap();
+        writer
+            .write_all(format!("-- {version}\n").as_bytes())
+            .unwrap();
+    }
     let stored = plain.compression_method(zip::CompressionMethod::Stored);
     writer
-        .start_file(format!("{folder}/media.ogg"), stored)
+        .start_file(format!("{}/media.ogg", folders[0]), stored)
         .unwrap();
     let chunk = vec![7u8; 1 << 20];
     let mut left = padding;
@@ -5172,4 +5573,141 @@ fn an_addon_too_big_to_keep_has_nothing_to_roll_back_to_after_an_update() {
     click(&mut h, "Foo Addon, 2.0");
     assert_eq!(managed(&h, FOO).unwrap().previous_version, None);
     assert!(!has_label(&h, "Roll back to 1.0"));
+}
+
+#[test]
+fn a_big_addon_whose_zip_an_earlier_app_kept_can_still_roll_back_after_an_update() {
+    // 0.1.2 kept any zip up to 500 MiB, in the same folder and under the same name as this
+    // app. So a player who had a big addon then still has its copy after updating the app,
+    // and the next update of that addon offers to roll back to it, though both are too big.
+    let rig = Rig::new();
+    let big = |version: &str| {
+        let zip = padded_zip("Foo", version, 132_000_000);
+        let size = zip.len() as u64;
+        let url = rig.site.put(&format!("/Foo-{version}-big.zip"), zip);
+        let mut addon = publish_addon(&rig.site, FOO, "Foo", version);
+        addon.source = Source::Direct { url: url.clone() };
+        let release = addon.stable.as_mut().unwrap();
+        release.url = url;
+        release.size = size;
+        addon
+    };
+    // A small first build, which gives Foo its folder in the cache.
+    rig.site.publish(&catalog_of(vec![publish_addon(
+        &rig.site, FOO, "Foo", "0.9",
+    )]));
+    let mut h = rig.launch_settled();
+    click(&mut h, "Install");
+    finish_ops(&mut h);
+    close(h);
+    let kept = feeling_core::install::kept_zips(&rig.dirs.cache, FOO);
+    let folder = kept[0].parent().unwrap().to_path_buf();
+
+    rig.site.publish(&catalog_of(vec![big("1.0")]));
+    let mut h = rig.launch_settled();
+    click(&mut h, "Update all (1)");
+    finish_ops(&mut h);
+    assert_eq!(rig.version_on_disk("Foo").as_deref(), Some("1.0"));
+    close(h);
+    // What 0.1.2 would have kept when it installed 1.0.
+    fs::write(
+        folder.join("1.0.zip"),
+        padded_zip("Foo", "1.0", 132_000_000),
+    )
+    .unwrap();
+
+    rig.site.publish(&catalog_of(vec![big("2.0")]));
+    let mut h = rig.launch_settled();
+    click(&mut h, "Update all (1)");
+    finish_ops(&mut h);
+    assert_eq!(rig.version_on_disk("Foo").as_deref(), Some("2.0"));
+    assert_eq!(
+        managed(&h, FOO).unwrap().previous_version.as_deref(),
+        Some("1.0")
+    );
+    click(&mut h, "Foo Addon, 2.0");
+    click(&mut h, "Roll back to 1.0");
+    finish_ops(&mut h);
+    assert_eq!(rig.version_on_disk("Foo").as_deref(), Some("1.0"));
+}
+
+#[test]
+fn an_addon_that_requires_an_entry_now_another_addon_says_so_once_and_installs_without_it() {
+    // The player has ShortKings, and its entry now lists ShortRoyalty instead. A new addon
+    // whose TOC requires ShortRoyalty's folder can't bring it, as the entry is taken by what
+    // the player has, so installing it says that once and goes ahead.
+    const SHORT: &str = "wowi:424242";
+    const ONCE: &str = "Foo Addon requires ShortRoyalty, which wasn't added because the catalog \
+                        now lists it in place of your ShortKings. To switch, remove yours, then \
+                        install that one.";
+    let rig = Rig::new();
+    rig.site.publish(&catalog_of(vec![named(
+        publish_addon(&rig.site, SHORT, "ShortKings", "v0.3.0"),
+        "ShortKings",
+    )]));
+    let mut h = rig.launch_settled();
+    app_mut(&mut h).apply(Action::Install(vec![SHORT.to_owned()]));
+    finish_ops(&mut h);
+    close(h);
+
+    let mut foo = publish_addon(&rig.site, FOO, "Foo", "1.0");
+    foo.deps = vec!["ShortRoyalty".to_owned()];
+    rig.site.publish(&catalog_of(vec![
+        named(
+            publish_addon(&rig.site, SHORT, "ShortRoyalty", "v0.3.1"),
+            "ShortRoyalty",
+        ),
+        foo,
+    ]));
+    let mut h = rig.launch_settled();
+    // A list naming it says the same before anything happens, and brings nothing.
+    let preview = list_preview(&mut h, &format!("{FOO}\n"));
+    assert!(preview.brings.is_empty() && preview.updates.is_empty());
+    assert_eq!(preview.notes, [ONCE]);
+    assert!(on_the_popup(&h, ONCE));
+    assert!(on_the_popup(&h, "This list adds 1 addon:"));
+    click_last(&mut h, "Cancel");
+
+    // What the page's Install button sends.
+    app_mut(&mut h).apply(Action::InstallFromPage(FOO.to_owned()));
+    let texts = app(&h).messages.texts();
+    assert_eq!(
+        texts.iter().filter(|text| **text == ONCE).count(),
+        1,
+        "{texts:?}"
+    );
+    assert!(!said(&h, "so that installs first"), "{texts:?}");
+    assert!(!said(&h, "doesn't get updates"), "{texts:?}");
+    assert!(!app(&h).queue.busy_with(SHORT));
+    finish_ops(&mut h);
+    assert!(managed(&h, FOO).is_some());
+    close(h);
+    assert_eq!(rig.version_on_disk("ShortKings").as_deref(), Some("v0.3.0"));
+    assert!(!rig.addons().join("ShortRoyalty").exists());
+}
+
+#[test]
+fn a_pack_with_no_build_yet_says_so_rather_than_that_its_size_is_unknown() {
+    let rig = Rig::new();
+    let mut voices = named(
+        quest_voices(&rig.site, "v2.5.0"),
+        "Spoken Audio: Quests (English)",
+    );
+    voices.stable = None;
+    voices.beta = None;
+    let mut foo = publish_addon(&rig.site, FOO, "Foo", "1.0");
+    foo.deps = vec!["SpokenQuestsAudioAlliance".to_owned()];
+    rig.site
+        .publish(&catalog_of(vec![foo, spoken(&rig.site, "v3.8.3"), voices]));
+    let mut h = rig.launch_settled();
+    app_mut(&mut h).apply(Action::InstallFromPage(FOO.to_owned()));
+    assert!(said(
+        &h,
+        "Foo Addon won't load without Spoken Audio: Quests (English), which has no build for \
+         Forever yet."
+    ));
+    assert!(!said(&h, "unknown size"));
+    assert!(!app(&h).queue.busy_with(QUEST_VOICES));
+    finish_ops(&mut h);
+    assert!(managed(&h, FOO).is_some() && managed(&h, QUEST_VOICES).is_none());
 }

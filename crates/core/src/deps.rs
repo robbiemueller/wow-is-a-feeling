@@ -91,7 +91,7 @@ pub struct TooBig {
     /// The entry the app picked for the folder, the same one the Requires line shows.
     pub provider: String,
     /// Its download, in bytes, from the channel it would install from. 0 when the catalog
-    /// doesn't say.
+    /// doesn't say, or has no build of it at all.
     pub size: u64,
 }
 
