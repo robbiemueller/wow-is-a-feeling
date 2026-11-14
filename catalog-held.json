@@ -1,0 +1,352 @@
+{
+  "held": [
+    {
+      "id": "gh:Beast-Masters-addons/Broker_RunSpeed",
+      "name": "Broker: RunSpeed",
+      "folders": [
+        "Broker_RunSpeed"
+      ],
+      "reason": "its name is already taken by wowi:26332"
+    },
+    {
+      "id": "gh:Beast-Masters-addons/TomTomTargetArrow",
+      "name": "TomTom group member arrow",
+      "folders": [
+        "TomTomTargetArrow"
+      ],
+      "reason": "its name is already taken by wowi:25895"
+    },
+    {
+      "id": "gh:BurN-30/wow-forever-guide",
+      "name": "BugSack",
+      "folders": [
+        "BugSack",
+        "Polestar",
+        "!BugGrabber",
+        "Auctionator",
+        "Polestar_Nav",
+        "Polestar_deDE",
+        "Polestar_esES",
+        "Polestar_esMX",
+        "Polestar_frFR",
+        "Polestar_koKR",
+        "Polestar_ptBR",
+        "Polestar_ruRU",
+        "Polestar_zhCN",
+        "Polestar_zhTW",
+        "Polestar_Codex",
+        "Polestar_Nav_EK"
+      ],
+      "reason": "its folder !BugGrabber is reserved for the real addon, which needs picking by hand"
+    },
+    {
+      "id": "gh:Deathwing/Achievements",
+      "name": "Achievements",
+      "folders": [
+        "Achievements"
+      ],
+      "reason": "its name is already taken by wowi:27169"
+    },
+    {
+      "id": "gh:Deathwing/Mount-Route-Planner",
+      "name": "Mount Route Planner (MRP)",
+      "folders": [
+        "MountRoutePlanner"
+      ],
+      "reason": "its main folder MountRoutePlanner is already taken by wowi:27171"
+    },
+    {
+      "id": "gh:Gyffes/Quest-Announcer-3",
+      "name": "Quest Announce 3",
+      "folders": [
+        "QuestAnnounce"
+      ],
+      "reason": "its name is already taken by wowi:11002"
+    },
+    {
+      "id": "gh:KyrosKrane/Broker_RunSpeed",
+      "name": "Broker RunSpeed",
+      "folders": [
+        "Broker_RunSpeed"
+      ],
+      "reason": "its name is already taken by wowi:26332"
+    },
+    {
+      "id": "gh:ManoloZocco/RXPGuides-Forever",
+      "name": "RestedXP Guides",
+      "folders": [
+        "RXPGuides"
+      ],
+      "reason": "its name is already taken by gh:RestedXP/RXPGuides"
+    },
+    {
+      "id": "gh:Mimezu/forever-ForeverWindows",
+      "name": "Forever Windows",
+      "folders": [
+        "ForeverWindows"
+      ],
+      "reason": "its name is already taken by gh:sorrow8/forever-windows"
+    },
+    {
+      "id": "gh:Mimezu/forever-Halo",
+      "name": "Halo",
+      "folders": [
+        "Halo"
+      ],
+      "reason": "its name is already taken by gh:adbergen/Halo"
+    },
+    {
+      "id": "gh:Nevcairiel/Quartz",
+      "name": "Quartz",
+      "folders": [
+        "Quartz"
+      ],
+      "reason": "its main folder Quartz is already taken by wowi:7158"
+    },
+    {
+      "id": "gh:RGXMods/RGXProfessions",
+      "name": "RGX | Professions",
+      "folders": [
+        "RGXProfessions"
+      ],
+      "reason": "its name is already taken by wowi:27306"
+    },
+    {
+      "id": "gh:SMoRG75/QuestCompleteSound",
+      "name": "QuestCompleteSound",
+      "folders": [
+        "QuestCompleteSound"
+      ],
+      "reason": "its name is already taken by wowi:27296"
+    },
+    {
+      "id": "gh:Xianghar/TotemTimers",
+      "name": "TotemTimers",
+      "folders": [
+        "TotemTimers"
+      ],
+      "reason": "its name is already taken by gh:Xianghar/TotemTimers_Classic"
+    },
+    {
+      "id": "gh:alarofrunetotem/AlarArtRemover",
+      "name": "AlarArtRemover",
+      "folders": [
+        "AlarArtRemover"
+      ],
+      "reason": "its name is already taken by wowi:23091"
+    },
+    {
+      "id": "gh:amhost/priest-companion",
+      "name": "Quest Companion",
+      "folders": [
+        "PriestCompanion"
+      ],
+      "reason": "its name is already taken by gh:LapassetAlexis/Ready2Quest"
+    },
+    {
+      "id": "gh:brykrys/LinkWrangler",
+      "name": "LinkWrangler",
+      "folders": [
+        "LinkWrangler"
+      ],
+      "reason": "its name is already taken by wowi:11155"
+    },
+    {
+      "id": "gh:brykrys/TooltipItemIcon",
+      "name": "TooltipItemIcon",
+      "folders": [
+        "TooltipItemIcon"
+      ],
+      "reason": "its name is already taken by wowi:11411"
+    },
+    {
+      "id": "gh:cjber/commissions-forever",
+      "name": "Commissions Forever",
+      "folders": [
+        "CommissionsForever",
+        "ForeverCore"
+      ],
+      "reason": "its folder ForeverCore is already taken by gh:cjber/shortest-path-forever"
+    },
+    {
+      "id": "gh:cjber/forever-core",
+      "name": "ForeverCore",
+      "folders": [
+        "ForeverCore"
+      ],
+      "reason": "its main folder ForeverCore is already taken by gh:cjber/shortest-path-forever"
+    },
+    {
+      "id": "gh:cjber/macro-assist-forever",
+      "name": "Macro Assist Forever",
+      "folders": [
+        "MacroAssistForever",
+        "ForeverCore"
+      ],
+      "reason": "its folder ForeverCore is already taken by gh:cjber/shortest-path-forever"
+    },
+    {
+      "id": "gh:drewkeller/DreamFish",
+      "name": "DreamFish",
+      "folders": [
+        "DreamFish"
+      ],
+      "reason": "its name is already taken by wowi:27165"
+    },
+    {
+      "id": "gh:gOOvER/GuildGreet-Extended",
+      "name": "GuildGreet-Extended",
+      "folders": [
+        "GuildGreet"
+      ],
+      "reason": "its name is already taken by wowi:21709"
+    },
+    {
+      "id": "gh:jkc-be/goldbook",
+      "name": "Goldbook",
+      "folders": [
+        "Goldbook"
+      ],
+      "reason": "its name is already taken by gh:jkc-be/goldbook-addon"
+    },
+    {
+      "id": "gh:keyboardturner/Artificer",
+      "name": "Artificer",
+      "folders": [
+        "Artificer"
+      ],
+      "reason": "its name is already taken by wowi:27048"
+    },
+    {
+      "id": "gh:kurapica/Scorpio",
+      "name": "[Lib] Scorpio",
+      "folders": [
+        "Scorpio",
+        "!Scorpio"
+      ],
+      "reason": "it would be the first to provide Scorpio, which addons already listed require"
+    },
+    {
+      "id": "gh:nanderson11/Atlas",
+      "name": "Atlas",
+      "folders": [
+        "Atlas"
+      ],
+      "reason": "its name is already taken by gh:arithmandar/Atlas"
+    },
+    {
+      "id": "gh:nyyr/MylunesChampions",
+      "name": "Mylune's Champions",
+      "folders": [
+        "MylunesChampions"
+      ],
+      "reason": "its name is already taken by wowi:27218"
+    },
+    {
+      "id": "gh:pathwise-nn/Pathwise",
+      "name": "Pathwise",
+      "folders": [
+        "Pathwise"
+      ],
+      "reason": "its name is already taken by gh:lagnelius-debug/Pathwise"
+    },
+    {
+      "id": "gh:quikmn/Lattice",
+      "name": "Lattice",
+      "folders": [
+        "Lattice"
+      ],
+      "reason": "its name is already taken by wowi:27194"
+    },
+    {
+      "id": "gh:salty-max/yonder",
+      "name": "Yonder",
+      "folders": [
+        "Yonder",
+        "FieldJournal"
+      ],
+      "reason": "it just added the folder FieldJournal, which gh:PlemonsBrett/FieldJournal already lists"
+    },
+    {
+      "id": "gh:tysongoulding/Questie-Forever",
+      "name": "Questie",
+      "folders": [
+        "Questie"
+      ],
+      "reason": "its name is already taken by gh:Questie/Questie"
+    },
+    {
+      "id": "wowi:14239",
+      "name": "VuhDo",
+      "folders": [
+        "VuhDo",
+        "VuhDoOptions"
+      ],
+      "reason": "its name is already taken by gh:vuhdo-io/VuhDo"
+    },
+    {
+      "id": "wowi:17044",
+      "name": "Accountant Classic",
+      "folders": [
+        "Accountant_Classic"
+      ],
+      "reason": "its name is already taken by gh:arithmandar/Accountant-Classic"
+    },
+    {
+      "id": "wowi:19130",
+      "name": "Yatlas patch",
+      "folders": [
+        "Yatlas"
+      ],
+      "reason": "its main folder Yatlas is already taken by gh:arithmandar/Yatlas"
+    },
+    {
+      "id": "wowi:23631",
+      "name": "Annoying Pop-up Remover",
+      "folders": [
+        "AnnoyingPopupRemover"
+      ],
+      "reason": "its name is already taken by gh:KyrosKrane/AnnoyingPopupRemover"
+    },
+    {
+      "id": "wowi:25210",
+      "name": "Broker Runspeed (TWW, Cata Classic, & Classic)",
+      "folders": [
+        "Broker_RunSpeed"
+      ],
+      "reason": "its main folder Broker_RunSpeed is already taken by wowi:26332"
+    },
+    {
+      "id": "wowi:25440",
+      "name": "Farming Bar",
+      "folders": [
+        "FarmingBar"
+      ],
+      "reason": "its name is already taken by gh:nikkisaurus/FarmingBar"
+    },
+    {
+      "id": "wowi:26935",
+      "name": "BindPanel",
+      "folders": [
+        "BindPanel"
+      ],
+      "reason": "its name is already taken by gh:Spyroh/BindPanel"
+    },
+    {
+      "id": "wowi:27278",
+      "name": "Gryphon Mail",
+      "folders": [
+        "GryphonMail"
+      ],
+      "reason": "its name is already taken by gh:Clausi/gryphonMail"
+    },
+    {
+      "id": "wowi:5342",
+      "name": "WIM (WoW Instant Messenger)",
+      "folders": [
+        "WIM"
+      ],
+      "reason": "its main folder WIM is already taken by gh:Legacy-of-Sylvanaar/wow-instant-messenger"
+    }
+  ]
+}
