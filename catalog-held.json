@@ -1,0 +1,674 @@
+{
+  "held": [
+    {
+      "id": "gh:AcidWeb/OPie_ElvUI",
+      "name": "OPie: ElvUI",
+      "folders": [
+        "OPie_ElvUI"
+      ],
+      "reason": "its main folder OPie_ElvUI is already taken by wowi:26446"
+    },
+    {
+      "id": "gh:Beast-Masters-addons/Broker_RunSpeed",
+      "name": "Broker: RunSpeed",
+      "folders": [
+        "Broker_RunSpeed"
+      ],
+      "reason": "its name is already taken by wowi:26332"
+    },
+    {
+      "id": "gh:Beast-Masters-addons/TomTomTargetArrow",
+      "name": "TomTom group member arrow",
+      "folders": [
+        "TomTomTargetArrow"
+      ],
+      "reason": "its name is already taken by wowi:25895"
+    },
+    {
+      "id": "gh:Book-of-Medivh/LFGForever",
+      "name": "LFG Forever",
+      "folders": [
+        "LFGForever"
+      ],
+      "reason": "its name is already taken by gh:Pinta365/LFGForever"
+    },
+    {
+      "id": "gh:Book-of-Medivh/LayerSwap",
+      "name": "LayerSwap",
+      "folders": [
+        "LayerSwap"
+      ],
+      "reason": "it would be the first to provide LayerSwap, which addons already listed require"
+    },
+    {
+      "id": "gh:BurN-30/wow-forever-guide",
+      "name": "BugSack",
+      "folders": [
+        "BugSack",
+        "Polestar",
+        "!BugGrabber",
+        "Auctionator",
+        "Polestar_Nav",
+        "Polestar_deDE",
+        "Polestar_esES",
+        "Polestar_esMX",
+        "Polestar_frFR",
+        "Polestar_koKR",
+        "Polestar_ptBR",
+        "Polestar_ruRU",
+        "Polestar_zhCN",
+        "Polestar_zhTW",
+        "Polestar_Codex",
+        "Polestar_Nav_EK"
+      ],
+      "reason": "its folder !BugGrabber is reserved for the real addon, which needs picking by hand"
+    },
+    {
+      "id": "gh:Checkov23/ForeverDungeonRoutes",
+      "name": "Forever Dungeon Routes",
+      "folders": [
+        "ForeverDungeonRoutes"
+      ],
+      "reason": "it would be the first to provide ForeverDungeonRoutes, which addons already listed require"
+    },
+    {
+      "id": "gh:Choonster-WoW-AddOns/BulkBuy",
+      "name": "Bulk Buy",
+      "folders": [
+        "BulkBuy"
+      ],
+      "reason": "its name is already taken by wowi:21442"
+    },
+    {
+      "id": "gh:Deathwing/Achievements",
+      "name": "Achievements",
+      "folders": [
+        "Achievements"
+      ],
+      "reason": "its name is already taken by wowi:27169"
+    },
+    {
+      "id": "gh:Deathwing/Mount-Route-Planner",
+      "name": "Mount Route Planner (MRP)",
+      "folders": [
+        "MountRoutePlanner"
+      ],
+      "reason": "its main folder MountRoutePlanner is already taken by wowi:27171"
+    },
+    {
+      "id": "gh:Emzime/OneForAll-API",
+      "name": "OneForAll",
+      "folders": [
+        "OneForAll"
+      ],
+      "reason": "its name is already taken by gh:thoreex/OneForAll"
+    },
+    {
+      "id": "gh:Estasleyendoesto/GhostUI",
+      "name": "GhostUI",
+      "folders": [
+        "GhostUI"
+      ],
+      "reason": "its main folder GhostUI is already taken by wowi:26734"
+    },
+    {
+      "id": "gh:Gyffes/Quest-Announcer-3",
+      "name": "Quest Announce 3",
+      "folders": [
+        "QuestAnnounce"
+      ],
+      "reason": "its name is already taken by wowi:11002"
+    },
+    {
+      "id": "gh:Jademalo/Cheese",
+      "name": "Cheese!",
+      "folders": [
+        "Cheese"
+      ],
+      "reason": "its name is already taken by wowi:27243"
+    },
+    {
+      "id": "gh:Japy01/LevelMates",
+      "name": "Forever Guild",
+      "folders": [
+        "LevelMates"
+      ],
+      "reason": "its name is already taken by gh:cameron3d/ForeverGuild"
+    },
+    {
+      "id": "gh:KyrosKrane/Broker_RunSpeed",
+      "name": "Broker RunSpeed",
+      "folders": [
+        "Broker_RunSpeed"
+      ],
+      "reason": "its name is already taken by wowi:26332"
+    },
+    {
+      "id": "gh:ManoloZocco/RXPGuides-Forever",
+      "name": "RestedXP Guides",
+      "folders": [
+        "RXPGuides"
+      ],
+      "reason": "its name is already taken by gh:RestedXP/RXPGuides"
+    },
+    {
+      "id": "gh:Mimezu/forever-ForeverWindows",
+      "name": "Forever Windows",
+      "folders": [
+        "ForeverWindows"
+      ],
+      "reason": "its name is already taken by gh:sorrow8/forever-windows"
+    },
+    {
+      "id": "gh:Mimezu/forever-Halo",
+      "name": "Halo",
+      "folders": [
+        "Halo"
+      ],
+      "reason": "its name is already taken by gh:adbergen/Halo"
+    },
+    {
+      "id": "gh:Nevcairiel/Quartz",
+      "name": "Quartz",
+      "folders": [
+        "Quartz"
+      ],
+      "reason": "its main folder Quartz is already taken by wowi:7158"
+    },
+    {
+      "id": "gh:RGXMods/RGXProfessions",
+      "name": "RGX | Professions",
+      "folders": [
+        "RGXProfessions"
+      ],
+      "reason": "its name is already taken by wowi:27306"
+    },
+    {
+      "id": "gh:Retronimrod/ForeverGuild",
+      "name": "ForeverGuild",
+      "folders": [
+        "ForeverGuild"
+      ],
+      "reason": "its name is already taken by gh:cameron3d/ForeverGuild"
+    },
+    {
+      "id": "gh:RobinLanderloos/RemindMe",
+      "name": "RemindMe",
+      "folders": [
+        "RemindMe"
+      ],
+      "reason": "its main folder RemindMe is already taken by gh:miyankooo/SimpleReminders"
+    },
+    {
+      "id": "gh:Ryna-Mods/automation",
+      "name": "Automation by Ryna",
+      "folders": [
+        "Ryna_Automation"
+      ],
+      "reason": "its main folder Ryna_Automation is already taken by gh:MaddisonM79/ryna_agent"
+    },
+    {
+      "id": "gh:Ryna-Mods/chronicle",
+      "name": "Chronicle by Ryna",
+      "folders": [
+        "Ryna_Chronicle"
+      ],
+      "reason": "its main folder Ryna_Chronicle is already taken by gh:MaddisonM79/ryna_agent"
+    },
+    {
+      "id": "gh:Ryna-Mods/fights",
+      "name": "Fights by Ryna",
+      "folders": [
+        "Ryna_Fights"
+      ],
+      "reason": "its main folder Ryna_Fights is already taken by gh:MaddisonM79/ryna_agent"
+    },
+    {
+      "id": "gh:Ryna-Mods/meter",
+      "name": "Meter by Ryna",
+      "folders": [
+        "Ryna_Meter"
+      ],
+      "reason": "its main folder Ryna_Meter is already taken by gh:MaddisonM79/ryna_agent"
+    },
+    {
+      "id": "gh:Ryna-Mods/prices",
+      "name": "Prices by Ryna",
+      "folders": [
+        "Ryna_Prices"
+      ],
+      "reason": "its main folder Ryna_Prices is already taken by gh:MaddisonM79/ryna_agent"
+    },
+    {
+      "id": "gh:Ryna-Mods/ryna",
+      "name": "Ryna Core",
+      "folders": [
+        "Ryna_Core",
+        "Ryna_Guild",
+        "Ryna_Meter",
+        "Ryna_Fights",
+        "Ryna_Prices",
+        "Ryna_Verity",
+        "Ryna_Cleanse",
+        "Ryna_Chronicle",
+        "Ryna_Automation"
+      ],
+      "reason": "its name is already taken by gh:Ryna-Mods/core"
+    },
+    {
+      "id": "gh:SMoRG75/QuestCompleteSound",
+      "name": "QuestCompleteSound",
+      "folders": [
+        "QuestCompleteSound"
+      ],
+      "reason": "its name is already taken by wowi:27296"
+    },
+    {
+      "id": "gh:SeanShaffer88/Rummage",
+      "name": "Rummage",
+      "folders": [
+        "Rummage"
+      ],
+      "reason": "its main folder Rummage is already taken by gh:snrn-Pontus/Rummage"
+    },
+    {
+      "id": "gh:Venpris/CraftPath",
+      "name": "CraftPath",
+      "folders": [
+        "CraftPath"
+      ],
+      "reason": "its name is already taken by gh:GYPM4H/CraftPath"
+    },
+    {
+      "id": "gh:VgerMods/HearKitty",
+      "name": "Hear Kitty",
+      "folders": [
+        "HearKitty"
+      ],
+      "reason": "its name is already taken by wowi:6357"
+    },
+    {
+      "id": "gh:WoW-Addons-Reforged/GuildGreet-Extended",
+      "name": "GuildGreet-Extended",
+      "folders": [
+        "GuildGreet"
+      ],
+      "reason": "its name is already taken by wowi:21709"
+    },
+    {
+      "id": "gh:WoW-Addons-Reforged/Name2Chat",
+      "name": "Name2Chat",
+      "folders": [
+        "Name2Chat"
+      ],
+      "reason": "its name is already taken by wowi:24357"
+    },
+    {
+      "id": "gh:Xianghar/TotemTimers",
+      "name": "TotemTimers",
+      "folders": [
+        "TotemTimers"
+      ],
+      "reason": "its name is already taken by gh:Xianghar/TotemTimers_Classic"
+    },
+    {
+      "id": "gh:alarofrunetotem/AlarArtRemover",
+      "name": "AlarArtRemover",
+      "folders": [
+        "AlarArtRemover"
+      ],
+      "reason": "its name is already taken by wowi:23091"
+    },
+    {
+      "id": "gh:amhost/priest-companion",
+      "name": "Quest Companion",
+      "folders": [
+        "PriestCompanion"
+      ],
+      "reason": "its name is already taken by gh:LapassetAlexis/Ready2Quest"
+    },
+    {
+      "id": "gh:ayumilove/WarlockToolsForever-zhCN",
+      "name": "Warlock Tools Forever",
+      "folders": [
+        "WarlockToolsForever",
+        "DyresToolkit",
+        "DyresShieldsUp",
+        "DyresBuffReminders",
+        "DyresDebuffTracker"
+      ],
+      "reason": "its name is already taken by gh:jbedworth/WarlockToolsForever"
+    },
+    {
+      "id": "gh:bhuddleston42/ForeverGuide",
+      "name": "Guide Steward",
+      "folders": [
+        "ForeverGuide"
+      ],
+      "reason": "its main folder ForeverGuide is already taken by gh:prezus/ForeverGuide"
+    },
+    {
+      "id": "gh:brykrys/LinkWrangler",
+      "name": "LinkWrangler",
+      "folders": [
+        "LinkWrangler"
+      ],
+      "reason": "its name is already taken by wowi:11155"
+    },
+    {
+      "id": "gh:brykrys/TooltipItemIcon",
+      "name": "TooltipItemIcon",
+      "folders": [
+        "TooltipItemIcon"
+      ],
+      "reason": "its name is already taken by wowi:11411"
+    },
+    {
+      "id": "gh:cjber/forever-core",
+      "name": "ForeverCore",
+      "folders": [
+        "ForeverCore"
+      ],
+      "reason": "it would be the first to provide ForeverCore, which addons already listed require"
+    },
+    {
+      "id": "gh:coylemichael/wow-perhour",
+      "name": "PerHour",
+      "folders": [
+        "PerHour"
+      ],
+      "reason": "its name is already taken by gh:eavidaze/wow-addon-per-hour"
+    },
+    {
+      "id": "gh:drewkeller/DreamFish",
+      "name": "DreamFish",
+      "folders": [
+        "DreamFish"
+      ],
+      "reason": "its name is already taken by wowi:27165"
+    },
+    {
+      "id": "gh:eelliott4517/forever-loot",
+      "name": "Forever Loot",
+      "folders": [
+        "ForeverLoot"
+      ],
+      "reason": "its name is already taken by gh:olegsuv/ForeverLootKey"
+    },
+    {
+      "id": "gh:fusionpit/ClassTrainerPlus",
+      "name": "Class Trainer Plus",
+      "folders": [
+        "ClassTrainerPlus"
+      ],
+      "reason": "its name is already taken by wowi:25029"
+    },
+    {
+      "id": "gh:gimzdev/grimoire",
+      "name": "Grimoire",
+      "folders": [
+        "GrimoireForever"
+      ],
+      "reason": "its name is already taken by gh:derekross/grimoire"
+    },
+    {
+      "id": "gh:jkc-be/goldbook",
+      "name": "Goldbook",
+      "folders": [
+        "Goldbook"
+      ],
+      "reason": "its name is already taken by gh:jkc-be/goldbook-addon"
+    },
+    {
+      "id": "gh:keyboardturner/Artificer",
+      "name": "Artificer",
+      "folders": [
+        "Artificer"
+      ],
+      "reason": "its name is already taken by wowi:27048"
+    },
+    {
+      "id": "gh:kurapica/Scorpio",
+      "name": "[Lib] Scorpio",
+      "folders": [
+        "Scorpio",
+        "!Scorpio"
+      ],
+      "reason": "it would be the first to provide Scorpio, which addons already listed require"
+    },
+    {
+      "id": "gh:lcellentani/wow-lodestar",
+      "name": "Lodestar",
+      "folders": [
+        "Lodestar"
+      ],
+      "reason": "its name is already taken by gh:danielcosta42/lodestar"
+    },
+    {
+      "id": "gh:mikebronka/MouseShift",
+      "name": "MouseShift",
+      "folders": [
+        "MouseShift"
+      ],
+      "reason": "its name is already taken by wowi:27280"
+    },
+    {
+      "id": "gh:nanderson11/Atlas",
+      "name": "Atlas",
+      "folders": [
+        "Atlas"
+      ],
+      "reason": "its name is already taken by gh:arithmandar/Atlas"
+    },
+    {
+      "id": "gh:nikkisaurus/Overbound",
+      "name": "Overbound",
+      "folders": [
+        "Overbound"
+      ],
+      "reason": "its name is already taken by wowi:25670"
+    },
+    {
+      "id": "gh:nyyr/MylunesChampions",
+      "name": "Mylune's Champions",
+      "folders": [
+        "MylunesChampions"
+      ],
+      "reason": "its name is already taken by wowi:27218"
+    },
+    {
+      "id": "gh:pathwise-nn/Pathwise",
+      "name": "Pathwise",
+      "folders": [
+        "Pathwise"
+      ],
+      "reason": "its name is already taken by gh:lagnelius-debug/Pathwise"
+    },
+    {
+      "id": "gh:quikmn/LatticePartyRaidFrames",
+      "name": "Lattice",
+      "folders": [
+        "LatticePartyRaidFrames"
+      ],
+      "reason": "its name is already taken by wowi:27194"
+    },
+    {
+      "id": "gh:salty-max/yonder",
+      "name": "Yonder",
+      "folders": [
+        "Yonder",
+        "FieldJournal"
+      ],
+      "reason": "it just added the folder FieldJournal, which gh:PlemonsBrett/FieldJournal already lists"
+    },
+    {
+      "id": "gh:tr1age/weather-forever",
+      "name": "Weather Forever",
+      "folders": [
+        "AzerothWeather"
+      ],
+      "reason": "its main folder AzerothWeather is gh:tr1age/azeroth-weather-observatory's, which isn't listed in this build"
+    },
+    {
+      "id": "gh:trevercomb/BeastScout",
+      "name": "BeastScout",
+      "folders": [
+        "BeastScout"
+      ],
+      "reason": "its name is already taken by wowi:27309"
+    },
+    {
+      "id": "gh:tysongoulding/Questie-Forever",
+      "name": "Questie",
+      "folders": [
+        "Questie"
+      ],
+      "reason": "its name is already taken by gh:Questie/Questie"
+    },
+    {
+      "id": "gh:vem882/pqAuction",
+      "name": "PandaQuest Auction",
+      "folders": [
+        "PandaQuestAuction"
+      ],
+      "reason": "its main folder PandaQuestAuction is already taken by gh:vem882/pandaquest"
+    },
+    {
+      "id": "gh:vem882/pqDB",
+      "name": "PandaQuest Database",
+      "folders": [
+        "PandaQuestDB"
+      ],
+      "reason": "its main folder PandaQuestDB is already taken by gh:vem882/pandaquest"
+    },
+    {
+      "id": "wowi:14239",
+      "name": "VuhDo",
+      "folders": [
+        "VuhDo",
+        "VuhDoOptions"
+      ],
+      "reason": "its name is already taken by gh:vuhdo-io/VuhDo"
+    },
+    {
+      "id": "wowi:17044",
+      "name": "Accountant Classic",
+      "folders": [
+        "Accountant_Classic"
+      ],
+      "reason": "its name is already taken by gh:arithmandar/Accountant-Classic"
+    },
+    {
+      "id": "wowi:19130",
+      "name": "Yatlas patch",
+      "folders": [
+        "Yatlas"
+      ],
+      "reason": "its main folder Yatlas is already taken by gh:arithmandar/Yatlas"
+    },
+    {
+      "id": "wowi:23631",
+      "name": "Annoying Pop-up Remover",
+      "folders": [
+        "AnnoyingPopupRemover"
+      ],
+      "reason": "its name is already taken by gh:KyrosKrane/AnnoyingPopupRemover"
+    },
+    {
+      "id": "wowi:25210",
+      "name": "Broker Runspeed (TWW, Cata Classic, & Classic)",
+      "folders": [
+        "Broker_RunSpeed"
+      ],
+      "reason": "its main folder Broker_RunSpeed is already taken by wowi:26332"
+    },
+    {
+      "id": "wowi:25440",
+      "name": "Farming Bar",
+      "folders": [
+        "FarmingBar"
+      ],
+      "reason": "its name is already taken by gh:nikkisaurus/FarmingBar"
+    },
+    {
+      "id": "wowi:26759",
+      "name": "Faster Loot",
+      "folders": [
+        "FasterLoot"
+      ],
+      "reason": "its name is already taken by gh:Xarano-GIT/Faster-Loot"
+    },
+    {
+      "id": "wowi:26935",
+      "name": "BindPanel",
+      "folders": [
+        "BindPanel"
+      ],
+      "reason": "its name is already taken by gh:Spyroh/BindPanel"
+    },
+    {
+      "id": "wowi:27278",
+      "name": "Gryphon Mail",
+      "folders": [
+        "GryphonMail"
+      ],
+      "reason": "its name is already taken by gh:Clausi/gryphonMail"
+    },
+    {
+      "id": "wowi:27302",
+      "name": "Bruh Forever",
+      "folders": [
+        "BruhForever"
+      ],
+      "reason": "its name is already taken by gh:Andy-Love/BruhForever"
+    },
+    {
+      "id": "wowi:27312",
+      "name": "NoHatersBullyElitists",
+      "folders": [
+        "NoHatersBullyElitists"
+      ],
+      "reason": "its main folder NoHatersBullyElitists is already taken by gh:iintellectualgamer/NoHatersBullyElitists"
+    },
+    {
+      "id": "wowi:27314",
+      "name": "ForeverFlip",
+      "folders": [
+        "ForeverFlip"
+      ],
+      "reason": "its name is already taken by gh:ErorNya/ForeverFlip"
+    },
+    {
+      "id": "wowi:27317",
+      "name": "WispXP",
+      "folders": [
+        "Wisp"
+      ],
+      "reason": "its main folder Wisp is already taken by gh:smogstate/wisp"
+    },
+    {
+      "id": "wowi:27319",
+      "name": "Backstage Forever",
+      "folders": [
+        "BackstageForever"
+      ],
+      "reason": "its name is already taken by gh:farena-ai/Backstage-Forever"
+    },
+    {
+      "id": "wowi:27323",
+      "name": "Lyorune",
+      "folders": [
+        "Lyorune"
+      ],
+      "reason": "its name is already taken by gh:BellaHealFr/Lyorune"
+    },
+    {
+      "id": "wowi:5342",
+      "name": "WIM (WoW Instant Messenger)",
+      "folders": [
+        "WIM"
+      ],
+      "reason": "its main folder WIM is already taken by gh:Legacy-of-Sylvanaar/wow-instant-messenger"
+    }
+  ]
+}
